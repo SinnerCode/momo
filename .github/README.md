@@ -6,7 +6,7 @@ Momo is Peach in English: a fork of [Peach](https://github.com/peach-mitao/peach
 
 Peach's interface is Chinese only. Momo translates every page, button, setting, error message and log line, so you can run it without a translator open in another tab.
 
-Momo is an independent fork. The Peach project did not make it and does not endorse it. Please report Momo problems on [Momo's issue tracker](https://github.com/Nael-Nathanael/momo/issues), not to Peach.
+Momo is an independent fork. The Peach project did not make it and does not endorse it. Please report Momo problems on [Momo's issue tracker](https://github.com/SinnerCode/momo/issues), not to Peach.
 
 ![Momo home screen in English](assets/momo-home.png)
 
@@ -37,7 +37,7 @@ Momo runs as one container. It works on any Linux server, NAS (Synology, Unraid,
 # compose.yaml
 services:
   momo:
-    image: ghcr.io/nael-nathanael/momo:0.52.0
+    image: ghcr.io/sinnercode/momo:0.52.0
     init: true
     restart: unless-stopped
     stop_grace_period: 75s

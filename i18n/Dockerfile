@@ -37,5 +37,5 @@ COPY i18n/brand/momo.ico ${PKG}/_resources/resources/peach.ico
 RUN python -m compileall -q ${PKG} && /app/amane-runtime/.venv/bin/python -X utf8 /app/tools/amane-bridge/bridge.py --self-check
 LABEL org.opencontainers.image.title="Momo" \
       org.opencontainers.image.description="English fork of Peach (github.com/peach-mitao/peach)" \
-      org.opencontainers.image.source="https://github.com/Nael-Nathanael/momo"
+      org.opencontainers.image.source="https://github.com/SinnerCode/momo"
 USER peach

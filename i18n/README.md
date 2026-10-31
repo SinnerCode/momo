@@ -33,6 +33,6 @@ python3 -I i18n/translate.py            # DeepL key in ~/.secrets/deepl-api-key;
 1. Fix anything listed in `i18n/failed.json` by adding it to `manual.json`, then run `translate.py` again.
 2. Set `BASE` in `i18n/Dockerfile` to the official image of that release: `longmeidao/peach:<version>@<digest>`.
 3. Check the translated tree: copy the repo, run `py.py apply` and `ts.mjs apply` on the copy, then `npm run typecheck && npm run lint` in its `frontend/`. A literal type that changed language fails typecheck. Fix it by removing the word from `allow.txt`.
-4. Build: `docker buildx build -f i18n/Dockerfile -t ghcr.io/nael-nathanael/momo:<version> .`
+4. Build: `docker buildx build -f i18n/Dockerfile -t ghcr.io/sinnercode/momo:<version> .`
 
 To change how one word is translated, edit `glossary.tsv`, then run `python3 -I i18n/translate.py --retranslate <word>`.
