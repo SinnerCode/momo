@@ -1,0 +1,41 @@
+# UI words translated in the frontend even though Python (or a few frontend sites) match them as data.
+# Each tool still skips them at its own matching sites; Python never translates them. typecheck guards
+# literal types. Genre and tag names do not belong here: they match stored data.
+# "text<TAB>file…" limits a word to those frontend files.
+事务所
+作品资料未取得
+保存待确认资料
+关注
+其他
+别名
+卸载 Peach
+厂牌
+取得
+只有这台电脑
+可用
+同一局域网的设备
+图片
+女优
+导演
+归属
+所在地
+搜索
+撤销
+无
+日期
+未取得
+本机
+条
+检查配套文件
+正常
+浏览器书签
+浏览记录
+照片
+片商
+系列
+艺人
+视频
+读取配套图片
+资料
+采集缺失封面
+标签	frontend/src/application/navigation-items.ts	frontend/src/history/route-meta.ts	frontend/src/index-skeleton.ts
