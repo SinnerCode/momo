@@ -8,6 +8,7 @@ FROM python:3.15.1-slim-trixie@sha256:533b0b2f9b5d46fd097091cf826f27902f1d6c3bca
 WORKDIR /w
 COPY src ./src
 COPY tools/amane-bridge/bridge.py ./tools/amane-bridge/
+COPY resources/media-sources.json ./resources/
 COPY i18n/py.py i18n/en.json ./i18n/
 COPY i18n/brand/momo-logo-64.png ./i18n/brand/
 RUN python -I i18n/py.py apply . i18n/en.json
@@ -19,6 +20,7 @@ RUN cd frontend && npm ci --no-audit --no-fund --ignore-scripts
 COPY frontend ./frontend
 COPY web ./web
 COPY resources ./resources
+COPY --from=py /w/resources/media-sources.json ./resources/
 COPY i18n/ts.mjs i18n/en.json i18n/allow.txt i18n/backend-strings.json ./i18n/
 RUN node i18n/ts.mjs apply . i18n/en.json && cd frontend && npm run build
 
@@ -29,6 +31,7 @@ COPY --from=py /w/src/peach/ ${PKG}/
 COPY --from=py /w/tools/amane-bridge/bridge.py ${PKG}/_resources/tools/amane-bridge/bridge.py
 COPY --from=py /w/tools/amane-bridge/bridge.py /app/tools/amane-bridge/bridge.py
 COPY --from=web /w/web/ ${PKG}/_resources/web/
+COPY --from=py /w/resources/media-sources.json ${PKG}/_resources/resources/
 # Own icon under the old file names, so routes and pages need no change.
 COPY i18n/brand/momo-logo.png ${PKG}/_resources/resources/peach-logo.png
 COPY i18n/brand/momo-logo-128.png ${PKG}/_resources/resources/peach-logo-128.png

@@ -169,14 +169,22 @@ def files(repo):
     yield repo / 'tools/amane-bridge/bridge.py'
 
 
+# Media source registry shared by Python and the frontend; only its display fields translate (`id` is the key).
+SOURCES_JSON = 'resources/media-sources.json'
+SOURCE_FIELDS = ('name', 'label')
+
+
 def main():
     mode, repo = sys.argv[1], Path(sys.argv[2]).resolve()
+    sources = json.loads((repo / SOURCES_JSON).read_text(encoding='utf-8'))
     if mode == 'extract':
         out = []
         for path in files(repo):
             for unit in scan(path.read_text(encoding='utf-8')):
                 out.append({'text': unit['text'], 'unsafe': unit['unsafe'], 'kind': 'py',
                             'at': f"{path.relative_to(repo)}:{unit['node'].lineno}"})
+        out += [{'text': row[f], 'unsafe': False, 'kind': 'json', 'at': SOURCES_JSON}
+                for row in sources for f in SOURCE_FIELDS if HAN.search(row[f])]
         json.dump(out, sys.stdout, ensure_ascii=False)
         return
     catalog = json.loads(Path(sys.argv[3]).read_text(encoding='utf-8'))
@@ -207,6 +215,11 @@ def main():
             ast.parse(text, filename=str(path))
             path.write_text(text, encoding='utf-8')
             changed += len(edits)
+    for row in sources:
+        for f in SOURCE_FIELDS:
+            if row[f] in catalog:
+                row[f], changed = brand(catalog[row[f]]), changed + 1
+    (repo / SOURCES_JSON).write_text(json.dumps(sources, ensure_ascii=False, indent=1) + '\n', encoding='utf-8')
     print(f'py: translated {changed}, kept {kept}', file=sys.stderr)
 
 

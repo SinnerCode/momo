@@ -1,5 +1,8 @@
 {
  "Peach · 蜜桃": "Momo",
+ "本地磁盘": "Local disk",
+ "光鸭云盘": "Guangya Cloud",
+ "其他已挂载网盘": "Other mounted cloud drive",
  "  [media.mounts] 为空 → 无法读取媒体来源的目录；可用 --mount <媒体来源ID>=<媒体目录> 指定目录（已知来源：{$0}）": "  [media.mounts] is empty → cannot read media source folders; use --mount <source-id>=<media-folder> to set one (known sources: {$0})",
  "{$0} 个": "{$0}",
  "{$0}年{$1}": "{$0}/{$1}",
