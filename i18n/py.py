@@ -191,14 +191,18 @@ def main():
     # A string matched as data anywhere in Python stays Chinese everywhere in Python.
     data = {u['text'] for path in files(repo) for u in scan(path.read_text(encoding='utf-8')) if u['unsafe']}
     catalog = {k: v for k, v in catalog.items() if k not in data}
+    # allow.txt "text<TAB>file…" limits a word to those files, here as in ts.mjs.
+    only = {text: files_ for text, *files_ in (l.split('\t') for l in
+            (repo / 'i18n/allow.txt').read_text(encoding='utf-8').splitlines() if l and not l.startswith('#')) if files_}
     changed = kept = 0
     for path in files(repo):
         source = path.read_text(encoding='utf-8')
         starts, data, edits = byte_offsets(source), source.encode(), []
         span = lambda n: (starts[n.lineno - 1] + n.col_offset, starts[n.end_lineno - 1] + n.end_col_offset)
+        file = str(path.relative_to(repo))
         for unit in scan(source):
             en = catalog.get(unit['text'])
-            if unit['unsafe'] or en is None:
+            if unit['unsafe'] or en is None or file not in only.get(unit['text'], [file]):
                 kept += 1
                 continue
             edits.append((*span(unit['node']), lambda render, unit=unit, en=brand(en): replacement(unit, en, span, render)))

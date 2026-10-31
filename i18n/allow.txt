@@ -1,7 +1,7 @@
 # UI words translated in the frontend even though Python (or a few frontend sites) match them as data.
 # Each tool still skips them at its own matching sites; Python never translates them. typecheck guards
 # literal types. Genre and tag names do not belong here: they match stored data.
-# "text<TAB>file…" limits a word to those frontend files.
+# "text<TAB>file…" limits a word to those files, frontend and Python.
 事务所
 作品资料未取得
 保存待确认资料
@@ -39,3 +39,6 @@
 资料
 采集缺失封面
 标签	frontend/src/application/navigation-items.ts	frontend/src/history/route-meta.ts	frontend/src/index-skeleton.ts	frontend/src/react/index/index-data.ts	frontend/src/react/index/index-page.tsx	frontend/src/catalog-onboarding.ts	frontend/src/management-skeletons.ts	frontend/src/react/item-detail/item-detail-page.tsx	frontend/src/react/taste/taste-page.tsx	frontend/src/react/catalog-grid/catalog-table-columns.ts	frontend/src/react/catalog-grid/catalog-list-page.tsx	frontend/src/react/entity-hero/entity-hero.ts	frontend/src/react/library-shortcuts/shortcut-controls.tsx
+高清	frontend/src/react/activity/resource-search.tsx
+中字	frontend/src/react/activity/resource-search.tsx
+无码	frontend/src/react/activity/resource-search.tsx

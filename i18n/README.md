@@ -5,7 +5,7 @@ Everything Momo adds lives in `i18n/` and `.github/`. No upstream Peach file is 
 | File | Role |
 | --- | --- |
 | `ts.mjs` | Finds Chinese strings in `frontend/src` and `web/index.html` (oxc-parser AST); rewrites them at build time |
-| `py.py` | Same for `src/peach` and the amane bridge (Python `ast`); also swaps the favicon |
+| `py.py` | Same for `src/peach` and the amane bridge (Python `ast`), plus the names in `resources/media-sources.json`; also swaps the favicon |
 | `translate.py` | Fills `en.json` through DeepL; sends only strings it has not seen |
 | `en.json` | Catalog: Chinese source → English |
 | `manual.json` | Hand translations for strings DeepL cannot keep intact; they win over DeepL |

@@ -9,7 +9,7 @@ WORKDIR /w
 COPY src ./src
 COPY tools/amane-bridge/bridge.py ./tools/amane-bridge/
 COPY resources/media-sources.json ./resources/
-COPY i18n/py.py i18n/en.json ./i18n/
+COPY i18n/py.py i18n/en.json i18n/allow.txt ./i18n/
 COPY i18n/brand/momo-logo-64.png ./i18n/brand/
 RUN python -I i18n/py.py apply . i18n/en.json
 
