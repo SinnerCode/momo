@@ -11,7 +11,7 @@ Peach has its own English interface since 0.58.0, so Momo no longer translates. 
 | `en.json` | Strings to replace outright (the page title) |
 | `allow.txt`, `backend-strings.json` | Inputs `ts.mjs` and `py.py` still read; empty |
 | `brand/` | Momo logo and icon, installed under Peach's file names |
-| `Dockerfile` | Official Peach image + renamed locales + rebuilt frontend + Momo icon; `PEACH_LANGUAGE=en` |
+| `Dockerfile` | Official Peach image plus renamed locales, a rebuilt frontend and the Momo icon, with `PEACH_LANGUAGE=en` |
 
 ## Rename rules
 
