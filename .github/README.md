@@ -2,9 +2,9 @@
 
 # Momo
 
-Momo is Peach in English: a fork of [Peach](https://github.com/peach-mitao/peach), the self-hosted JAV metadata scraper and media manager, with the same features.
+Momo is a fork of [Peach](https://github.com/peach-mitao/peach), the self-hosted JAV metadata scraper and media manager, with the same features.
 
-Peach's interface is Chinese only. Momo translates every page, button, setting, error message and log line, so you can run it without a translator open in another tab.
+Since 0.58.0, Peach ships its own English interface, and Momo uses it. Momo is Peach under its own name and icon, with English as the default language.
 
 Momo is an independent fork. The Peach project did not make it and does not endorse it. Please report Momo problems on [Momo's issue tracker](https://github.com/SinnerCode/momo/issues), not to Peach.
 
@@ -37,7 +37,7 @@ Momo runs as one container. It works on any Linux server, NAS (Synology, Unraid,
 # compose.yaml
 services:
   momo:
-    image: ghcr.io/sinnercode/momo:0.52.0
+    image: ghcr.io/sinnercode/momo:0.59.0
     init: true
     restart: unless-stopped
     stop_grace_period: 75s
@@ -73,19 +73,17 @@ momo.example.lan {
 
 Keep Momo on your LAN or a VPN such as Tailscale. Like Peach, it is a single-user app with no accounts, and it should not face the public internet.
 
-## How the translation works
+## How the build works
 
-Momo does not change Peach's source files, so each new Peach release merges cleanly. The English build happens when the image is made:
+Momo does not change Peach's source files, so each new Peach release merges cleanly. The rename happens when the image is made:
 
-- `i18n/py.py` and `i18n/ts.mjs` parse the Python backend and the TypeScript frontend, and swap each Chinese interface string for its English version from `i18n/en.json`.
-- Strings the code uses as data (comparisons, lookups, tag names) are left alone, so nothing breaks.
-- `i18n/translate.py` fills `en.json` through DeepL with a glossary of library terms. Only new strings are sent.
-- `i18n/Dockerfile` builds on top of the official Peach image for the same release.
+- `i18n/ts.mjs` renames Peach to Momo in the interface text and the frontend, and `i18n/py.py` swaps the favicon.
+- `i18n/Dockerfile` builds on top of the official Peach image for the same release and sets English as the default language.
 
 See [`i18n/README.md`](../i18n/README.md) to update or build it yourself.
 
 ## License
 
-AGPL-3.0-or-later, the same as Peach. Momo's source, including the translation tooling, is this repository. Peach's name and icon belong to the Peach project (see its [name policy](../docs/TRADEMARKS.md)); Momo uses its own name and icon. Adults only: Momo is for legally released content featuring consenting adults.
+AGPL-3.0-or-later, the same as Peach. Momo's source, including the build tooling, is this repository. Peach's name and icon belong to the Peach project (see its [name policy](../docs/TRADEMARKS.md)); Momo uses its own name and icon. Adults only: Momo is for legally released content featuring consenting adults.
 
 <sub>Search terms: Peach English, Peach English version, Peach in English, Peach global version, Peach international version, Peach 英文版, peach-mitao English, peach.video English, English JAV metadata scraper, JAV library manager, self-hosted JAV media server, JAV NFO scraper, Docker, NAS.</sub>

@@ -1,4 +1,4 @@
-// Finds Chinese UI strings in frontend/src and web/index.html, and rewrites them from i18n/en.json.
+// Renames Peach to Momo in frontend/src, web/index.html and resources/locales; rewrites strings listed in i18n/en.json.
 //   node i18n/ts.mjs extract <repo>          -> JSON units on stdout
 //   node i18n/ts.mjs apply <repo> <en.json>  -> rewrites <repo> in place (run on a copy)
 // A string in a matching position (===, switch, Set/Map, includes, keys, literal types…) is
@@ -205,7 +205,19 @@ if (mode === 'extract') {
   const edits = htmlUnits(html).filter(u => catalog[u.text] != null)
     .map(u => ({ start: u.start, end: u.end, value: escapeHtml(brand(catalog[u.text]), u.attr) }));
   writeFileSync(indexHtml, rewrite(html, edits).replace(/<html lang="zh-CN"/, '<html lang="en"'));
-  console.error(`ts: translated ${changed + edits.length}, kept ${kept}`);
+  // Peach's own interface text lives in resources/locales; rename it there, values only.
+  let renamed = 0;
+  const brandValues = value => typeof value === 'string' ? (hasBrand(value) ? (renamed++, brand(value)) : value)
+    : Array.isArray(value) ? value.map(brandValues)
+    : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, brandValues(v)])) : value;
+  const locales = join(repo, 'resources/locales');
+  for (const lang of readdirSync(locales, { withFileTypes: true }).filter(d => d.isDirectory() && d.name !== 'glossary')) {
+    for (const name of readdirSync(join(locales, lang.name)).filter(n => n.endsWith('.json'))) {
+      const path = join(locales, lang.name, name);
+      writeFileSync(path, JSON.stringify(brandValues(JSON.parse(readFileSync(path, 'utf8'))), null, 2) + '\n');
+    }
+  }
+  console.error(`ts: translated ${changed + edits.length}, kept ${kept}, renamed ${renamed} locale strings`);
 } else {
   console.error('usage: ts.mjs extract|apply <repo> [en.json]');
   process.exit(2);
