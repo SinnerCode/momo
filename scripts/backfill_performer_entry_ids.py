@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -51,6 +52,7 @@ if str(SRC_DIR) not in sys.path:
 from peach import javdb   # noqa: E402
 from peach.config import STATE_DIR   # noqa: E402
 from peach.entry_links import EXTERNAL_KIND, JAV_DIRECTORIES   # noqa: E402
+from peach.interface_text import dev as t   # noqa: E402
 from peach.performer_alias_followup import match_key, rejection   # noqa: E402
 from peach.review_csv import read_rows, write_rows   # noqa: E402
 from peach.scripting import add_ledger_write_args, open_for_write, verify_after_write   # noqa: E402
@@ -59,9 +61,11 @@ JAVDB, MINNANO = "javdb", "minnano-av"
 #: 复核 CSV 里这两列就是站点 id，列名由产出它们的脚本定下。
 CSV_COLUMNS = {"actor_id": JAVDB, "actress_id": MINNANO}
 
-OK, HAVE, CONFLICT = "ok", "已登记", "冲突"
-TAKEN, NOT_PERFORMER, NAMESAKE = "id 已归他人", "不是女优实体", "站上同名"
-FC2_ONLY = "只有 FC2 作品"
+#: 复核 CSV `verdict` 列：可登记、已登记、对上几个 id 互相冲突、id 已归他人、不是女优实体、站上同名、
+#: 只有 FC2 作品。
+OK, HAVE, CONFLICT = "ok", "registered", "conflict"
+TAKEN, NOT_PERFORMER, NAMESAKE = "taken", "not-performer", "namesake"
+FC2_ONLY = "fc2-only"
 
 FIELDS = ("entity_id", "canonical_name", "provider", "external_id",
           "origin", "verdict", "evidence")
@@ -182,17 +186,17 @@ def plan(connection: sqlite3.Connection, args: argparse.Namespace) -> list[dict]
     if args.javdb_cache and Path(args.javdb_cache).is_dir():
         cache = Path(args.javdb_cache)
         for entity_id, ids in from_page_cache(cache, owners).items():
-            candidates[(JAVDB, entity_id)] = (ids, f"javdb 页面缓存 {cache}")
+            candidates[(JAVDB, entity_id)] = (ids, t("backfill_performer_entry_ids.pageCache", cache=cache))
         carded, namesakes = from_search_cards(cache, owners)
         for entity_id, ids in carded.items():
             have, origin = candidates.get((JAVDB, entity_id), (set(), ""))
             candidates[(JAVDB, entity_id)] = (
-                have | ids, origin or f"javdb 搜索页缓存 {cache}")
+                have | ids, origin or t("backfill_performer_entry_ids.searchCache", cache=cache))
     for path in args.csv:
         for (provider, entity_id), ids in from_csv([path], CSV_COLUMNS).items():
             have, origin = candidates.get((provider, entity_id), (set(), ""))
             candidates[(provider, entity_id)] = (
-                have | ids, f"{origin}；{Path(path).name}".strip("；"))
+                have | ids, t("common.clauseSeparator").join(filter(None, (origin, Path(path).name))))
     names = {int(entity_id): str(written) for entity_id, written in connection.execute(
         "SELECT id,canonical_name FROM entity WHERE kind='performer'")}
     owner = _owner_of(connection)
@@ -208,27 +212,26 @@ def plan(connection: sqlite3.Connection, args: argparse.Namespace) -> list[dict]
         if entity_id not in names:
             rows.append({"entity_id": entity_id, "canonical_name": "", "provider": provider,
                          "external_id": "", "origin": origin, "verdict": NOT_PERFORMER,
-                         "evidence": "账本里这条实体不是女优"})
+                         "evidence": t("backfill_performer_entry_ids.notPerformer")})
             continue
         for external_id in sorted(ids):
             row = {"entity_id": entity_id, "canonical_name": names[entity_id],
                    "provider": provider, "external_id": external_id, "origin": origin,
-                   "verdict": OK, "evidence": f"{origin} 给的 id"}
+                   "verdict": OK, "evidence": t("backfill_performer_entry_ids.idFrom", origin=origin)}
             held = owner.get((provider, external_id))
             others = claimants[(provider, external_id)] - {entity_id}
             if held == entity_id:
-                row.update(verdict=HAVE, evidence="账本里已有这一行")
+                row.update(verdict=HAVE, evidence=t("backfill_performer_entry_ids.alreadyRegistered"))
             elif held is not None:
                 row.update(verdict=TAKEN,
-                           evidence=f"账本里这个 id 挂在实体 {held} 名下")
+                           evidence=t("backfill_performer_entry_ids.idTaken", entityId=held))
             elif others:
                 row.update(verdict=CONFLICT,
-                           evidence="同一个 id 对上 "
-                                    f"{len(others) + 1} 位实体："
-                                    f"{'、'.join(str(x) for x in sorted(others | {entity_id}))}")
+                           evidence=t("backfill_performer_entry_ids.idClaimed", count=len(others) + 1,
+                                      entities=sorted(others | {entity_id})))
             elif provider == JAVDB and entity_id in creators:
                 row.update(verdict=FC2_ONLY,
-                           evidence=f"没有 JAV 目录站 id，带番号的 {creators[entity_id]} 部作品全是 FC2")
+                           evidence=t("backfill_performer_entry_ids.fc2Only", count=creators[entity_id]))
             rows.append(row)
     registered = {entity_id for (provider, _external_id), entity_id in owner.items()
                   if provider == JAVDB}
@@ -236,28 +239,34 @@ def plan(connection: sqlite3.Connection, args: argparse.Namespace) -> list[dict]
         if entity_id in names and entity_id not in registered and (JAVDB, entity_id) not in candidates:
             rows.append({"entity_id": entity_id, "canonical_name": names[entity_id],
                          "provider": JAVDB, "external_id": "",
-                         "origin": f"javdb 搜索页缓存 {args.javdb_cache}", "verdict": NAMESAKE,
-                         "evidence": f"对得上的卡片不止一个人：{'、'.join(ids)}"})
+                         "origin": t("backfill_performer_entry_ids.searchCache", cache=args.javdb_cache),
+                         "verdict": NAMESAKE,
+                         "evidence": t("backfill_performer_entry_ids.severalCards", ids=ids)})
     return rows
 
 
-def apply_rows(connection: sqlite3.Connection, rows: list[dict]) -> tuple[int, int]:
+def apply_rows(connection: sqlite3.Connection, rows: list[dict],
+               records: dict[str, bool] | None = None) -> tuple[int, int]:
     """写入 `ok` 的那些，返回（打算写的条数，真的写进去的条数）。
 
     两个数不相等就是判定和账本对不上——`OR IGNORE` 留着只为让这一趟跑完，不是让它
-    安静地少写几条：数量报出来，差值由人去看。
+    安静地少写几条：数量报出来，差值由人去看。`records` 是缓存卡片上认出的有碼／無碼
+    （`javdb.card_records`），javdb 的 id 在里面就一并记下：同站几枚入口按它分辨（#271）。
     """
     planned = written = 0
     for row in rows:
         if row["verdict"] != OK or not row["external_id"]:
             continue
         planned += 1
+        metadata = {"source": "backfill_performer_entry_ids"}
+        if row["provider"] == JAVDB and row["external_id"] in (records or {}):
+            metadata["uncensored"] = records[row["external_id"]]
         connection.execute(
             "INSERT OR IGNORE INTO entity_external_ref"
             "(entity_id,provider,external_kind,external_id,metadata_json)"
             " VALUES(?,?,?,?,?)",
             (row["entity_id"], row["provider"], EXTERNAL_KIND, row["external_id"],
-             '{"source": "backfill_performer_entry_ids"}'))
+             json.dumps(metadata, ensure_ascii=False)))
         written += connection.execute("SELECT changes()").fetchone()[0]
     connection.commit()
     return planned, written
@@ -265,14 +274,14 @@ def apply_rows(connection: sqlite3.Connection, rows: list[dict]) -> tuple[int, i
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="把 javdb 演员 id 与 minnano-av 女优 id 落成 entity_external_ref")
+        description=t("backfill_performer_entry_ids.description"))
     add_ledger_write_args(parser)
-    parser.add_argument("--out", type=Path, required=True, help="复核 CSV 的落点")
+    parser.add_argument("--out", type=Path, required=True, help=t("backfill_performer_entry_ids.outHelp"))
     parser.add_argument("--javdb-cache", type=Path,
                         default=STATE_DIR / "directory-links" / "javdb",
-                        help="javdb 的页面缓存目录")
+                        help=t("backfill_performer_entry_ids.javdbCacheHelp"))
     parser.add_argument("--csv", type=Path, action="append", default=[],
-                        help="带 entity_id 与 actor_id／actress_id 的复核 CSV，可重复给")
+                        help=t("backfill_performer_entry_ids.csvHelp"))
     return parser
 
 
@@ -284,14 +293,15 @@ def run(args: argparse.Namespace) -> int:
         counts = collections.Counter(str(row["verdict"]) for row in rows)
         by_site = collections.Counter(
             str(row["provider"]) for row in rows if row["verdict"] == OK)
-        print(f"外部入口 id 候选 {len(rows)} 行，复核 CSV：{args.out}")
-        print("  判定分布：", dict(counts))
-        print("  可补的引用：", dict(by_site))
+        print(t("backfill_performer_entry_ids.candidates", count=len(rows), out=args.out))
+        print(t("backfill_performer_entry_ids.verdicts"), dict(counts))
+        print(t("backfill_performer_entry_ids.refsToAdd"), dict(by_site))
         if args.apply:
-            planned, written = apply_rows(connection, rows)
+            records = (javdb.card_records(_cached_pages(args.javdb_cache))
+                       if args.javdb_cache and Path(args.javdb_cache).is_dir() else {})
+            planned, written = apply_rows(connection, rows, records)
             integrity, violations = verify_after_write(connection)
-            print(f"打算写 {planned} 条、实际写入 {written} 条 entity_external_ref；"
-                  f"integrity_check={integrity}、外键违规 {violations} 条")
+            print(t("backfill_performer_entry_ids.written", planned=planned, written=written, integrity=integrity, violations=violations))
             return 1 if violations or integrity != "ok" or planned != written else 0
     finally:
         connection.close()

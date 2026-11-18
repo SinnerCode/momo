@@ -23,11 +23,17 @@ import hashlib
 import os
 import re
 import sqlite3
+import threading
+import time
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
+from . import interface_text
 from .catalog_rules import VERSION_TAIL_TOKENS, release_code_from_filename
+from .content_words import SUBTITLE_LANGUAGE_WORDS
+from .user_messages import UserFacingError
 
 #: 文本字幕：能转成 WebVTT 交给播放器。
 TEXT_FORMATS = {".srt": "srt", ".ass": "ass", ".ssa": "ssa", ".vtt": "vtt"}
@@ -36,26 +42,32 @@ TEXT_FORMATS = {".srt": "srt", ".ass": "ass", ".ssa": "ssa", ".vtt": "vtt"}
 GRAPHIC_FORMATS = {".sub": "sub"}
 SUBTITLE_FORMATS = {**TEXT_FORMATS, **GRAPHIC_FORMATS}
 
-#: 文件名末尾的语言 token → (BCP 47 语言码, 界面标签)。
+#: 文件名末尾的语言 token → BCP 47 语言码。中日韩文写法的 token 是文件名里的原词，在 `content_words`。
 #: `ch` 在这个库里既是「中文字幕版」的版次标记也是语言标记，两种含义指向同一个结论。
-LANGUAGE_TOKENS: dict[str, tuple[str, str]] = {
-    token: ("zh-Hans", "简体中文")
-    for token in ("chs", "gb", "gbk", "sc", "zhcn", "zh-cn", "chi", "chn", "简体", "简中")
+LANGUAGE_TOKENS: dict[str, str] = {
+    **{token: "zh-Hans" for token in ("chs", "gb", "gbk", "sc", "zhcn", "zh-cn", "zh-hans", "chi", "chn")},
+    **{token: "zh-Hant" for token in ("cht", "big5", "tc", "zhtw", "zh-tw", "zhhk", "zh-hk", "zh-hant")},
+    **{token: "zh" for token in ("zh", "ch", "cn", "chinese")},
+    **{token: "en" for token in ("en", "eng", "english")},
+    **{token: "ja" for token in ("ja", "jp", "jpn", "japanese")},
+    **{token: "ko" for token in ("ko", "kor", "korean")},
 }
-LANGUAGE_TOKENS.update({
-    token: ("zh-Hant", "繁體中文")
-    for token in ("cht", "big5", "tc", "zhtw", "zh-tw", "zhhk", "zh-hk", "繁体", "繁體", "繁中")
-})
-LANGUAGE_TOKENS.update({token: ("zh", "中文") for token in ("zh", "ch", "cn", "chinese", "中文", "中字")})
-LANGUAGE_TOKENS.update({token: ("en", "英语") for token in ("en", "eng", "english", "英文", "英语")})
-LANGUAGE_TOKENS.update({token: ("ja", "日语") for token in ("ja", "jp", "jpn", "japanese", "日文", "日语", "日本語")})
-LANGUAGE_TOKENS.update({token: ("ko", "韩语") for token in ("ko", "kor", "korean", "韩文", "韩语")})
+LANGUAGE_TOKENS.update({token: language for language, tokens in SUBTITLE_LANGUAGE_WORDS.items()
+                        for token in tokens})
+#: 语言码 → 界面标签的 code。前端按语言码用 `Intl.DisplayNames` 显示语言名；`track_label` 的原文
+#: 给还不认语言码的调用方兜底。
+LANGUAGE_LABEL_CODES = {
+    "zh-Hans": "labels.subtitles.language.zh-Hans", "zh-Hant": "labels.subtitles.language.zh-Hant",
+    "zh": "labels.subtitles.language.zh", "en": "labels.subtitles.language.en",
+    "ja": "labels.subtitles.language.ja", "ko": "labels.subtitles.language.ko",
+}
 
 #: 剥去之后仍应与正片同名的 token：语言之外，还有 `catalog_rules` 已经认定的版次标记
-#: （`-C` 中文字幕版、`-UC` 无码流出、画质词）。版次表只此一份，不在这里重抄。
+#: （`-C` 中文字幕版、`-UC` 无码、画质词）。版次表只此一份，不在这里重抄。
 _STRIPPABLE = (frozenset(LANGUAGE_TOKENS) | frozenset(VERSION_TAIL_TOKENS)
                | {"forced", "sdh", "default"})
 _SEPARATORS = ".-_ "
+_COMPOUND_LANGUAGES = sorted((token for token in LANGUAGE_TOKENS if "-" in token), key=len, reverse=True)
 #: 一个 stem 最多剥几层：`ABP-758.chs.forced` 是两层，再多就不像是 sidecar 命名了。
 _MAX_STRIPS = 3
 
@@ -95,6 +107,11 @@ def _stem(name: str) -> str:
 
 def _split_tail(stem: str) -> tuple[str, str]:
     """切下 stem 末尾的一个分隔 token；切不动时后半是空串。"""
+    folded = stem.casefold()
+    for token in _COMPOUND_LANGUAGES:
+        start = len(stem) - len(token)
+        if start > 0 and stem[start - 1] in _SEPARATORS and folded.endswith(token):
+            return stem[:start - 1], stem[start:]
     index = max(stem.rfind(separator) for separator in _SEPARATORS)
     if index <= 0:
         return stem, ""
@@ -114,7 +131,7 @@ def language_of(name: str) -> str:
             break
         known = LANGUAGE_TOKENS.get(tail.casefold())
         if known:
-            return known[0]
+            return known
         if tail.casefold() not in _STRIPPABLE:
             break
         stem = head
@@ -122,11 +139,9 @@ def language_of(name: str) -> str:
 
 
 def language_label(language: str) -> str:
-    """语言码对应的界面标签；空语言码返回空串。"""
-    for code, label in LANGUAGE_TOKENS.values():
-        if code == language:
-            return label
-    return language
+    """语言码对应的界面标签（按 zh-CN 渲染）；空语言码返回空串，认不出的语言码原样返回。"""
+    code = LANGUAGE_LABEL_CODES.get(language)
+    return interface_text.text(f"server:{code}") if code else language
 
 
 def track_label(name: str, language: str, video_name: str | None) -> str:
@@ -259,12 +274,26 @@ def file_key(name: str) -> str:
 
 def discover_sidecars(video: Path, video_suffixes: set[str]) -> list[dict]:
     """读取正片所在目录，返回配给当前视频的字幕，不写账本。"""
-    try:
+    from .smb_media import SmbResource
+
+    def wanted(name: str) -> bool:
+        return Path(name).suffix.lower() in video_suffixes or bool(subtitle_format(name))
+
+    def listing() -> list[str]:
+        if isinstance(video, SmbResource):
+            # SMB 共享上的作品不是操作系统路径，经共享列目录；传输层错误已映射为 OSError。
+            return [entry.name for entry in video.parent.scandir()
+                    if wanted(entry.name) and not entry.is_dir and not entry.is_symlink]
         with os.scandir(video.parent) as entries:
-            names = [entry.name for entry in entries
-                     if (Path(entry.name).suffix.lower() in video_suffixes
-                         or subtitle_format(entry.name))
-                     and entry.is_file(follow_symlinks=False)]
+            return [entry.name for entry in entries
+                    if wanted(entry.name) and entry.is_file(follow_symlinks=False)]
+
+    from . import media_io
+    try:
+        # 打开片子时在请求里列目录：网盘答不上按期限抛超时，交调用方决定，不当成「没有字幕」缓存。
+        names = media_io.bounded(media_io.mount_key(video), listing)
+    except TimeoutError:
+        raise
     except OSError:
         return []
     videos = [name for name in names if Path(name).suffix.lower() in video_suffixes]
@@ -282,7 +311,40 @@ def discover_sidecars(video: Path, video_suffixes: set[str]) -> list[dict]:
     return found
 
 
-class SubtitleUndecodable(ValueError):
+#: 同目录字幕的发现结果留这么久（`SidecarListings`）。新放进去的字幕最多晚这么久出现。
+SIDECAR_LISTING_TTL = 120.0
+
+
+class SidecarListings:
+    """`discover_sidecars` 按视频路径缓存一小段时间。
+
+    打开一部片子时，字幕列表一次、每条轨各一次，都要先列一遍正片目录；目录在网盘上时
+    每次都是一趟网络往返。只缓存目录列举，字幕正文照旧现读：删掉的字幕立即取不到。
+    """
+
+    def __init__(self, *, ttl: float = SIDECAR_LISTING_TTL, limit: int = 256, clock=time.monotonic):
+        self.ttl, self.limit, self.clock = ttl, limit, clock
+        self._rows: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def discover(self, video: Path, video_suffixes: set[str]) -> list[dict]:
+        key = str(video)
+        now = self.clock()
+        with self._lock:
+            hit = self._rows.get(key)
+            if hit is not None and now - hit[0] < self.ttl:
+                self._rows.move_to_end(key)
+                return [dict(row) for row in hit[1]]
+        rows = discover_sidecars(video, video_suffixes)
+        with self._lock:
+            self._rows[key] = (now, rows)
+            self._rows.move_to_end(key)
+            while len(self._rows) > self.limit:
+                self._rows.popitem(last=False)
+        return [dict(row) for row in rows]
+
+
+class SubtitleUndecodable(UserFacingError, ValueError):
     """字节按已知编码都读不出来。消息可以直接给人看。"""
 
 
@@ -311,7 +373,7 @@ def decode(data: bytes) -> str:
             return data.decode(encoding)
         except UnicodeDecodeError:
             continue
-    raise SubtitleUndecodable("编码未识别")
+    raise SubtitleUndecodable("errors.subtitles.encodingUnknown")
 
 
 _TIME = re.compile(r"(\d{1,3}):([0-5]\d):([0-5]\d)[,.](\d{1,3})")
@@ -415,7 +477,7 @@ def _wrap(cues: Sequence[str]) -> str:
 def to_webvtt(data: bytes, fmt: str) -> str:
     """字幕字节 → WebVTT 文本。格式不可播或编码认不出来都抛异常。"""
     if not is_playable_format(fmt):
-        raise SubtitleUndecodable("图形字幕不能作为文本轨播放")
+        raise SubtitleUndecodable("errors.subtitles.imageSubtitle")
     text = decode(data)
     if fmt == "vtt":
         return vtt_passthrough(text)

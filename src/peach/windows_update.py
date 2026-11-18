@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
+from . import interface_text, process_job
 from .fsutil import atomic_write_text, replace_with_retry
 
 
@@ -20,6 +21,11 @@ log = logging.getLogger(__name__)
 BACKUP_GLOB = "Peach.pre-source-sync-*.exe"
 STAGING_DIRNAME = "source-sync-build"
 KEEP_BACKUPS = 2
+#: 「同步源码」各步的期限（秒）：超时收掉整棵进程树，按这一步失败处理，托盘和服务保持原样。
+#: 完整测试本机要一个多小时，构建十来分钟，暂存包的 `migrate status` 只开库读版本。
+TEST_SECONDS = 4 * 3600
+BUILD_SECONDS = 3600
+MIGRATE_STATUS_SECONDS = 300
 
 WINDOWS_TRAY_INPUTS = (
     "src/peach/",
@@ -50,8 +56,14 @@ class PendingWindowsUpdate:
 
 @dataclass(frozen=True)
 class WindowsUpdatePreparation:
+    """`message` 进托盘通知，按本机语言渲染（`tray.sourceSync.*`）。"""
+
     state: str
     message: str
+
+    @classmethod
+    def of(cls, state: str, code: str) -> "WindowsUpdatePreparation":
+        return cls(state, interface_text.text(f"server:{code}", None, interface_text.local_language()))
 
 
 #: PyInstaller 单文件包解压目录的固定前缀，位于 `%TEMP%`。
@@ -86,7 +98,7 @@ def sweep_onefile_extractions(
                 continue
             shutil.rmtree(entry)
         except OSError as exc:
-            log.warning("单文件包解压残留未能删除 %s: %s", entry, exc)
+            log.warning("Failed to delete one-file bundle extraction leftovers %s: %s", entry, exc)
             continue
         removed.append(entry)
     return tuple(removed)
@@ -107,11 +119,11 @@ def swap_tray_binary(
     才会按 `KEEP_BACKUPS` 收口；换个名字就会在 `dist/Peach/` 里越堆越多。
     """
     if not staged.is_file():
-        raise FileNotFoundError(f"暂存包不存在：{staged}")
+        raise FileNotFoundError(f"staged package not found: {staged}")
     if target.name.lower() != "peach.exe" or not target.is_file():
-        raise ValueError(f"生产入口不存在或不是 Peach.exe：{target}")
+        raise ValueError(f"production entry point is missing or is not Peach.exe: {target}")
     if os.path.normcase(os.path.abspath(staged)) == os.path.normcase(os.path.abspath(target)):
-        raise ValueError("暂存包与生产入口是同一个文件")
+        raise ValueError("staged package and production entry point are the same file")
 
     backup = target.with_name(f"Peach.pre-source-sync-{now().strftime('%Y%m%d-%H%M%S')}.exe")
     shutil.copy2(target, backup)
@@ -133,7 +145,7 @@ class WindowsUpdateInstaller:
         state_dir: Path,
         log_dir: Path,
         current_executable: Path | None = None,
-        run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        run: Callable[..., subprocess.CompletedProcess] = process_job.run,
         popen: Callable[..., subprocess.Popen] = subprocess.Popen,
         powershell: str | None = None,
         frozen: bool | None = None,
@@ -189,7 +201,7 @@ class WindowsUpdateInstaller:
             try:
                 stale.unlink()
             except OSError as exc:
-                log.warning("旧托盘备份未能删除 %s: %s", stale, exc)
+                log.warning("Failed to delete old tray backup %s: %s", stale, exc)
                 continue
             removed.append(stale)
 
@@ -204,7 +216,7 @@ class WindowsUpdateInstaller:
                 try:
                     shutil.rmtree(entry)
                 except OSError as exc:
-                    log.warning("暂存构建未能删除 %s: %s", entry, exc)
+                    log.warning("Failed to delete staged build %s: %s", entry, exc)
                     continue
                 removed.append(entry)
         return tuple(removed)
@@ -219,21 +231,30 @@ class WindowsUpdateInstaller:
         known = Path(r"C:\Program Files\PowerShell\7\pwsh.exe")
         return str(known) if known.is_file() else None
 
-    def _run_logged(self, command: list[str], *, append: bool = True) -> int:
+    def _run_logged(self, command: list[str], *, timeout: float, append: bool = True,
+                    env: dict[str, str] | None = None) -> int | None:
+        """跑一步并把输出记进 `log_path`；超时收掉整棵进程树，日志里记一行，返回 None。"""
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if append else "w"
         with self.log_path.open(mode, encoding="utf-8", errors="replace") as log:
             log.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] {' '.join(command)}\n")
             log.flush()
-            result = self._run(
-                command,
-                cwd=str(self.root),
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=False,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
+            try:
+                result = self._run(
+                    command,
+                    cwd=str(self.root),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    env=env,
+                    timeout=timeout,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+            except subprocess.TimeoutExpired:
+                log.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] "
+                          f"timed out after {timeout:g}s; the process tree was stopped\n")
+                return None
         return result.returncode
 
     def build_staged_tray(self, commit: str, *, shell: str | None = None) -> Path | None:
@@ -254,7 +275,7 @@ class WindowsUpdateInstaller:
         build_exit = self._run_logged([
             shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(build_script),
             "-OutputDirectory", str(staging_dir),
-        ])
+        ], timeout=BUILD_SECONDS)
         if build_exit != 0 or not staged.is_file():
             return None
         return staged
@@ -267,67 +288,47 @@ class WindowsUpdateInstaller:
         """
         reset_environment = os.environ.copy()
         reset_environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8", errors="replace") as log:
-            validation = self._run(
-                [str(staged), "migrate", "status"],
-                cwd=str(self.root), stdin=subprocess.DEVNULL, stdout=log,
-                stderr=subprocess.STDOUT, check=False, env=reset_environment,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-        return validation.returncode == 0
+        return self._run_logged([str(staged), "migrate", "status"], timeout=MIGRATE_STATUS_SECONDS,
+                                env=reset_environment) == 0
 
     def prepare(
         self, commit: str, changed_paths: tuple[str, ...],
     ) -> WindowsUpdatePreparation:
         shell = self._powershell_executable()
         if shell is None:
-            return WindowsUpdatePreparation(
-                "failed", "代码已快进，但找不到 PowerShell，未运行测试或重启服务。",
-            )
+            return WindowsUpdatePreparation.of("failed", "tray.sourceSync.noPowerShell")
 
         test_script = self.root / "scripts" / "test.ps1"
         for attempt in range(3):
             test_exit = self._run_logged(
                 [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(test_script),
                  "-Scope", "full", "-Fresh"],
-                append=attempt > 0,
+                timeout=TEST_SECONDS, append=attempt > 0,
             )
             # test_runner 的 4 表示验证期间输入变化；最多三次，每次取得完整有效记录。
             if test_exit != 4:
                 break
+        if test_exit is None:
+            return WindowsUpdatePreparation.of("failed", "tray.sourceSync.testsTimedOut")
         if test_exit == 4:
-            return WindowsUpdatePreparation(
-                "failed", "测试期间代码或依赖持续变化，三次验证均未取得有效记录；请稍后重试。",
-            )
+            return WindowsUpdatePreparation.of("failed", "tray.sourceSync.inputsKeptChanging")
         if test_exit != 0:
-            return WindowsUpdatePreparation(
-                "failed", "代码已快进，但完整测试失败；服务与托盘均未重启，请查看日志。",
-            )
+            return WindowsUpdatePreparation.of("failed", "tray.sourceSync.testsFailed")
 
         if not windows_tray_rebuild_required(changed_paths):
-            return WindowsUpdatePreparation("services", "代码与完整测试已通过。")
+            return WindowsUpdatePreparation.of("services", "tray.sourceSync.testsPassed")
 
         if not self._frozen:
-            return WindowsUpdatePreparation(
-                "services-manual-tray",
-                "代码与完整测试已通过；当前不是打包托盘，托盘进程需手动重开。",
-            )
+            return WindowsUpdatePreparation.of("services-manual-tray", "tray.sourceSync.manualTray")
 
         if not self.current_executable.is_file():
-            return WindowsUpdatePreparation(
-                "failed", "代码与测试已通过，但找不到当前托盘 EXE，未执行替换。",
-            )
+            return WindowsUpdatePreparation.of("failed", "tray.sourceSync.trayExeMissing")
 
         staged = self.build_staged_tray(commit, shell=shell)
         if staged is None:
-            return WindowsUpdatePreparation(
-                "failed", "代码与测试已通过，但新托盘构建失败；旧托盘和服务保持运行。",
-            )
+            return WindowsUpdatePreparation.of("failed", "tray.sourceSync.buildFailed")
         if not self.packaged_migrations_pass(staged):
-            return WindowsUpdatePreparation(
-                "failed", "新托盘未通过打包迁移资源检查；旧托盘和服务保持运行。",
-            )
+            return WindowsUpdatePreparation.of("failed", "tray.sourceSync.packagedMigrationsFailed")
 
         backup = self.current_executable.with_name(
             f"Peach.pre-source-sync-{datetime.now().strftime('%Y%m%d-%H%M%S')}.exe"
@@ -336,9 +337,7 @@ class WindowsUpdateInstaller:
         helper_python = self.root / ".venv" / "Scripts" / "pythonw.exe"
         helper_script = self.root / "scripts" / "replace_windows_tray.py"
         if not helper_python.is_file() or not helper_script.is_file():
-            return WindowsUpdatePreparation(
-                "failed", "新托盘已构建，但替换助手不完整；旧托盘和服务保持运行。",
-            )
+            return WindowsUpdatePreparation.of("failed", "tray.sourceSync.helperIncomplete")
 
         creationflags = 0
         if os.name == "nt":
@@ -359,9 +358,5 @@ class WindowsUpdateInstaller:
                 shell=False, creationflags=creationflags,
             )
         except OSError:
-            return WindowsUpdatePreparation(
-                "failed", "新托盘已构建，但替换助手启动失败；旧托盘和服务保持运行。",
-            )
-        return WindowsUpdatePreparation(
-            "replace", "代码、完整测试和新托盘检查均已通过；正在安全替换并重启。",
-        )
+            return WindowsUpdatePreparation.of("failed", "tray.sourceSync.helperFailed")
+        return WindowsUpdatePreparation.of("replace", "tray.sourceSync.replacing")

@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .catalog_rules import normalise_code_key
+from .coded_text import Said
 from .classification import creator_collection_base
 from .entities import canonicalize_entity_name, normalize_entity_name, upsert_asset_entity
 from .entity_classification import trusted_sql, write_claim
@@ -78,11 +79,11 @@ def existing_account(connection, rows: list[dict]) -> tuple[int | None, str]:
             (name, name)).fetchall()
         found.update(int(item[0]) for item in matches)
     if len(found) > 1:
-        return None, '同名命中多个账号'
+        return None, Said('labels.fc2Sellers.nameMatchesAccounts')
     entity_id = next(iter(found), None)
     if entity_id and connection.execute("SELECT 1 FROM entity_external_ref WHERE entity_id=? AND provider='fc2' "
                                        "AND external_kind='creator' AND external_id<>?", (entity_id, account)).fetchone():
-        return None, '同名对应不同 FC2 账号'
+        return None, Said('labels.fc2Sellers.nameOtherAccount')
     return entity_id, ''
 
 
@@ -95,7 +96,7 @@ def _account_groups(connection, groups, skipped):
     for account, rows in sorted(groups.items()):
         entity_id, conflict = existing_account(connection, rows)
         if not entity_id and any(len(names[normalize_entity_name(row['name'])]) > 1 for row in rows):
-            conflict = '不同 FC2 账号使用相同卖家名称'
+            conflict = Said('labels.fc2Sellers.sharedName')
         if conflict:
             skipped.append({'account': account, 'reason': conflict})
         else:
@@ -118,7 +119,7 @@ def collect(connection, root: Path) -> dict:
     skipped = []
     for code, rows in sorted(by_code.items()):
         if len({row['account'] for row in rows}) != 1:
-            skipped.append({'code': code, 'reason': '作品来源给出不同卖家账号'})
+            skipped.append({'code': code, 'reason': Said('labels.fc2Sellers.conflictingAccounts')})
         else:
             groups[rows[0]['account']].extend(rows)
     accounts = _account_groups(connection, groups, skipped)
@@ -141,7 +142,9 @@ def _claim(connection, entity_id, record, owner):
                           "AND value='seller' AND " + trusted_sql(), (entity_id,)).fetchone():
         return
     write_claim(connection, entity_id=entity_id, facet='account_role', value='seller', source=owner,
-                source_url=record['source_url'], evidence=f"作品 {record['code']} 的販売者：{record['name']}；账号 {record['account_url']}",
+                source_url=record['source_url'],
+                evidence=Said('labels.fc2Sellers.evidence', code=record['code'], name=record['name'],
+                              account=record['account_url']),
                 status='observed', confidence=1)
 
 
@@ -161,7 +164,7 @@ def _associate(connection, entity_id, name, record, metadata, batch, skipped):
     for asset_id in record['asset_ids']:
         asset = connection.execute("SELECT code FROM asset WHERE id=? AND medium='video' AND disposal IS NULL", (asset_id,)).fetchone()
         if not asset or normalise_code_key(asset[0]) != record['code']:
-            raise ValueError('卖家作品计划已过期')
+            raise ValueError('seller plan is stale: video no longer matches')
         if entity_id and connection.execute("SELECT 1 FROM asset_entity WHERE asset_id=? AND entity_id=? AND role='creator'",
                                             (asset_id, entity_id)).fetchone():
             linked = entity_id
@@ -170,13 +173,13 @@ def _associate(connection, entity_id, name, record, metadata, batch, skipped):
             source=batch, metadata=payload, update_entity_metadata=False)
         if landed is None:
             skipped.append({'account': record['account'], 'code': record['code'], 'asset_id': asset_id,
-                            'reason': '摄取判定不收这个卖家名'})
+                            'reason': Said('labels.fc2Sellers.rejectedName')})
             continue
         actual = connection.execute('SELECT kind FROM entity WHERE id=?', (landed,)).fetchone()
         if not actual or actual[0] != 'creator':
-            raise ValueError('卖家账号与已合并出演身份冲突')
+            raise ValueError('seller account conflicts with a merged performer identity')
         if entity_id and landed != entity_id:
-            raise ValueError('卖家身份计划已过期：摄取认到另一个账号')
+            raise ValueError('seller plan is stale: ingestion resolved a different account')
         entity_id = linked = landed
     return linked
 
@@ -185,12 +188,12 @@ def _install_account(connection, group, batch, skipped):
     first = group['records'][0]
     entity_id = group['entity_id']
     if existing_account(connection, group['records']) != (entity_id, ''):
-        raise ValueError('卖家身份计划已过期')
+        raise ValueError('seller plan is stale')
     name = first['name']
     if entity_id:
         held = connection.execute('SELECT kind,canonical_name FROM entity WHERE id=?', (entity_id,)).fetchone()
         if not held or held[0] != 'creator':
-            raise ValueError('账号身份已变化')
+            raise ValueError('account identity changed')
         name = held[1]
     metadata = {'source': SOURCE, 'batch': batch, 'account_url': first['account_url']}
     installed = None
@@ -209,7 +212,7 @@ def _install_account(connection, group, batch, skipped):
     other = connection.execute("SELECT external_id FROM entity_external_ref WHERE entity_id=? AND provider='fc2' "
                                "AND external_kind='creator'", (entity_id,)).fetchone()
     if other and other[0] != first['account']:
-        raise ValueError('卖家身份计划已过期：账号已绑定另一个 FC2 账号')
+        raise ValueError('seller plan is stale: the account is already bound to another FC2 account')
     if not other:
         connection.execute("INSERT INTO entity_external_ref(entity_id,provider,external_kind,external_id,metadata_json) VALUES(?,'fc2','creator',?,?)",
                            (entity_id, first['account'], json.dumps(metadata)))
@@ -220,12 +223,45 @@ def _install_account(connection, group, batch, skipped):
 def install(connection, frozen: dict, *, batch: str) -> dict:
     """追加卖家关系，保留出演者、扁平字段和既有账号资料。"""
     if not batch.startswith(SOURCE + '@'):
-        raise ValueError('卖家批次需要明确来源前缀')
+        raise ValueError(f'seller batch must start with {SOURCE}@')
     before = connection.total_changes
     skipped: list[dict] = []
     ids = [_install_account(connection, group, batch, skipped) for group in frozen['accounts']]
     return {'entity_ids': sorted({entity_id for entity_id in ids if entity_id}), 'skipped': skipped,
             'changes': connection.total_changes - before}
+
+
+def _pending_accounts(connection, frozen: dict, asset_ids=None) -> list[dict]:
+    """计划里还有作品没挂上卖家账号的那些账号；`asset_ids` 给了就只看含这些作品的。"""
+    wanted = None if asset_ids is None else {int(value) for value in asset_ids}
+    linked = {row[0] for row in connection.execute(
+        "SELECT asset_id FROM asset_entity WHERE role='creator' AND source LIKE ?", (SOURCE + '@%',))}
+    accounts = []
+    for group in frozen['accounts']:
+        ids = {asset_id for record in group['records'] for asset_id in record['asset_ids']}
+        if (wanted is None or ids & wanted) and ids - linked:
+            accounts.append(group)
+    return accounts
+
+
+def pending(connection, root: Path) -> bool:
+    """整库补一次时有没有要挂的，只读；有才先备份。"""
+    return bool(_pending_accounts(connection, collect(connection, root)))
+
+
+def land(connection, root: Path, *, asset_ids=None, now: str | None = None) -> dict:
+    """自动落库那一步：来源快照已写明卖家、还没挂上卖家账号的 FC2 作品，按同一份计划挂上。
+
+    `asset_ids` 给了就只处理含这些作品的账号——刚采完资料的那几部，以及后来才认出番号
+    的副本；不给就是整库补一次（升级补修）。已挂上的跳过，所以重复跑不改任何东西；
+    计划过期或与已合并的人物冲突时这一批整批不写，留给下一轮。批次号按时刻记，整批可撤。
+    """
+    frozen = collect(connection, root)
+    accounts = _pending_accounts(connection, frozen, asset_ids)
+    if not accounts:
+        return {'entity_ids': [], 'skipped': frozen['skipped'], 'changes': 0}
+    moment = now or datetime.now(timezone.utc).isoformat()
+    return install(connection, {**frozen, 'accounts': accounts}, batch=f'{SOURCE}@{moment}')
 
 
 def planned_revert(connection, source: str, batch: str) -> list[dict]:

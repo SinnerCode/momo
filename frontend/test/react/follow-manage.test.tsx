@@ -14,15 +14,16 @@ import {
   authorAvatar, authorGroups, authorInitial, authorName, checkReceipt, checkSummary, errorHeadline, feedIntervalText, FEEDS_CHECK_URL, FEED_SOURCE_URL,
   FEEDS_LOOKUP_URL, FEEDS_URL, FOLLOW_CHECK_URL, FOLLOW_MANAGE_KEY,
   FOLLOW_CREDENTIAL_URL, FOLLOW_CREDENTIALS_URL, FOLLOW_RESOLVE_URL, FOLLOW_SOURCE_URL,
-  FOLLOW_SUGGEST_URL, FOLLOW_URL, pageWindow, prefetchFollowManage,
+  FOLLOW_STATUS_URL, FOLLOW_SUGGEST_URL, FOLLOW_URL, MARK_BATCH, markAllPending, pageWindow, prefetchFollowManage,
   sortLabel, SUGGEST_DEBOUNCE_MS, tableRows,
   type CheckJob, type CredentialData, type CredentialRow, type FeedLookup, type FeedsData, type FollowData,
   type FollowSource, type ResolveJob, type SuggestData,
 } from '../../src/react/follow-manage/follow-manage';
 import { FollowManagePage } from '../../src/react/follow-manage/follow-manage-page';
+import { AuthorAvatar } from '../../src/react/follow-manage/source-view';
 import { Credentials } from '../../src/react/follow-manage/credentials';
 
-import { actionOrder, buttonNamed, choose, click, linkNamed, mountRoot, settle, type } from './render';
+import { actionOrder, buttonNamed, choose, click, linkNamed, mountRoot, pending, settle, type } from './render';
 
 // 客户端是模块级的单例（所有 React 根共用一个），用例之间不清就互相喂数据。
 afterEach(() => queryClient.clear());
@@ -94,7 +95,7 @@ interface Plan {
   /** 登记一条来源。回 `refuse(...)` 就是这一条被服务端挡回来。 */
   add?: (body: { url: string; label: string }) => unknown;
   /** 订阅源清单。 */
-  feeds?: FeedsData;
+  feeds?: FeedsData | Promise<FeedsData>;
   /** 订阅源的开关、移除与按名字登记。回 `refuse(...)` 就是这一次被服务端挡回来。 */
   feedWrite?: (body: { action: string; id?: number; name?: string; ids?: string[] }) => unknown;
   /** 按女优名到 JavDB 搜演员卡的结果。回 `refuse(...)` 就是这一趟被服务端挡回来。 */
@@ -107,7 +108,7 @@ function serve(plan: Plan = {}) {
   const fetcher = vi.fn(async (input: string, init?: RequestInit) => {
     const url = String(input);
     const body = init?.body ? JSON.parse(String(init.body)) : null;
-    if (url === FEEDS_URL) return ok(plan.feeds ?? { sources: [], unread: 0 });
+    if (url === FEEDS_URL) return ok(await (plan.feeds ?? { sources: [], unread: 0 }));
     if (url === FEED_SOURCE_URL && plan.feedWrite) return plan.feedWrite(body);
     if (url === FEED_SOURCE_URL || url === FEEDS_CHECK_URL) return ok({ ok: true });
     if (url.startsWith(`${FEEDS_LOOKUP_URL}?`)) {
@@ -182,6 +183,18 @@ async function open(plan: Plan = {}, over: Partial<Props> = {}) {
 }
 
 const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms) });
+
+it('订阅响应未完成时先显示关注读数与列表，订阅读数独立等待', async () => {
+  const delayed = pending<FeedsData>();
+  const { host } = await open({ feeds: delayed.answer });
+  expect(host.querySelector('[data-measured-reading="creators"] [aria-busy="true"]')).toBeNull();
+  expect(host.querySelector('[data-measured-reading="subscriptions"] [aria-busy="true"]')).not.toBeNull();
+  expect(host.querySelector('[data-follow-toolbar-actions]')).not.toBeNull();
+  await delayed.release({ sources: [], unread: 9 });
+  await settle();
+  expect(host.querySelector('[data-measured-reading="releases"] [aria-busy="true"]')).toBeNull();
+  expect(host.querySelector('[data-measured-reading="releases"] [data-follow-reading]')?.textContent).toBe('9 条');
+});
 
 const cards = (root: ParentNode) => [...root.querySelectorAll('section[aria-label$="的关注来源"]')];
 
@@ -272,7 +285,7 @@ it('检查回执保留新增、更新与失败，详细统计由完整结果承�
       history_skipped: 862, probed: 241 },
     { ok: false },
   ] } as CheckJob;
-  expect(checkReceipt(job)).toBe('已检查 2 个来源：新增 3 条 · 更新 2933 条 · 1 个失败');
+  expect(checkReceipt(job)).toBe('已检查 2 个来源：新增 3 条 · 更新 2,933 条 · 1 个失败');
   expect(checkSummary(job)).toContain('跳过 281 条无资源');
   expect(checkSummary(job)).toContain('回查 241 条');
   expect(checkReceipt({ results: [{ ok: true }] })).toBe('已检查 1 个来源：没有更新');
@@ -306,6 +319,7 @@ it('勾选跨页也跨视图，批量发出去的是整个 ID 集合', async () 
   const many = Array.from({ length: 12 }, (_, at) => source({
     id: at + 1, author_key: `name:人${at}`, author_name: `人${at}`,
   }));
+  const { asked } = stubConfirm(true);
   const { host, fetcher } = await open({ data: follow({ sources: many }) }, { pageSize: 10 });
 
   await click(checkboxNamed(host, '全选本页来源'));
@@ -320,6 +334,7 @@ it('勾选跨页也跨视图，批量发出去的是整个 ID 集合', async () 
 
   await click([...host.querySelectorAll('button')].find((b) => b.textContent === '暂停'));
   await settle();
+  expect(asked[0]).toMatchObject({ title: '暂停所选来源', body: expect.stringContaining('将暂停选中的 11 个关注来源') });
   const writes = sentBody(fetcher, FOLLOW_SOURCE_URL);
   expect(writes).toHaveLength(11);
   expect(writes.map((body) => body.id).sort((a, b) => a - b))
@@ -341,6 +356,7 @@ it('换成表格视图时勾选还是那一批', async () => {
 });
 
 it('表格视图把每条来源摊成一行，勾的还是来源 ID', async () => {
+  stubConfirm(true);
   const { host, fetcher } = await open({}, { layout: 'table' });
 
   expect([...host.querySelectorAll('[role="columnheader"]:not([data-table-space])')].map((cell) => cell.textContent?.trim()))
@@ -362,6 +378,7 @@ it('关注表格分页和排序保留来源选择，批量操作覆盖跨页集�
   const many = Array.from({ length: 12 }, (_, at) => source({
     id: at + 1, label: `来源 ${String(at + 1).padStart(2, '0')}`,
   }));
+  stubConfirm(true);
   const { host, fetcher } = await open({ data: follow({ sources: many }) }, {
     layout: 'table', pageSize: 10, sort: 'source', dir: 'asc',
   });
@@ -577,11 +594,13 @@ it('首字母取创作者名里的第一个拉丁字母或数字，没有才取�
   expect(authorInitial('初音')).toBe('初');
 });
 
-it('头像先用官方的，取不下来退到镜像的，再取不下来画首字母', async () => {
+it('没有实体图时头像先用官方的，取不下来退到镜像的，再取不下来画首字母', async () => {
   const official = source({ id: 1, official_avatar_url: '/official.png' });
   const mirror = source({ id: 2, avatar_url: '/mirror.png' });
   expect(authorAvatar([mirror, official])).toEqual({ src: '/official.png', fallback: '/mirror.png' });
   expect(authorAvatar([mirror])).toEqual({ src: '/mirror.png', fallback: '' });
+  expect(authorAvatar([{ ...mirror, cached_avatar_url: '/mirror.png' }, official]))
+    .toEqual({ src: '/mirror.png', fallback: '/official.png' });
 
   const kou = { author_key: 'name:kou', author_name: 'kou' };
   const { host } = await open({ data: follow({ sources: [
@@ -594,6 +613,18 @@ it('头像先用官方的，取不下来退到镜像的，再取不下来画首�
   await act(async () => { avatar().dispatchEvent(new Event('error')) });
   expect(avatar().tagName).toBe('SPAN');
   expect(avatar().textContent).toBe('K');
+});
+
+it('创作者圆标复用已安装实体头像的版本与取景', async () => {
+  const { host } = await mountRoot(<AuthorAvatar name="Author" small group={[source({
+    id: 1, official_avatar_url: '/official.png', author_entity: {
+      id: 77, name: 'Author', has_image: true, image_version: 'saved-photo',
+      avatar_focus: { axis: 'y', pct: 20 },
+    },
+  })]} />);
+  expect(host.querySelector('img')?.getAttribute('src')).toBe('/entity-image?kind=creator&id=77&thumb=1&v=saved-photo');
+  expect(host.querySelector('img')?.getAttribute('style')).toContain('20%');
+  expect(host.querySelector('img[src="/official.png"]')).toBeNull();
 });
 
 it('按状态正序先列要处理的：失败、暂停、未检查、正常', () => {
@@ -613,6 +644,7 @@ const listReads = (fetcher: ReturnType<typeof serve>) => fetcher.mock.calls.filt
   String(input).startsWith(`${FOLLOW_URL}?`) && !(init as RequestInit | undefined)?.method).length;
 
 it('暂停只改那一条的状态，不把整张清单重取一遍', async () => {
+  stubConfirm(true);
   const { host, fetcher } = await open();
   const before = listReads(fetcher);
   await click(checkboxNamed(host, '选择 甲 · Kemono'));
@@ -713,7 +745,7 @@ it('关注列表空状态直接切换添加页签并保留页面宿主', async (
 it('各栏按做事的先后排，缺凭据的数挂在最后一栏上', async () => {
   const { host } = await open({ creds: { root: 'C:\\creds', providers: [credential({ provider: 'fanbox' })] } });
   expect([...host.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent))
-    .toEqual(['关注列表', '添加关注', '标签管理']);
+    .toEqual(['关注列表', '添加关注']);
   expect(linkNamed('来源与订阅设置（1）', host)?.getAttribute('href')).toBe('/settings/subscriptions');
 });
 
@@ -790,7 +822,8 @@ it('关注列表首屏带着订阅源清单，开关、移除与立即拉取都�
     { action: 'enabled', id: 5, enabled: true }, { action: 'remove', id: 4 },
   ]);
   // 行尾的拉取键只点名这一条，停着的也拉；「立即拉取」才是全部启用的源。
-  expect(sentBody(fetcher, FEEDS_CHECK_URL)).toEqual([{ sources: [5] }, { all: true }]);
+  // 都在后台发起：服务端不占着线程等这一轮跑完。
+  expect(sentBody(fetcher, FEEDS_CHECK_URL)).toEqual([{ sources: [5], background: true }, { all: true, background: true }]);
   expect(feedReads(fetcher)).toBeGreaterThan(1);
 });
 
@@ -810,8 +843,9 @@ it('同一个人的两页各一行，旧艺名那页在名字旁写出站上的�
   expect(readings.slice(-2)).toEqual(['JAV 订阅2 位', '未看新作81 条']);
 });
 
-it('订阅源表里点一行的空白处就是选这一行，选中了底部浮出批量操作，暂停逐条写到订阅源接口', async () => {
-  const { host, fetcher } = await open({ feeds: FEEDS }, { tab: 'list' });
+it('订阅源表里点一行的空白处就是选这一行，选中了底部浮出批量操作，暂停先确认、只写状态要变的源', async () => {
+  const { asked } = stubConfirm(true);
+  const { host, fetcher, props } = await open({ feeds: FEEDS }, { tab: 'list' });
   const row = () => checkboxNamed(host, '选择 乙 的新作')!.closest('[role="row"]')!;
   const blank = () => [...row().querySelectorAll('[role="rowheader"],[role="gridcell"]')]
     .find((cell) => cell.textContent?.trim() === '每 30 分钟')!;
@@ -829,9 +863,10 @@ it('订阅源表里点一行的空白处就是选这一行，选中了底部浮�
   expect(host.textContent).toContain('已选 2 条订阅源');
   await click([...host.querySelectorAll('[data-selection-dock] button')].find((b) => b.textContent === '暂停'));
   await settle();
-  expect(sentBody(fetcher, FEED_SOURCE_URL)).toEqual([
-    { action: 'enabled', id: 4, enabled: false }, { action: 'enabled', id: 5, enabled: false },
-  ]);
+  expect(asked[0]).toMatchObject({ title: '暂停所选订阅源', body: expect.stringContaining('将暂停选中的 2 条订阅源') });
+  // 乙 本来就停着，只写真的要变的那条；撤销也只改回这一条。
+  expect(sentBody(fetcher, FEED_SOURCE_URL)).toEqual([{ action: 'enabled', id: 4, enabled: false }]);
+  expect(props.toast).toHaveBeenCalledWith('已暂停 2 条订阅源', { undo: expect.any(Function) });
   expect(host.querySelector('[data-selection-dock]')).toBeNull();
 });
 
@@ -985,7 +1020,7 @@ function nameField(root: ParentNode): HTMLInputElement {
 
 const actorPanel = (root: ParentNode) => root.querySelector('section[aria-label="添加 JAV 订阅"]')!;
 
-const card = (id: string, names: string[], record = '', held_by: FeedLookup['known'] = null) =>
+const card = (id: string, names: string[], record = '', held_by: { id: number; name: string } | null = null) =>
   ({ id, names, record, url: `https://javdb.com/actors/${id}`, held_by, matched: [] });
 
 const LOOKUP: FeedLookup = {
@@ -1096,6 +1131,23 @@ it('回车也是查找；勾的卡已在数据库里谁名下就说会挂给谁�
   expect(host.textContent).toContain('所勾的卡分属数据库里不同的人：甲、乙');
   expect(buttonNamed('添加订阅（2）', host)?.disabled).toBe(true);
   expect(sentBody(fetcher, FEED_SOURCE_URL)).toEqual([]);
+});
+
+it('JavDB 搜不成时，库里已有编号的她可以直接订，原因照样说明', async () => {
+  const lookup = vi.fn(() => ({ ...LOOKUP, suggested: [], candidates: [], unavailable: 'JavDB 没有搜成：来源正在冷却',
+    known: { id: 5, name: '瀬戸環奈', subscribable: true, following: false } }));
+  const feedWrite = vi.fn(() => ok({ ok: true, entity_id: 5, following: true, sources: [7] }));
+  const { host, props } = await open({ feeds: FEEDS, lookup, feedWrite }, { tab: 'add' });
+  await type(nameField(host), '瀬戸環奈');
+  await click(buttonNamed('查找', actorPanel(host)));
+  await settle();
+  expect(host.textContent).toContain('JavDB 没有搜成：来源正在冷却');
+  expect(host.textContent).toContain('数据库里的「瀬戸環奈」已有 JavDB 或 DMM 编号，可以直接订阅。');
+  expect(host.textContent).not.toContain('JavDB 上没有搜到这个名字。');
+  await click(buttonNamed('订阅「瀬戸環奈」', host));
+  await settle();
+  expect(feedWrite).toHaveBeenCalledWith({ action: 'follow', entity_id: 5, enabled: true });
+  expect(props.toast).toHaveBeenCalledWith('已订阅「瀬戸環奈」的新作');
 });
 
 it('查找被服务端挡回时原因摆在卡里，没有候选时直说', async () => {
@@ -1246,7 +1298,7 @@ it('等待时说的话跟着这一趟查的是名字还是链接走', async () =
     return said;
   };
   // 按名字查的第一趟要下载创作者索引，几十秒没有动静得先说一声；贴链接不走索引。
-  expect(await hint('kou')).toContain('首次按名字查要下载创作者索引');
+  expect(await hint('kou')).toContain('首次按名字查要先下载索引');
   expect(await hint('https://kemono.test/kou')).toBe('识别中');
 });
 
@@ -1612,4 +1664,44 @@ it('凭据文件路径可展开，权限过宽警告在凭据收起时可见', a
   await click(file.querySelector('summary'));
   expect(file.open).toBe(true);
   expect(file.textContent).toContain('fanbox.json');
+});
+
+it('全部标为已看：一页待处理之外的也标完，每批不超过批量接口的 1000 条', async () => {
+  // 1500 条未看，每组一条主条目；服务端一页最多给 1000 组，标过的离开 status=new。
+  const unseen = new Set(Array.from({ length: 1500 }, (_, index) => index + 1));
+  const batches: number[][] = [];
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+    const path = new URL(url, location.origin).pathname;
+    if (path === FOLLOW_STATUS_URL) {
+      const body = JSON.parse(String(init?.body)) as { items: number[]; to: string };
+      expect(body.to).toBe('seen');
+      batches.push(body.items);
+      for (const id of body.items) unseen.delete(id);
+      return { ok: true, status: 200, json: async () => ({ ok: true, items: body.items }) } as Response;
+    }
+    expect(path).toBe(FOLLOW_URL);
+    const page = [...unseen].slice(0, MARK_BATCH);
+    return { ok: true, status: 200, json: async () => ({
+      groups: page.map((id) => ({ primary: { id, status: 'new' }, variants: [], duplicates: [] })),
+      has_more: unseen.size > MARK_BATCH }) } as Response;
+  }));
+  const result = await markAllPending('seen');
+  expect(result).toEqual({ total: 1500, failed: 0, error: undefined, marked: [...Array(1500).keys()].map((index) => index + 1) });
+  expect(unseen.size).toBe(0);
+  expect(batches.map((items) => items.length)).toEqual([1000, 500]);
+});
+
+it('全部标为已看：写失败的那批记进失败数，不反复重取同一批', async () => {
+  const fetcher = vi.fn(async (url: string) => {
+    const path = new URL(url, location.origin).pathname;
+    if (path === FOLLOW_STATUS_URL) return { ok: false, status: 500, json: async () => ({ error: '数据库忙' }) } as Response;
+    return { ok: true, status: 200, json: async () => ({
+      groups: [{ primary: { id: 1, status: 'new' }, variants: [{ id: 2, status: 'seen' }], duplicates: [{ id: 3, status: 'new' }] }],
+      has_more: true }) } as Response;
+  });
+  vi.stubGlobal('fetch', fetcher);
+  const result = await markAllPending('ignored');
+  expect([result.total, result.failed]).toEqual([2, 2]);
+  expect(String((result.error as Error).message)).toContain('数据库忙');
+  expect(fetcher.mock.calls.filter(([url]) => new URL(url, location.origin).pathname === FOLLOW_URL)).toHaveLength(2);
 });

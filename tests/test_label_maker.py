@@ -1,16 +1,15 @@
 """label 属于片商（ADR-0049）；上级可以一级套一级，片商合计旗下每一级的作品（ADR-0051）。"""
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from peach import web_contract as rm_web
 from peach.entities import merge_entity
-from peach.migrations import upgrade
+from support.ledger import fresh_ledger
 from scripts.install_label_makers import install, plan
-
-ROOT = Path(__file__).resolve().parents[1]
-MIGRATIONS = ROOT / "migrations"
 
 
 class LabelMakerTests(unittest.TestCase):
@@ -20,8 +19,7 @@ class LabelMakerTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name).resolve()
-        self.db = root / "ledger.db"
-        upgrade(self.db, MIGRATIONS)
+        self.db = fresh_ledger(root)
         self.con = sqlite3.connect(self.db)
         self.con.row_factory = sqlite3.Row
         self.addCleanup(self.con.close)
@@ -87,6 +85,13 @@ class LabelMakerTests(unittest.TestCase):
         self.assertEqual([item["action"] for item in planned], ["insert", "update"])
         self.assertEqual(self.maker_of(5607), "妄想族")
         self.assertEqual(self.maker_of(5638), "BAZOOKA")
+
+    def test_reasons_follow_the_local_language(self):
+        """开发工具的输出跟本机语言：英文环境下跳过原因是英文。"""
+        with mock.patch.dict(os.environ, {"PEACH_LANGUAGE": "en"}):
+            planned = plan(self.con, self.rows, create_makers=False)
+        self.assertEqual(planned[2]["reason"],
+                         'Studio "妄想族" has no entity in the database; after checking, add --create-makers')
 
     def test_a_chain_that_loops_back_is_refused(self):
         self.apply()

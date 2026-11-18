@@ -11,12 +11,14 @@
 - 代码判据确定、能按来源整批撤回的断言按 ADR-0052 落库；LLM 输出、打分、冲突与多候选只产生候选，不得自行标为 `approved`。真实写入执行 `peach-ledger-write`。
 - 编辑前核对 `git status`。代码任务使用 `scripts/agent_worktree.py create` 的隔离工作树，主检出负责集成；先读 `peach-worktree`。
 - 代码改动经 PR 交付，维护者自身也适用；issue 范围与交付流程见 `peach-issue-delivery`。
+- 提交用本机 Git 身份，不照抄仓库历史里的作者；fork 来的 PR 以上游维护者为作者会被 CI 拒收。贡献者的 `integrate` 只合进自己的 master，进上游一律经 PR 评审。换用未登记的智能体时，按 `scripts/co_author.py` 的格式单独提交登记，并在 PR 说明。
+- 替他人开 issue 按 `CONTRIBUTING.md`「开 Issue」：用 `.github/ISSUE_TEMPLATE/` 的模板章节和 `gh issue create --type`，写通用技术说法；本文件的术语与交付格式只用于改代码。
 - 服务、端口或重启操作先核对监听与进程归属。已提交且测试通过的适用代码用 `restart_windows_tray.py` 重启并核验；手动或 CLI 发起的主任务仍在跑时先问，其余任务均能续跑时直接重启。
 - `agent_worktree.py prune --apply` 可回收入口判定安全的工作树；只按 PID 清理本任务创建的进程，保护活动工作树、忽略文件与其他任务。
 
 ## 术语
 
-- **你**：改动 Peach 的智能体；**我 / 用户**：部署、使用并维护 Peach 的人，每个部署只有一人。 <!-- copy-lint-disable-line -->
+- **你**：改动 Peach 的智能体；**我 / 用户**：在本机部署、使用并维护这份检出的人，每个部署只有一人；外部贡献者照本文件工作时，「我」、ledger、生产与主检出都指贡献者自己的环境。 <!-- copy-lint-disable-line -->
 - **ledger / 账本**：当前实例数据根 `database/ledger.db` 的本地工作副本，唯一真相源；**真相字段**：直接构成 ledger 断言的列。
 - **候选 candidate**：带来源与置信度、未经用户复核的断言；**复核产物**：承载逐项结论、可重放的 CSV 等文件。
 - **实体 entity**：女优、厂牌、创作者、系列的规范身份；扁平 `asset_tag`、creator/studio 字段是兼容投影。
@@ -45,7 +47,7 @@
 ## 验证与交付门槛
 
 - 测试只用当前隔离工作树的 Windows `& .\scripts\test.ps1` 或 macOS/Linux `./scripts/test.sh`。`auto` 按域选测；实际依赖、共享设施和未知影响面用 `full`；环境、登记与记录契约见 `docs/TESTING.md`。`ready` / `integrate` 拒收无有效记录的交付，禁止手工 merge 绕过入口。健康检查只用 `/healthz`。
-- 不用 `git add .`、`git add -A`、目录或 glob；逐文件暂存并核对 `git diff --cached --name-status`。实现与对应测试原子提交，署名与 README 影响按 `peach-worktree`。
+- 不用 `git add .`、`git add -A`、目录或 glob；逐文件暂存并核对 `git diff --cached --name-status`。实现与对应测试原子提交，署名按 `peach-worktree`。
 - 预览使用独立真实小样本，启动前通过 `scripts/check_ui_preview.py`；确认与普通、编辑链接按界面技能。HTTPS 验证使用项目 CA 严格校验，失败就报告原始错误与未取得的验收面。
 - 入口与技能的结构、行数、字节数、单行长度由 `scripts/check_context_budget.py` 强制；职责与清退按 `peach-context-rules`。工作树残留与公开文档中的私有信息由 `tests/test_repo_hygiene.py` 检查。
 - 文案、注释、docstring、测试名描述当前行为；检查与事故例外见 `docs/WRITING.md`。源码文本断言只减不增；行为与设计测试分工见 `docs/TESTING.md`。

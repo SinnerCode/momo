@@ -9,7 +9,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as legacyUi from '@peach/legacy/ui';
 
 import type { DataCleanupSection } from '../../src/react/bundle';
-import { DataCleanupPage } from '../../src/react/data-cleanup/data-cleanup-page';
+import { DataCleanupPage, DataCleanupToolPage } from '../../src/react/data-cleanup/data-cleanup-page';
+import { prefetchDataCleanupTool } from '../../src/react/data-cleanup/data-cleanup';
+import type { CleanupToolKey } from '../../src/cleanup-tools';
+import { CLEANUP_HASH_REDIRECTS } from '../../src/cleanup-tools';
+import { peachHistory } from '../../src/history';
 import { junkBreakdown, prefetchDataCleanup, reviewSummary } from '../../src/react/data-cleanup/data-cleanup';
 import { LinkManager } from '../../src/react/data-cleanup/link-manager';
 import type { LinkCheckState } from '../../src/react/data-cleanup/links';
@@ -31,6 +35,22 @@ afterEach(() => {
 });
 notifyManager.setScheduler((notify) => notify());
 
+for (const [hash, target] of Object.entries(CLEANUP_HASH_REDIRECTS)) {
+  it(`数据管理旧锚点 ${hash} 交路由打开工具正文且不增加历史条目`, async () => {
+    serve({});
+    peachHistory.replace('/data-cleanup?library=local' + hash);
+    const length = window.history.length;
+    await mount(<QueryClientProvider client={queryClient}>
+      <DataCleanupPage toast={vi.fn()} failure={vi.fn()} open={vi.fn()} navigate={vi.fn()} />
+    </QueryClientProvider>);
+    await settle();
+    expect(location.pathname + location.search).toBe(target + '?library=local');
+    expect(peachHistory.navigation.claimed).toBe(false);
+    expect(window.history.length).toBe(length);
+    peachHistory.replace('/');
+  });
+}
+
 const FAIL = Symbol('fail');
 /** 一条端点回非 2xx。 */
 const failWith = (status: number, body: unknown = {}) => ({ [FAIL]: true, status, body });
@@ -49,11 +69,13 @@ function serve(routes: Record<string, Route>) {
       const params = new URL(path, 'http://localhost').searchParams;
       return { ok: true, status: 200, json: async () => ({ ok: true, example: `${params.get('dir_template')}/${params.get('file_template')}.mp4` }) };
     }
-    if (!(path in routes)) {
+    /* 整理状态带界面语言（`?language=`，预设示例按它取示例字段），按不带它的路径应答。 */
+    const key = path in routes ? path : path.replace(/\?language=[\w-]+$/, '');
+    if (!(key in routes)) {
       unknown.push(path);
       return { ok: false, status: 404, json: async () => ({}) };
     }
-    const route = routes[path];
+    const route = routes[key];
     const answer = typeof route === 'function' ? (route as (b: unknown, m: string) => unknown)(body, method) : route;
     if (answer && typeof answer === 'object' && FAIL in answer) {
       const { status, body: payload } = answer as ReturnType<typeof failWith>;
@@ -122,9 +144,18 @@ async function openPage(sources: MediaSourcesData = withRoots, patch: Record<str
   const server = serve({ ...pageRoutes(sources), ...patch });
   await prefetchDataCleanup(new AbortController().signal);
   const open = vi.fn<(section: DataCleanupSection) => void>();
-  const host = await wrap(<DataCleanupPage toast={vi.fn()} failure={vi.fn()} open={open} />);
+  const navigate = vi.fn<(path: string) => void>();
+  const host = await wrap(<DataCleanupPage toast={vi.fn()} failure={vi.fn()} open={open} navigate={navigate} />);
   await settle();
-  return { host, open, server };
+  return { host, open, navigate, server };
+}
+
+async function openTool(tool: CleanupToolKey, sources: MediaSourcesData = withRoots, patch: Record<string, Route> = {}) {
+  const server = serve({ ...pageRoutes(sources), ...patch });
+  await prefetchDataCleanupTool(tool, new AbortController().signal);
+  const host = await wrap(<DataCleanupToolPage tool={tool} toast={vi.fn()} failure={vi.fn()} />);
+  await settle();
+  return { host, server };
 }
 
 const entry = (host: ParentNode, section: DataCleanupSection) =>
@@ -132,7 +163,10 @@ const entry = (host: ParentNode, section: DataCleanupSection) =>
 
 describe('读数卡', () => {
   it('单面板分区的标题只在面板内显示', async () => {
-    const { host } = await openPage();
+    serve(pageRoutes(withRoots));
+    const host = await wrap(<><DataCleanupToolPage tool="links" toast={vi.fn()} failure={vi.fn()} />
+      <DataCleanupToolPage tool="resource-sync" toast={vi.fn()} failure={vi.fn()} /></>);
+    await settle();
     for (const id of ['link-manager', 'resource-sync']) {
       const section = host.querySelector(`#${id}`)!;
       const title = section.querySelector(`#${id}-title`)!;
@@ -178,18 +212,19 @@ describe('读数卡', () => {
 });
 
 describe('资源同步', () => {
-  it('只在有落盘来源配了根目录时出现，两份任务状态随首屏一起取回', async () => {
+  it('首页不读取资源扫描，进入二级页后才按已配置根目录读取', async () => {
     expect(hasResourceRoots(withRoots)).toBe(true);
     expect(hasResourceRoots(withoutRoots)).toBe(false);
     const server = serve(pageRoutes(withRoots));
     await prefetchDataCleanup(new AbortController().signal);
-    expect(server.calls.map((call) => call.path)).toEqual(expect.arrayContaining(['/api/resource-sync/scan', '/api/resource-sync/apply']));
+    expect(server.calls.some(call => call.path.startsWith('/api/resource-sync'))).toBe(false);
     queryClient.clear();
-    const shown = await openPage(withRoots);
+    const shown = await openTool('resource-sync', withRoots);
     expect(shown.host.querySelector('#resource-sync')).not.toBeNull();
     queryClient.clear();
-    const hidden = await openPage(withoutRoots);
+    const hidden = await openTool('resource-sync', withoutRoots);
     expect(hidden.host.querySelector('#resource-sync')).toBeNull();
+    expect(hidden.host.textContent).toContain('尚未配置可核对的媒体目录');
     expect(hidden.server.calls.some((call) => call.path.startsWith('/api/resource-sync'))).toBe(false);
   });
 
@@ -241,7 +276,7 @@ describe('资源同步', () => {
     expect(seen[0]!.title).toBe('清理失效条目');
     expect(seen[0]!.danger).toBe(true);
     expect(seen[0]!.body).toBe(
-      '将永久删除文件已不在盘上的 4 条记录（含回收站里的）、3 个空文件夹，并清理 2 个闲置缓存。来源根目录保留。这一步不可撤销。');
+      '将永久删除 4 条文件已不在的记录（含回收站）和 3 个空文件夹，并清理 2 个闲置缓存。这一步不可撤销。');
     expect(server.posts('/api/resource-sync/apply')).toEqual([
       { confirm: true, clean_cache: true, scan_id: 'scan-7', background: true },
     ]);
@@ -287,8 +322,8 @@ describe('资源同步', () => {
     await click(buttonNamed('清理失效条目', host));
     await settle();
     expect(seen[0]!.body).toBe(
-      '将永久删除文件已不在盘上的 3 条记录（含回收站里的）、3 个空文件夹，并清理 2 个闲置缓存。来源根目录保留。'
-      + '这几样不可撤销。2 条作品记录的文件已丢失，个人记录保留，可在「文件已丢失的记录」中转移个人记录或删除记录。');
+      '将永久删除 3 条文件已不在的记录（含回收站）和 3 个空文件夹，并清理 2 个闲置缓存。'
+      + '这几样不可撤销。2 条作品记录的文件已丢失，个人记录保留，可在「文件已丢失的记录」中处理。');
     await settle();
     expect(host.textContent).toContain(
       '1 条作品记录已标为文件丢失，可在「文件已丢失的记录」中处理。1 条的记录已接到库里的另一个版本。');
@@ -349,7 +384,7 @@ describe('资源同步', () => {
 
 describe('链接管理', () => {
   it('主要站点分别链接到主页并通过本站读取 favicon，图标失败时保留链接', async () => {
-    const { host } = await openPage(withRoots, {
+    const { host } = await openTool('links', withRoots, {
       '/api/links': { total: 8, entities: 3, by_kind: {}, top_hosts: [['example.com', 5], ['example.org', 3]], top_host_link_ids: { 'example.com': 8, 'example.org': 9 } },
     });
     const link = host.querySelector<HTMLAnchorElement>('#link-manager a[href="https://example.com"]')!;
@@ -396,6 +431,16 @@ describe('链接管理', () => {
     expect(unclear.querySelector('[data-link-identity]')?.textContent).toContain('女优 2');
   });
 
+  it('自动重查过的暂时故障注明问了几次，站点拒绝的不注', async () => {
+    serve({ '/api/links': stats, '/api/links/check': { ...checked,
+      unclear: [row(2, { note: '403' }), row(3, { note: '503', temporary: true, attempts: 3 })],
+    }, '/api/links/prune': { status: 'idle' } });
+    const host = await wrap(<LinkManager />);
+    await settle();
+    const notes = [...host.querySelectorAll('[aria-label="本次未访问成功"] [data-link-rechecked]')].map((node) => node.textContent);
+    expect(notes).toEqual(['临时故障，共自动试了 3 次']);
+  });
+
   it('每一类链接各占一格，类型用界面上的名字，主要站点只列前三', async () => {
     serve({ '/api/links': stats, '/api/links/check': { ...checked, status: 'idle' }, '/api/links/prune': { status: 'idle' } });
     const host = await wrap(<LinkManager />);
@@ -427,7 +472,7 @@ describe('链接管理', () => {
     await settle();
     expect(seen).toHaveLength(1);
     expect(seen[0]!.danger).toBe(true);
-    expect(seen[0]!.body).toBe('将删除 1 条失效链接。删除前会再次检查，删除后无法恢复。');
+    expect(seen[0]!.body).toBe('将删除 1 条失效链接，删除前会再检查一次。不能撤销。');
     expect(server.posts('/api/links/prune')).toEqual([{ confirm: true, check_id: 'check-3', background: true }]);
   });
 
@@ -492,9 +537,10 @@ describe('孤儿记录', () => {
     ],
   };
 
-  it('没有已消失的作品时整块不出现', async () => {
-    const { host, server } = await openPage();
-    expect(host.querySelector('#orphan-records')).toBeNull();
+  it('没有已消失的作品时二级页保留空表和零计数', async () => {
+    const { host, server } = await openTool('orphan-records');
+    expect(host.querySelector('#orphan-records')?.textContent).toContain('0 条作品');
+    expect(host.querySelectorAll('#orphan-records tbody tr[data-row-id]')).toHaveLength(0);
     expect(server.calls.map((call) => call.path)).toContain('/api/orphan-records');
   });
 
@@ -670,7 +716,7 @@ describe('整理', () => {
     await click(buttonNamed('执行整理', host));
     await settle();
     expect(seen.map((options) => options.title)).toEqual(['整理文件']);
-    expect(seen[0]!.body).toContain('「本地」上的文件名与目录');
+    expect(seen[0]!.body).toContain('「本地」上的全部文件');
     expect(server.posts('/api/organize/apply')).toEqual([
       { location: 'local', path: '', file_template: '{code}', dir_template: '', confirm: true },
     ]);
@@ -693,7 +739,7 @@ describe('整理', () => {
     const path = host.querySelector<HTMLInputElement>('input[name="organize-path"]');
     await click(host.querySelector('[aria-label="选择整理路径"]'));
     await settle();
-    expect(server.posts('/api/pick-folder')).toEqual([{ initial: 'R:\\media' }]);
+    expect(server.posts('/api/pick-folder')).toEqual([{ initial: 'R:\\media', purpose: 'media', start: true }]);
     expect(path?.value).toBe('R:\\media\\合集');
     await click(buttonNamed('预览', host));
     await settle();

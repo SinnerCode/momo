@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from urllib.parse import quote, urljoin, urlsplit
@@ -22,22 +23,38 @@ _UUID = re.compile(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}')
 _MOVIE_PATH = re.compile(r'[a-f0-9]/[a-f0-9]/[a-f0-9-]{36}\.mp4')
 DMM_PREVIEW_QUERY = ('query PeachPreview($id: ID!) { ppvContent(id: $id) '
                      '{ id makerContentId sample2DMovie { highestMovieUrl } } }')
-DMM_PREVIEW_HOST = 'cc3001.dmm.co.jp'
+#: DMM 预告所在的域名。具体主机由 DMM 分配、会换：2026-11 起 `highestMovieUrl` 从 `cc3001.dmm.co.jp`
+#: 换成了 `tencc3001.dmm.co.jp`，按单个主机写死就会让全部预告失效，所以只认 DMM 自己域名下的主机。
+DMM_PREVIEW_DOMAIN = 'dmm.co.jp'
+
+log = logging.getLogger(__name__)
 
 
 def dmm_preview_url(value):
-    """只接受来源明确声明的公开 DMM MP4。"""
+    """只接受来源明确声明、放在 DMM 自己域名下的公开 MP4。"""
     if not isinstance(value, str) or any(char.isspace() for char in value):
         return ''
     try:
         parts = urlsplit(value)
-        allowed = (parts.scheme == 'https' and parts.hostname == DMM_PREVIEW_HOST
+        host = (parts.hostname or '').casefold()
+        allowed = (parts.scheme == 'https' and host.endswith('.' + DMM_PREVIEW_DOMAIN)
                    and not parts.username and not parts.password and parts.port in (None, 443)
-                   and not parts.fragment and '..' not in parts.path.split('/')
-                   and re.fullmatch(r'/(?:pv|litevideo)/[A-Za-z0-9/_-]+\.mp4', parts.path))
+                   and not parts.fragment and re.fullmatch(r'(?:/[A-Za-z0-9_-]+)+\.mp4', parts.path))
     except ValueError:
         return ''
     return value if allowed else ''
+
+
+def _unrecognized(value):
+    """DMM 声明了预告、地址却不认：多半是 DMM 换了主机或路径，原样写进日志，界面说明不是网络问题。"""
+    host = ''
+    if isinstance(value, str):
+        try:
+            host = urlsplit(value).hostname or ''
+        except ValueError:
+            pass
+    log.warning('DMM trailer URL not recognized: %r', value)
+    return PublicSourceUnavailable('errors.javOfficialPreview.dmmUnrecognized', {'host': host or '-'})
 
 
 class _DmmPreviewSource(DmmSource):
@@ -46,13 +63,13 @@ class _DmmPreviewSource(DmmSource):
     def content(self, cid, *, session):
         data = self.graphql(DMM_PREVIEW_QUERY, {'id': cid}, session=session)
         if 'ppvContent' not in data:
-            raise ValueError('DMM 商品字段未取得')
+            raise ValueError('DMM product field missing')
         item = data['ppvContent']
         if item is None:
             return None
         if (not isinstance(item, dict) or item.get('id') != cid
                 or not matching_cids(item.get('makerContentId'), [cid])):
-            raise ValueError('DMM 作品身份不匹配')
+            raise ValueError('DMM video identity mismatch')
         return item
 
 
@@ -69,34 +86,44 @@ def dmm_preview(code, secrets_root, *, transport=None):
         with source.holding(session):
             item = json.loads(source.fetch(code, session=session).body)
         if normalise_code_key(item.get('makerContentId')) != normalise_code_key(code):
-            raise ValueError('DMM 番号不匹配')
+            raise ValueError('DMM code mismatch')
         if 'sample2DMovie' not in item:
-            raise ValueError('DMM 公开预告字段未取得')
+            raise ValueError('DMM public trailer field missing')
         movie = item['sample2DMovie']
         if movie is None:
             return ''
-        url = dmm_preview_url(movie.get('highestMovieUrl')) if isinstance(movie, dict) else ''
+        declared = movie.get('highestMovieUrl') if isinstance(movie, dict) else None
+        url = dmm_preview_url(declared)
         if not url:
-            raise ValueError('DMM 公开预告地址未识别')
+            raise _unrecognized(declared)
         return url
+    except PublicSourceUnavailable:
+        raise
     except SourceFailure as error:
         if error.reason == FailureReason.NOT_FOUND:
             return ''
-        raise PublicSourceUnavailable('DMM 视频预览未取得，请稍后重试') from error
+        raise PublicSourceUnavailable('errors.javOfficialPreview.dmmUnavailable') from error
     except (OSError, ValueError, TypeError, AttributeError, RuntimeError, httpx.HTTPError) as error:
-        raise PublicSourceUnavailable('DMM 视频预览未取得，请稍后重试') from error
+        raise PublicSourceUnavailable('errors.javOfficialPreview.dmmUnavailable') from error
     finally:
         if owned:
             transport.close()
 
 
 def javdb_preview(code, movie_id, secrets_root, *, transport=None):
-    """从同一番号的 JavDB 详情读取页面声明的 DMM 预告。"""
+    """从同一番号的 JavDB 详情读取页面声明的 DMM 预告。
+
+    详情页在 javdb.com 上，等的是进程共用的 `SOURCE_LIMITER`：资料处理同时在取页时，这一页排在它们中间，
+    合计不超过用户定的每分钟 20 页。
+    """
+    from .library_processing import SOURCE_LIMITER
+
     if movie_id is not None and (not isinstance(movie_id, str) or not re.fullmatch(r'[A-Za-z0-9]+', movie_id)):
         return ''
     owned = transport is None
     transport = transport or HostLimitedTransport(SourceTransport(
-        secrets_root, max_requests=3, max_bytes=2 * 1024 * 1024, max_seconds=30), JAVDB.interval)
+        secrets_root, max_requests=3, max_bytes=2 * 1024 * 1024, max_seconds=30), JAVDB.interval,
+        limiter=SOURCE_LIMITER)
     try:
         source = JavDBSource()
         session = Session(transport, deadline=time.monotonic() + 30)
@@ -112,7 +139,7 @@ def javdb_preview(code, movie_id, secrets_root, *, transport=None):
                 return url
         return ''
     except (OSError, ValueError, TypeError, AttributeError, RuntimeError, httpx.HTTPError, SourceFailure) as error:
-        raise PublicSourceUnavailable('JavDB 视频预览未取得，请稍后重试') from error
+        raise PublicSourceUnavailable('errors.javOfficialPreview.javdbUnavailable') from error
     finally:
         if owned:
             transport.close()
@@ -130,31 +157,31 @@ def prestige_preview(code, secrets_root, *, transport=None):
                       limit=1024 * 1024, deadline=deadline)
         payload = json.loads(body)
         if not isinstance(payload, dict):
-            raise ValueError('商品资料格式未识别')
+            raise ValueError('product data format not recognized')
         return payload
 
     try:
         sku = read(PRESTIGE_SKU.format(code=quote(normalise_code_key(code))))
         uuid = (sku.get('parentProduct') or {}).get('uuid')
         if not isinstance(uuid, str) or not _UUID.fullmatch(uuid):
-            raise ValueError('商品身份未取得')
+            raise ValueError('product identity missing')
         product = read(PRESTIGE_PRODUCT.format(uuid=uuid))
         numbers = [row.get('deliveryItemId') for row in product.get('sku') or [] if isinstance(row, dict)]
         if product.get('uuid') != uuid or not any(normalise_code_key(number) == normalise_code_key(code) for number in numbers):
-            raise ValueError('来源作品身份不匹配')
+            raise ValueError('source video identity mismatch')
         if 'movie' not in product:
-            raise ValueError('公开预告字段未取得')
+            raise ValueError('public trailer field missing')
         movie = product['movie']
         if movie is None:
             return ''
         if not isinstance(movie, dict) or movie.get('mimeType') != 'video/mp4' or movie.get('isLimited') != 0:
-            raise ValueError('公开预告格式未识别')
+            raise ValueError('public trailer format not recognized')
         path = movie.get('path')
         if not isinstance(path, str) or not _MOVIE_PATH.fullmatch(path):
-            raise ValueError('公开预告地址未识别')
+            raise ValueError('public trailer URL not recognized')
         return PRESTIGE_MEDIA.format(path=path)
     except (OSError, ValueError, TypeError, AttributeError, RuntimeError, httpx.HTTPError) as error:
-        raise PublicSourceUnavailable('官方视频预览未取得，请稍后重试') from error
+        raise PublicSourceUnavailable('errors.javOfficialPreview.officialUnavailable') from error
     finally:
         if owned:
             transport.close()

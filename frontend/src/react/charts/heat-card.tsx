@@ -3,13 +3,18 @@
  * Recharts 没有热力图，EvilCharts 的 Recharts 分支也没有，所以格子仍是自绘的 SVG：一格一个
  * `rect`，浓度是 `fill-opacity`，几何全写成属性。外观对齐同页的 EvilCharts 图：颜色只取
  * `chart-*`，指到一格时其余格子淡下去，浮层与柱状、径向图共用 `./chart-tip.tsx` 那一块面；
- * 页头读数也跟着换，键盘聚焦一格时读的是它。取舍见 ADR-0076。 */
-import { useState } from 'react';
-import type { ReactNode } from 'react';
+ * 页头读数也跟着换，键盘聚焦一格时读的是它。取舍见 ADR-0076。
+ *
+ * 一张图只占一个 Tab 停靠点（漫游焦点，同 EvilCharts 日历热力图 `4c2dd7c9`）：星期 × 小时有
+ * 168 格，一格一个停靠点要按上百次 Tab 才走得出这张卡。进卡之后用方向键与 Home/End 挪。 */
+import { useRef, useState } from 'react';
+import type { KeyboardEvent, ReactNode } from 'react';
 
+import { type CountUnit } from './bar-card';
 import { CHART_CARD, ChartEmpty, ChartHead } from './chart-card';
 import { TIP_SURFACE, TIP_SWATCH, TipRow } from './chart-tip';
 import { dayCalendar, hourGrid, WEEKDAYS, type ActivityCounts, type HeatCell } from './heat';
+import { t } from '../../i18n';
 
 const SIZE = 14;
 const STEP = 17;
@@ -43,8 +48,8 @@ function HeatTooltip(
   );
 }
 
-/** 读数的三处文字：页头大数旁的单位、浮层那一行的名字、读屏时每一格计数后面的量词。 */
-export interface HeatWords { unit: string; series: string; cellUnit: string }
+/** 读数的三处文字：页头大数旁的单位、浮层那一行的名字、读屏时每一格的计数（带数字的整句，如「3 次访问」）。 */
+export interface HeatWords { unit: CountUnit; series: string; cell: CountUnit }
 
 /** 一张热力图：一格一个计数，指到哪一格读数就换成哪一格。 */
 export function HeatCard(
@@ -55,6 +60,10 @@ export function HeatCard(
   },
 ) {
   const [shown, setShown] = useState(-1);
+  const [stop, setStop] = useState(0);
+  const grid = useRef<SVGSVGElement>(null);
+  // 数据换了、格子变少时停靠点落回第一格，不让整张图一个停靠点都没有。
+  const focusable = stop < cells.length ? stop : 0;
   const left = axis ? 30 : 0;
   const top = axis ? 18 : 0;
   const width = left + columns * STEP;
@@ -67,28 +76,42 @@ export function HeatCard(
   const share = pin ? (pin.x + SIZE / 2) / width : 0;
   const anchor = share < 0.1 ? 'start' : share > 0.9 ? 'end' : 'center';
   const edge = pin ? { start: pin.x, center: pin.x + SIZE / 2, end: pin.x + SIZE }[anchor] : 0;
+  const move = (event: KeyboardEvent<SVGRectElement>, index: number) => {
+    const rowStart = index - (index % columns);
+    const next = {
+      ArrowLeft: index - 1, ArrowRight: index + 1, ArrowUp: index - columns, ArrowDown: index + columns,
+      Home: rowStart, End: Math.min(rowStart + columns, cells.length) - 1,
+    }[event.key];
+    if (next === undefined) return;
+    event.preventDefault();
+    if (next < 0 || next >= cells.length) return;
+    setStop(next);
+    grid.current?.querySelector<SVGRectElement>(`rect[data-cell="${next}"]`)?.focus();
+  };
   return (
     <section className={CHART_CARD}>
       <ChartHead title={title} figure={(cell ? cell.count : total).toLocaleString()}
-        note={cell ? cell.label : words.unit} />
+        note={cell ? cell.label : words.unit(total)} />
       {/* 带坐标轴的星期 × 小时有 24 列，压到 320 以下格子和字都读不清，宁可在卡里横滚；
           每日那张只有 13 列，跟着卡片缩，最近几天不会藏到右边看不见的地方。 */}
       <div className="relative">
         <div className="min-w-0 overflow-x-auto">
-          <svg role="img" aria-label={title} onPointerLeave={() => setShown(-1)}
+          <svg ref={grid} role="img" aria-label={title} onPointerLeave={() => setShown(-1)}
             viewBox={`0 0 ${width} ${height}`} className={axis ? 'block h-auto min-w-80 w-full' : 'block h-auto w-full'}>
             {axis}
             {cells.map((item, index) => {
               const { x, y } = at(index);
               return (
-                <rect key={item.key} tabIndex={0} role="img" aria-label={`${item.label}，${item.count} ${words.cellUnit}`}
+                <rect key={item.key} data-cell={index} tabIndex={index === focusable ? 0 : -1} role="img"
+                  aria-label={`${item.label}${t('shell:format.clauseSeparator')}${words.cell(item.count)}`}
                   x={x} y={y} width={SIZE} height={SIZE} rx={3} fillOpacity={item.share || 1}
                   opacity={shown >= 0 && shown !== index ? 0.4 : 1}
                   className={item.share
                     ? `outline-none transition-opacity duration-200 focus-visible:stroke-border-focus-ring ${TONES[tone].fill}`
                     : 'fill-chart-track outline-none transition-opacity duration-200 focus-visible:stroke-border-focus-ring'}
                   onPointerEnter={() => setShown(index)}
-                  onFocus={() => setShown(index)} onBlur={() => setShown(-1)} />
+                  onFocus={() => { setShown(index); setStop(index); }} onBlur={() => setShown(-1)}
+                  onKeyDown={(event) => move(event, index)} />
               );
             })}
           </svg>
@@ -138,7 +161,7 @@ export function ActivityHeat(
     <div className="inline-grid w-full items-start gap-5 lg:grid-cols-2">
       <HeatCard title={title} words={words} tone={tone}
         cells={hours.cells} total={hours.total} columns={24} rows={7} axis={HOUR_AXIS}
-        footer={<><span>星期 × 小时</span><span>{activity?.timezone || 'UTC+08:00'}</span></>} />
+        footer={<><span>{t('manage:charts.dayByHour')}</span><span>{activity?.timezone || 'UTC+08:00'}</span></>} />
       <HeatCard title={dailyTitle} words={words} tone={tone}
         cells={days.cells} total={days.total} columns={13} rows={7}
         footer={<><span>{days.start}</span><span>{days.end}</span></>} />

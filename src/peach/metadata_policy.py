@@ -40,6 +40,8 @@ HISTORICAL_SOURCES = (
 
 SOURCE_SPECS = {
     name: SourceSpec(name, kind) for name, kind in {
+        # 维护者逐项复核的公共包；保留社区来源级别，不冒充发行方。
+        "public-seed": "community",
         # r18.dev 是 DMM 数字版目录的镜像，采集链有码与素人排在片商站之后的那一档
         # （`library_processing.LibraryMetadataProvider.query`）。
         "r18dev": "official_mirror",
@@ -123,8 +125,13 @@ CHAIN_COMMUNITY, CHAIN_FALLBACK, CHAIN_UNKNOWN = 3, 4, 5
 #: javdb 写 `Chisa`、fc2cmadb 写 `大村阿美香`；`FC2-PPV-2629971` javdb 写中文 `安娜`、
 #: fc2cmadb 写日文原名 `あんな`。FC2PPV-DB 的女优栏同样按片中人整理、写日文原名
 #: （2026-09-24 `FC2-PPV-4898837` 写 `川北すずね`），排在 fc2cmadb 之后、javdb 之前。
+#:
+#: 演员栏的两个认人 Wiki（ADR-0145）：只有素人番号会问到它们。MGStage 与 r18.dev 是官方档，
+#: 素人片上写的却是片中称呼：本机账本 `348NTR-076` 记着 mgstage 的 `アミ`、`857OMG-048` 记着
+#: `七○舞`、`230ORETD-615` 记着 r18dev 的 `早見さん`；2026-11-05 素人系総合 Wiki 给
+#: `348NTR-076` 的是 `稲森あみ`。
 FIELD_SOURCE_PRIORITY: dict[str, tuple[str, ...]] = {
-    "performers": ("fc2cmadb", "fc2ppvdb"),
+    "performers": ("fc2cmadb", "fc2ppvdb", "sougouwiki", "av_neme"),
 }
 
 #: 字段级黑名单（对应 amane 的 `field_blacklist`），优先于一切：列进来的来源在这个
@@ -254,7 +261,7 @@ def sort_candidates(field: str, candidates: Iterable[Mapping[str, object]], *,
                     code: str | None = None) -> list[dict]:
     """同一字段的候选按来源顺序表排，同位次按置信度，再按来源名兜底保证确定。"""
     if field not in PEACH_FIELDS:
-        raise ValueError("未知 Peach 元数据字段：" + field)
+        raise ValueError("unknown Peach metadata field: " + field)
     rows = [dict(candidate) for candidate in candidates]
     for row in rows:
         row["field_rank"] = field_rank(field, str(row.get("source") or ""), code=code)

@@ -138,7 +138,7 @@ it('挂上就打开：先报换页，骨架与冷启动那张同键不重画，�
   expect(stats.textContent).toContain('追更检查');
 });
 
-it('没人认领的写地址一次就是打开一次：认领的写地址不重开，同一路径不认领再写就重取、重挂', async () => {
+it('认领的写地址不重开，返回已访问地址重挂时使用缓存', async () => {
   const r = await load('/tasks');
   const { stats } = surface(r, '/tasks');
   const api = serve({ '/api/tasks': tasks(), '/api/downloads': { available: true, providers: [], tasks: [] } });
@@ -152,7 +152,7 @@ it('没人认领的写地址一次就是打开一次：认领的写地址不重�
   const length = window.history.length;
   await act(async () => { r.peachHistory.push('/tasks') });
   await until(() => painted(stats) !== null && painted(stats) !== page, '重挂之后再画上');
-  expect(api.calls('/api/tasks')).toBe(2);
+  expect(api.calls('/api/tasks')).toBe(1);
   expect(r.managedEntry(stats)?.revision).not.toBe(revision);
   expect(window.history.length - length).toBe(1);
 });
@@ -192,10 +192,10 @@ it('后退落到压在这一页上的详情才挂上（中间去过别的页）�
   expect([painted(stats), api.calls('/api/tasks')], '被详情压着挂上不开').toEqual([null, 1]);
   await act(async () => { r.shellNavigate('/tasks') });
   await until(() => painted(stats) !== null, '关掉详情后画上');
-  expect(api.calls('/api/tasks')).toBe(2);
+  expect(api.calls('/api/tasks')).toBe(1);
 });
 
-it('走开时还露在 `#stats` 上就收起，收起排在提交之后、不报同步提交的告警；壳藏起了它就留着', async () => {
+it('走开时保留管理区宿主供目标页面切换，提交阶段没有同步提交告警', async () => {
   const errors = vi.spyOn(console, 'error');
   const r = await load('/tasks');
   const { stats } = surface(r, '/tasks');
@@ -204,7 +204,8 @@ it('走开时还露在 `#stats` 上就收起，收起排在提交之后、不报
   await until(() => painted(stats) !== null, '画上');
   await act(async () => { r.shellNavigate('/') });
   await settle();
-  expect([stats.querySelector('.peach-react'), r.managedEntry(stats)]).toEqual([null, null]);
+  expect(stats.querySelector('.peach-react')).not.toBeNull();
+  expect(r.managedEntry(stats)?.path).toBe('/tasks');
   expect(errors).not.toHaveBeenCalled();
 
   await act(async () => { r.peachHistory.push('/tasks') });
@@ -248,16 +249,17 @@ it('口味页打开时清掉目录筛选与搜索框，引导标记交出一次�
   expect(r.shell.cameFromSetup).toBe(false);
 });
 
-it('旧直达地址 `/resource-sync` 改写成数据管理页的锚点，不加历史条目，由数据管理页的元素打开', async () => {
+it('旧直达地址 `/resource-sync` 改写成资源同步工具页，不加历史条目', async () => {
   const r = await load('/resource-sync');
   surface(r, '/resource-sync');
   serve({});
   const length = window.history.length;
   const { actions } = await boot(r);
-  await until(() => location.pathname === '/data-cleanup', '改写到数据管理');
+  await until(() => location.pathname === '/data-cleanup/resource-sync', '改写到资源同步');
   await until(() => vi.mocked(actions.surfaceChanged).mock.calls.length > 0, '数据管理页打开');
-  expect([location.hash, window.history.length - length]).toEqual(['#resource-sync', 0]);
-  expect(vi.mocked(actions.surfaceChanged).mock.calls).toEqual([['management', '/data-cleanup']]);
+  expect([location.hash, window.history.length - length]).toEqual(['', 0]);
+  expect(r.peachHistory.navigation.claimed).toBe(false);
+  expect(vi.mocked(actions.surfaceChanged).mock.calls).toEqual([['management', '/data-cleanup/resource-sync']]);
 });
 
 it('配置页带 `#libraryProcessing` 进来：画上之后改写到数据管理页的那一块，不加历史条目', async () => {
@@ -271,6 +273,20 @@ it('配置页带 `#libraryProcessing` 进来：画上之后改写到数据管理
   expect(vi.mocked(actions.surfaceChanged).mock.calls.map(([, path]) => path)).toEqual(['/settings/library', '/data-cleanup']);
   expect(stats.hidden).toBe(false);
 });
+
+for (const [tab, target] of [['wants', '/jav'], ['source', '/settings/subscriptions']] as const) {
+  it(`关注管理的旧 ${tab} 入口打开目标页面并替换历史条目`, async () => {
+    const r = await load(`/subscriptions?tab=${tab}`);
+    surface(r, '/subscriptions');
+    serve({ '/healthz': {}, '/api/configuration': configuration });
+    const length = window.history.length;
+    const { actions } = await boot(r);
+    await until(() => vi.mocked(actions.surfaceChanged).mock.calls.some(([, path]) => path === target), '目标正文打开');
+    expect(location.pathname).toBe(target);
+    expect(window.history.length).toBe(length);
+    expect(r.peachHistory.navigation.claimed).toBe(false);
+  });
+}
 
 it('诊断页的标题、管理区身份与换一批由路由元数据登记', async () => {
   const r = await load();

@@ -16,11 +16,13 @@
  * 登记键是「面」：页面用路径（`/stats`、`/performers/*`、`/`），页面内组件与常驻组件用名字（`search`、
  * `batch-dock`），两者不重叠，路由树按键查同一组表（`react/router/managed-routes.tsx`）。
  *
- * 一次打开：壳铺好骨架后调 `openManagedRoute`，这里先收起同一容器里的上一页，再取首屏；取齐、壳也还停在
+ * 一次打开：壳铺好骨架后调 `openManagedRoute`，这里保留同一容器里的上一页并取首屏；取齐、壳也还停在
  * 这一页时，在同一个任务里换掉骨架、放进宿主，再让路由树同步画出整页。路由树还没接上时，打开先等它接上
  * 再取数（搜索下拉在壳的模块求值时就打开，早于 `loadRouter`）。每次打开都领一个新代次，页面按代次重挂、
  * 重取。打开之后壳的开关（选择模式、换筛选、换版式）经 `updateManagedRoute` 合进同一页的 props：代次不变，
  * 页面就地重渲染，不重挂也不重取。 */
+
+import { rememberPageState, restoredPageState } from './page-navigation';
 
 /** 画在某个容器里的那一页（或一面）。`host` 是页面 portal 进去的那个 `.peach-react` 宿主。 */
 export interface ManagedEntry {
@@ -43,6 +45,10 @@ export interface ManagedOpenOptions {
   container: Element;
   /** 壳的换页判据：取数期间用户走开了，就不画。 */
   isCurrent: () => boolean;
+  /** 首屏已取齐，和内容提交在同一任务里切换壳的可见面。 */
+  beforePlace?: () => void;
+  /** 同类页面复用宿主与组件，只更新属性。 */
+  reuse?: boolean;
   /** 壳自己排好的框架：取齐首屏的那一刻由它把框架换进容器，返回页面画进去的宿主。不给就清空容器、
    *  放进一个新的 `.peach-react`。资料页要这个：浮层吸顶要它的父盒就是 `#index`，新作那一行是遗留层
    *  卡片、不进 `.peach-react`，所以框架的四块由壳排，页面只占其中一块，再经 portal 画进另外三块。 */
@@ -55,7 +61,8 @@ export interface ManagedOpenOptions {
  *  晚一拍就是一帧空白。为假是就地更新，照常排进下一次渲染。 */
 type ManagedListener = (entries: readonly ManagedEntry[], sync: boolean) => void;
 
-interface Pending { revision: number; controller: AbortController }
+/* `page`：登记键是路径，这一趟是换页；页面内组件与常驻组件的取数不算。 */
+interface Pending { revision: number; controller: AbortController; page: boolean }
 
 /* 路由树接上取数之前，打开都等在这里；接上的那一份装载失败时，等着的打开跟着失败。 */
 let connect: (ready: Promise<ManagedPrefetch>) => void = () => {};
@@ -71,6 +78,25 @@ const entries = new Map<Element, ManagedEntry>();
 const pending = new Map<Element, Pending>();
 let revision = 0;
 const listeners = new Set<ManagedListener>();
+const loadingListeners = new Set<(loading: boolean) => void>();
+let loading = false;
+
+/** 有一页还在取首屏：换页进度条（`navigation-progress.ts`）读它。 */
+export const managedLoading = (): boolean => loading;
+
+/** 订阅「有一页还在取首屏」的变化，只在真假翻转时通知。 */
+export function listenManagedLoading(listener: (loading: boolean) => void): () => void {
+  loadingListeners.add(listener);
+  return () => { loadingListeners.delete(listener) };
+}
+
+/* `pending` 每次增删之后调。 */
+function settleLoading(): void {
+  const next = [...pending.values()].some((inflight) => inflight.page);
+  if (next === loading) return;
+  loading = next;
+  for (const listener of [...loadingListeners]) listener(loading);
+}
 
 /** 路由树装载时接上取数。只认第一次。 */
 export function connectManagedRoutes(ready: Promise<ManagedPrefetch>): void {
@@ -103,28 +129,44 @@ function notify(sync: boolean): void {
 /** 打开一页并等首屏落地。画上了回 true；期间被收起、被重开或壳已换页回 false。 */
 export async function openManagedRoute(path: string, props: object, options: ManagedOpenOptions): Promise<boolean> {
   const { container } = options;
-  releaseManagedRoute(container);
+  pending.get(container)?.controller.abort();
+  pending.delete(container);
+  settleLoading();
   if (!options.isCurrent()) return false;
+  const previous = entries.get(container);
+  if (options.reuse && previous?.host.isConnected) {
+    entries.set(container, { ...previous, path, props });
+    notify(true);
+    if (path.startsWith('/')) rememberPageState(`managed:${path}`, true);
+    return true;
+  }
   revision += 1;
-  const mine: Pending = { revision, controller: new AbortController() };
+  const mine: Pending = { revision, controller: new AbortController(), page: path.startsWith('/') && !options.resident };
   pending.set(container, mine);
+  settleLoading();
   const load = preload;
   preload = null;
   load?.();
   const prefetch = await prefetcher;
   if (pending.get(container) !== mine) return false;
   try {
-    await prefetch(path, props, mine.controller.signal);
+    if (!path.startsWith('/') || !restoredPageState<boolean>(`managed:${path}`)) {
+      await prefetch(path, props, mine.controller.signal);
+    }
   } catch {
     // 中止就是用户已经走开。其余失败照画：原因和重试的节律都在页面自己手里。
     if (mine.controller.signal.aborted) return false;
   }
   if (pending.get(container) !== mine) return false;
   pending.delete(container);
+  settleLoading();
   if (!options.isCurrent()) return false;
+  options.beforePlace?.();
+  releaseManagedRoute(container);
   const host = options.place ? options.place(container) : defaultHost(container);
   entries.set(container, { path, props, revision: mine.revision, container, host, resident: !!options.resident });
   notify(true);
+  if (path.startsWith('/')) rememberPageState(`managed:${path}`, true);
   return true;
 }
 
@@ -147,8 +189,7 @@ export function openResidentSurface(
 function defaultHost(container: Element): HTMLElement {
   const host = container.ownerDocument.createElement('div');
   host.className = 'peach-react';
-  container.textContent = '';
-  container.append(host);
+  container.replaceChildren(host);
   return host;
 }
 
@@ -172,6 +213,7 @@ export function releaseManagedRoute(container: Element, ...more: Element[]): voi
     if (inflight) {
       inflight.controller.abort();
       pending.delete(target);
+      settleLoading();
     }
     const shown = entries.get(target);
     if (shown) {

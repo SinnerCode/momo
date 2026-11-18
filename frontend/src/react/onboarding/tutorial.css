@@ -1,0 +1,67 @@
+.peach-guide-center, .peach-guide-popover {
+  --gradient-button-primary-default: linear-gradient(var(--ink), var(--ink));
+  --gradient-button-primary-hover: linear-gradient(color-mix(in srgb, var(--ink) 88%, var(--ground)), color-mix(in srgb, var(--ink) 88%, var(--ground)));
+  --gradient-button-primary-active: var(--gradient-button-primary-hover);
+  --gradient-button-primary-disabled: linear-gradient(var(--surface), var(--surface));
+  --color-button-primary-disabled-foreground: var(--muted);
+  --color-button-ghost-background: transparent;
+  --color-button-ghost-foreground: var(--muted);
+  --color-button-ghost-hover: color-mix(in srgb, var(--ink) 8%, var(--ground));
+  --color-button-ghost-active: var(--color-button-ghost-hover);
+}
+:is(.peach-guide-center, .peach-guide-popover) .bg-button-primary:not(:disabled):not([aria-disabled="true"]) { color: var(--ground); }
+/* 高度跟着当前页签的内容走，到上限才在正文里滚。顶边钉在满高时的位置，切页签只有底边伸缩，
+   页签不会跳到指针底下。 */
+[data-modal-kind="tutorial"] { align-items: flex-start; }
+.peach-guide-center {
+  width: min(680px, calc(100vw - 32px));
+  max-height: min(740px, calc(100dvh - 32px));
+  margin-top: max(0px, calc((100dvh - 32px - 740px) / 2));
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--floating-radius);
+  background: var(--ground);
+  color: var(--ink);
+  box-shadow: var(--elevation-dropdown);
+  overflow: hidden;
+}
+.peach-guide-center > [role="dialog"] { max-height: inherit; overflow: hidden; }
+.peach-guide-topic-icon { display: inline-flex; flex: none; align-items: center; justify-content: center; width: var(--control-h); height: var(--control-h); border-radius: var(--control-radius); background: var(--color-background-tertiary-default); color: var(--color-text-primary); }
+.peach-guide-topics { display: flex; flex-direction: column; }
+.peach-guide-topic { border-bottom: 1px solid var(--line-soft); }
+.peach-guide-topic:last-child { border-bottom: 0; }
+.peach-guide-topic summary { padding: 12px 0; gap: 12px; }
+.peach-guide-topic-chapters { margin: -8px -12px 12px; }
+.peach-guide-scroll-frame { position: relative; display: flex; min-height: 0; flex: 1 1 auto; }
+.peach-guide-body { min-height: 0; flex: 1; padding: 4px 24px 24px; overflow: auto; overscroll-behavior: contain; }
+.peach-guide-chapters { display: flex; flex-direction: column; gap: 4px; margin-inline: -12px; }
+.peach-guide-routes { margin: 0; padding: 0; list-style: none; }
+.peach-guide-routes > li, .peach-guide-routes > div { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line-soft); }
+.peach-guide-routes > :first-child { padding-top: 0; }
+.peach-guide-routes > :last-child { border-bottom: 0; }
+.peach-guide-routes strong { font-size: var(--fs-md); line-height: 1.5; font-weight: 500; }
+.peach-guide-routes p { margin-top: 4px; font-size: var(--fs-sm); line-height: 1.5; color: var(--muted); }
+.peach-guide-routes button { flex: none; }
+#tutorialBtn[hidden] { display: none; }
+.driver-popover.peach-guide-popover { width: min(360px, calc(100vw - 24px)); max-width: calc(100vw - 24px); min-width: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--floating-radius); background: var(--ground); color: var(--ink); box-shadow: var(--elevation-dropdown); font-family: var(--font-sans); }
+.peach-guide-popover-content { display: flex; flex-direction: column; max-height: calc(100dvh - 24px); overflow: hidden; border-radius: inherit; }
+.peach-guide-step-frame { position: relative; min-height: 0; }
+.peach-guide-step-body { max-height: calc(100dvh - 170px); overflow: auto; overscroll-behavior: contain; }
+.peach-guide-popover .driver-popover-arrow-side-top { border-top-color: var(--ground); }
+.peach-guide-popover .driver-popover-arrow-side-bottom { border-bottom-color: var(--ground); }
+.peach-guide-popover .driver-popover-arrow-side-left { border-left-color: var(--ground); }
+.peach-guide-popover .driver-popover-arrow-side-right { border-right-color: var(--ground); }
+.driver-overlay, .driver-active .driver-active-element { z-index: var(--layer-popover) !important; }
+.driver-popover.peach-guide-popover { z-index: var(--layer-tooltip) !important; }
+[data-player-guide] .vjs-control-bar { display: flex !important; opacity: 1 !important; visibility: visible !important; }
+[data-player-guide] .vjs-big-play-button { display: none !important; }
+@media (max-width: 600px) {
+  .peach-guide-center { width: calc(100vw - 16px); }
+  [data-modal-kind="tutorial"] { padding: 8px; }
+  .peach-guide-center header, .peach-guide-tools { padding-left: 16px; padding-right: 16px; }
+  .peach-guide-body { padding: 4px 16px 16px; }
+  .peach-guide-chapters { margin-inline: -8px; }
+  .peach-guide-chapters > button { padding-inline: 8px; }
+  .peach-guide-routes > li, .peach-guide-routes > div { display: grid; grid-template-columns: var(--control-h) minmax(0, 1fr); align-items: start; gap: 12px; }
+  .peach-guide-routes button { grid-column: 2; justify-self: start; }
+}

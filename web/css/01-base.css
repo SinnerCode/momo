@@ -84,6 +84,10 @@
   --control-h-compact:32px; /* 紧凑档：行操作、卡片悬浮动作、卡内次级操作、筛选条 */
   --control-h:36px; /* 默认档：表单字段与同组按钮、页面与分区操作、页签外框、导航 */
   --control-h-large:40px; /* 大档：顶栏搜索与图标键、播放器控制条、首页厂牌胶囊 */
+  /* 旧模板与 React 新作卡共用窄卡头像几何，避免两条渲染路径各自漂移。 */
+  --media-avatar-tight:30px;
+  --media-avatar-tight-step:8px;
+  --media-avatar-tight-max:64px;
   /* 框体上下两条横条的统一高度。写成变量是因为它同时管数据管理的卡片、链接管理
      和资源同步：这三处任何一处单独调，页面上就会出现两种「同一种条」。 */
   --fieldset-bar-h:52px;
@@ -173,7 +177,6 @@ html:has(.top :focus){scroll-padding-top:0}
 html::-webkit-scrollbar{display:none}
 /* 换筛选那一路上关掉滚动锚定：卡片换成骨架、骨架再换成新卡片，锚定每一步都要照新内容
    把位置推一次，而这一路正有一段回到顶部的滚动在走，两边会互相顶。 */
-html.refiltering{overflow-anchor:none}
 @media (prefers-color-scheme:dark){html:not([data-theme="light"]){color-scheme:dark}}
 html[data-theme="dark"]{color-scheme:dark}
 html,body{margin:0;padding:0}
@@ -271,7 +274,8 @@ button,[role="button"],summary{user-select:none;-webkit-user-select:none;-webkit
   user-select:auto;-webkit-user-select:auto;-webkit-touch-callout:default}
 /* React 子树的焦点环由 BoardUI 组件自己画（输入框画在外框上）；`:where` 让特指度保持 0,1,0。 */
 :where(:not(.peach-react *)):focus-visible{outline:2px solid var(--tungsten);outline-offset:2px}
-@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+/* 伪元素一并选上：遗留骨架的微光写在 `::after` 上，只写 `*` 时减少动效也照样扫。 */
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 /* 静态搜索框：React 接管前的骨架里用（索引页标题行），接管后换成 BoardUI 的 InputBase。
    两者是同一只框的前后两帧，几何与面照 InputBase 取：无边框的填充底、20px 图标距左 8px、
    文字从 34px 起（8 + 20 + 2 + 4），框高跟同一行按钮共用 --control-h。 */
@@ -393,6 +397,9 @@ button.danger.danger:disabled{
 .ov-x .ovthumb{left:0;bottom:0;height:3px}
 .ov-y:hover .ovthumb,.ov-y.dragging .ovthumb{width:6px}
 .ov-x:hover .ovthumb,.ov-x.dragging .ovthumb{height:6px}
+/* 横排、表格按住拖动（`wireHorizontalScroller`）时整页锁成「抓取中」并且不选字：只给滚动容器写光标的话，
+   内容在指针底下移动，按钮的手形、文字的竖线轮流冒出来，看着一直在闪。 */
+html[data-drag-scrolling],html[data-drag-scrolling] *{cursor:grabbing!important;user-select:none!important}
 .ovtrack.page{position:fixed;top:0;bottom:0;right:0;z-index:91;pointer-events:none}
 @media (pointer:fine){.ovtrack.page .ovthumb{pointer-events:auto}}
 .ovtrack.page:hover .ovthumb{width:3px}

@@ -4,18 +4,15 @@ import sqlite3
 import tempfile
 import types
 import unittest
-from pathlib import Path
 
 from peach.entities import normalize_entity_name
-from peach.migrations import upgrade
+from support.ledger import fresh_ledger
 from scripts.harvest_agency_rosters import (
     ABSENT, AMBIGUOUS, INSTALLABLE, KNOWN, MISSING, MOVED, NEW, PRODUCTION, PROVIDER, REJECTED,
     apply_rows, fetch_roster, find_production, plan, roster_key, roster_url, search_url,
     shown_keys,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
-MIGRATIONS = ROOT / "migrations"
 STAMP = "2026-09-05T00:00:00Z"
 
 
@@ -155,8 +152,7 @@ class LedgerFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.db = Path(self.tmp.name).resolve() / "ledger.db"
-        upgrade(self.db, MIGRATIONS)
+        self.db = fresh_ledger(self.tmp.name)
         self.con = sqlite3.connect(self.db)
         self.con.row_factory = sqlite3.Row
         self.addCleanup(self.con.close)
@@ -254,7 +250,7 @@ class ApplyTests(LedgerFixture):
         self.con.commit()
         held = dict(self.con.execute(
             "SELECT member_id, agency_id FROM entity_membership").fetchall())
-        self.assertEqual(done["归属"], 1)
+        self.assertEqual(done["memberships"], 1)
         self.assertEqual(held[12], 30)
         # 神雪 在账本里属于 T-POWERS，名册说她属于 KRONE：留给人判，不改。
         self.assertEqual(held[13], 31)

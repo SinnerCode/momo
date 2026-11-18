@@ -20,11 +20,18 @@ r18.dev 的 `name_ja` 是同一套词。
 
 只进有码链：Prestige 已从 FANZA 撤下（搜 `ABW 032` 零结果），MGS 素人号也不在这份目录上
 （搜 `MIUM 1239`、`LUXU 1475` 零结果）。
+
+同一个接口还给 JAV 订阅当第二个发现源（ADR-0135）：`legacySearchPPV` 带
+`filter.actressIds` 按女优编号列她的全部商品，按发售日倒序，预购（`releaseStatus` 为 `PRE_ORDER`）
+排在最前。列表那一型没有 `makerContentId`（2026-11-04 实测问它回 422 `GRAPHQL_VALIDATION_FAILED`），
+官方番号要再用别名批量问一次 `ppvContent`。不用 cid 推：分卷 `h_1454mcsr64002` 推出来是
+`MCSR-64002`，官方写 `MCSR-640-02`；`13dsvr01234` 的数字头会被当成发行目录吃掉，推成另一个厂牌的 `DSVR`。
 """
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -55,21 +62,60 @@ SEARCH_LIMIT = 30
 DETAIL_ATTEMPTS = 2
 HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 JST = timezone(timedelta(hours=9))
-UNRECOGNISED = "认不出可以问 DMM 的番号"
-MISSING = "DMM 没有这个番号"
-NOT_JSON = "DMM 返回的不是作品 JSON"
-REFUSED = "DMM 拒绝了这条查询"
+#: 几种没给出结果的说法（code）。
+UNRECOGNISED = "errors.dmm.unrecognizedCode"
+MISSING = "errors.dmm.notFound"
+NOT_JSON = "errors.dmm.notWorkJson"
+
+#: 按女优编号列片单。列表型 `PPVContentSearchContent` 没有 `makerContentId` 与 `makerReleasedAt`。
+ACTRESS_WORKS_QUERY = (
+    "query PeachActressWorks($limit: Int!, $offset: Int!, $sort: ContentSearchPPVSort!,"
+    " $filter: ContentSearchPPVFilterInput) { legacySearchPPV(limit: $limit, offset: $offset,"
+    " sort: $sort, filter: $filter) { result { pageInfo { totalCount hasNext } contents { id title"
+    " deliveryStartAt releaseStatus actresses { id name } maker { id name } } } } }"
+)
+#: 一页多少条：接口单页上限 100，官方番号的别名批量也按这个数一次问完。
+ACTRESS_PAGE = 100
+#: 女优编号的写法。只认纯数字，拼进查询变量之前就挡住别的东西。
+ACTRESS_ID = re.compile(r"^\d{1,10}$")
+PRE_ORDER = "PRE_ORDER"
+
+
+@dataclass(frozen=True)
+class ListedWork:
+    """片单里的一部。`maker_code` 是官方番号原文（`MXDLP-0343`），没问到时为空。"""
+
+    cid: str
+    title: str
+    maker_code: str
+    release_date: str
+    pre_order: bool
+    performers: tuple[str, ...]
+    studio: str
+
+
+@dataclass(frozen=True)
+class ActressWorks:
+    """一位女优的片单。`name` 是她在 DMM 上这个编号挂的名字，`total` 是接口自报的总部数。"""
+
+    name: str
+    total: int
+    works: tuple[ListedWork, ...]
 
 _CODE = re.compile(r"^(\d{3})?([A-Z]{2,8})-?(\d{1,5})([A-Z]{0,2})$")
 _CID = re.compile(r"^(?:h_\d+|\d+)?([a-z]+)(\d+)([a-z]*)$")
 
 
 def code_from_cid(value: str) -> str:
-    """DMM 商品号的数字头属于发行目录，尾字母保留为作品身份。"""
+    """DMM 商品号的数字头属于发行目录，尾字母保留为作品身份；SOD 特典版的尾字母 `v` 除外。"""
     matched = _CID.fullmatch(str(value or "").lower())
     if not matched:
         return ""
     letters, digits, suffix = matched.groups()
+    # SOD 特典版的商品号以 v 结尾（`1sdjs00304v`，官方番号 SDJS-304-V），内容是通常版正片加特典映像，
+    # 资源与资料都按通常版番号收录，归到通常版（同 JavDB 对 FANZA 限定版取通常版的规则）。
+    if suffix == "v":
+        suffix = ""
     return normalise_code_key(f"{letters}-{digits}{suffix}")
 
 
@@ -124,6 +170,38 @@ def release_date(value) -> str:
     return moment.astimezone(JST).date().isoformat()
 
 
+def listed_page(data: dict) -> tuple[list[dict], int, bool]:
+    """片单一页的（有 cid 的行，接口自报总部数，还有没有下一页）。形状对不上归 `parse_error`。"""
+    result = (data.get("legacySearchPPV") or {}).get("result")
+    contents = result.get("contents") if isinstance(result, dict) else None
+    if not isinstance(contents, list):
+        raise SourceFailure(FailureReason.PARSE_ERROR, "errors.dmm.notListJson")
+    info = result.get("pageInfo") if isinstance(result.get("pageInfo"), dict) else {}
+    total = info["totalCount"] if isinstance(info.get("totalCount"), int) else 0
+    rows = [row for row in contents if isinstance(row, dict) and row.get("id")]
+    return rows, total, bool(info.get("hasNext"))
+
+
+def _cast(row: dict) -> list[dict]:
+    return [item for item in row.get("actresses") or [] if isinstance(item, dict)]
+
+
+def listed_work(row: dict, maker_code: str) -> ListedWork:
+    """片单里的一行。发售日用 `deliveryStartAt`，预购的是预定配信日。"""
+    return ListedWork(
+        cid=str(row["id"]), title=str(row.get("title") or "").strip(), maker_code=maker_code,
+        release_date=release_date(row.get("deliveryStartAt")),
+        pre_order=row.get("releaseStatus") == PRE_ORDER,
+        performers=tuple(str(item["name"]) for item in _cast(row) if item.get("name")),
+        studio=str((row.get("maker") or {}).get("name") or ""))
+
+
+def actress_name(rows, actress_id: str) -> str:
+    """这个编号在出演表里挂的名字：订阅源列表靠它分清同一个人的几个编号。"""
+    return next((str(item.get("name") or "") for row in rows for item in _cast(row)
+                 if str(item.get("id") or "") == actress_id), "")
+
+
 class DmmSource(SiteSource):
     DEFAULT = DMM
 
@@ -148,7 +226,9 @@ class DmmSource(SiteSource):
             errors = raw.get("errors")
             first = errors[0] if isinstance(errors, list) and errors and isinstance(errors[0], dict) else {}
             message = str(first.get("message") or "")
-            raise SourceFailure(FailureReason.PARSE_ERROR, REFUSED + (f"：{message}" if message else ""))
+            if message:
+                raise SourceFailure(FailureReason.PARSE_ERROR, "errors.dmm.refusedWithMessage", {"message": message})
+            raise SourceFailure(FailureReason.PARSE_ERROR, "errors.dmm.refused")
         return data
 
     def content(self, cid: str, *, session: Session) -> dict | None:
@@ -175,6 +255,49 @@ class DmmSource(SiteSource):
         contents = result.get("contents") or []
         return matching_cids(code, (row.get("id") for row in contents if isinstance(row, dict)))
 
+    def maker_codes(self, cids, *, session: Session) -> dict[str, str]:
+        """一批 cid 的官方番号，一次请求问完（GraphQL 别名）。接口答 null 的 cid 不在结果里。"""
+        cids = list(cids)
+        if not cids:
+            return {}
+        query = "query PeachMakerCodes { " + " ".join(
+            f"a{index}: ppvContent(id: {json.dumps(cid)}) {{ id makerContentId }}"
+            for index, cid in enumerate(cids)) + " }"
+        data = self.graphql(query, {}, session=session)
+        found: dict[str, str] = {}
+        for index, cid in enumerate(cids):
+            item = data.get(f"a{index}")
+            if isinstance(item, dict) and str(item.get("makerContentId") or "").strip():
+                found[cid] = str(item["makerContentId"]).strip()
+        return found
+
+    def actress_works(self, actress_id: str, *, session: Session, known=frozenset(),
+                      limit: int = 2 * ACTRESS_PAGE) -> ActressWorks:
+        """按女优编号列片单，新的在前，预购最前。
+
+        一页 100 条，见过的 cid（`known`）只列不问官方番号。翻页只在这一页全是没见过的时候继续：
+        片单按发售日倒序，一页里出现见过的那部，再往后就都是上一轮列过的了；首轮最多翻到 `limit`。
+        一个人的片单动辄上千条（篠田ゆう 2066 部），每六小时全翻一遍只是花配额。
+        """
+        if not ACTRESS_ID.match(str(actress_id or "")):
+            raise SourceFailure(FailureReason.NOT_FOUND, "errors.feeds.dmmActressIdDigits")
+        name, total, works = "", 0, []
+        offset = 0
+        while offset < limit:
+            data = self.graphql(ACTRESS_WORKS_QUERY, {
+                "limit": ACTRESS_PAGE, "offset": offset, "sort": "RELEASE_DATE",
+                "filter": {"actressIds": {"ids": [{"id": str(actress_id)}]}}}, session=session)
+            rows, total, has_next = listed_page(data)
+            rows = rows[:limit - offset]
+            fresh = [str(row["id"]) for row in rows if str(row["id"]) not in known]
+            codes = self.maker_codes(fresh, session=session)
+            works.extend(listed_work(row, codes.get(str(row["id"]), "")) for row in rows)
+            name = name or actress_name(rows, str(actress_id))
+            offset += len(rows)
+            if not has_next or not rows or len(fresh) < len(rows):
+                break
+        return ActressWorks(name=name, total=total, works=tuple(works))
+
     def fetch(self, code: str, *, session: Session) -> Page:
         if not code_parts(code):
             raise SourceFailure(FailureReason.NOT_FOUND, UNRECOGNISED)
@@ -198,7 +321,7 @@ class DmmSource(SiteSource):
             raise SourceFailure(FailureReason.PARSE_ERROR, NOT_JSON)
         cid = str(item["id"])
         if not identifies_code(code, {"content_id": cid, "id": item.get("makerContentId")}):
-            raise SourceFailure(FailureReason.PARSE_ERROR, "来源返回的番号不匹配")
+            raise SourceFailure(FailureReason.PARSE_ERROR, "errors.base.codeMismatch")
         name = lambda key: str((item.get(key) or {}).get("name") or "")
         rows = lambda key: [row for row in item.get(key) or [] if isinstance(row, dict) and row.get("name")]
         directors = rows("directors")

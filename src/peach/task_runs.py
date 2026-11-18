@@ -28,19 +28,21 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
-from .jobs import TaskRunConflict, process_alive
+from . import interface_text, task_outcomes, task_stages
+from .jobs import TaskRunConflict, process_alive, process_matches
 from .repository import LedgerDatabase
 
 __all__ = [
     "ACTIVE_STATUSES", "DEFAULT_KEEP", "LEASE_SECONDS", "MAX_FOLLOWUPS",
-    "MAX_FOLLOWUP_DEPTH", "PROGRESS_INTERVAL", "TASK_LABELS", "TERMINAL_STATUSES",
+    "MAX_FOLLOWUP_DEPTH", "PROGRESS_INTERVAL", "TASK_KEYS", "TERMINAL_STATUSES",
     "TRIGGERS", "TaskRun", "TaskRunConflict", "TaskRunHandle", "TaskRunStore",
-    "cli_run", "inert_handle", "stamp", "task_label",
+    "cli_run", "inert_handle", "item_progress", "run_error", "run_progress", "stamp",
+    "task_label",
 ]
 
 LOGGER = logging.getLogger(__name__)
@@ -50,6 +52,8 @@ ACTIVE_STATUSES = ("pending", "running")
 #: 终态。只有这四种能进 `finish`，也只有这四种会被 `prune` 回收。
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled", "interrupted")
 TRIGGERS = ("manual", "scheduled", "startup", "cli")
+#: 任务中心列表每轮下发的已结束后继条数上限，见 `settled_followups`。
+SETTLED_FOLLOWUP_LIMIT = 50
 
 #: 心跳超过这么久没续，且进程也不在了，就按被打断处理。
 #: 取 5 分钟不是因为任务不会更久——单项外部动作的预算是 240 秒（`library_processing`
@@ -72,6 +76,9 @@ FINISH_RETRY_DELAYS = (1.0, 5.0)
 #: 每个 task_key 默认保留多少条终态记录。活动页只看最近几轮，更早的属于日志。
 DEFAULT_KEEP = 20
 
+#: 失败与中断的后继行按结束时间保留这么多天，见 `prune` 的 `failed_days`。
+FAILED_FOLLOWUP_DAYS = 30
+
 #: 一轮任务最多能派出多少条后继（ADR-0040 第五条）。多出来的在入队时截断，截断了几条
 #: 写进父任务的摘要——静默丢弃和无上限一样，都是事后查不出来的那一类。
 #: 64 是「一部片的出演者加厂牌」那个量级的十几倍，正常扇出撞不到它。
@@ -81,61 +88,115 @@ MAX_FOLLOWUPS = 64
 #: 再往下就不是扇出而是递归了，而递归的规模在代码评审里看不出来。
 MAX_FOLLOWUP_DEPTH = 2
 
-#: 任务登记表：key → 给人看的名字。不在表里的 key 由界面原样显示，不猜。
-TASK_LABELS = {
-    "follow-check": "追更检查",
-    "follow-resolve": "关注来源查找",
-    "library-processing": "扫描与采集",
-    "taste-refresh": "口味分析",
-    "link-check": "链接检查",
-    "link-prune": "失效链接清理",
-    "resource-scan": "资源同步检查",
-    "resource-apply": "资源同步清理",
-    "scraping-cover": "封面采集",
-    "media-repair": "媒体修复",
-    "upgrade-repairs": "自动修复",
-    "upgrade-library": "自动修复资料",
-    "organize": "按模板整理",
-    "batch": "批量操作",
-    "scrape-codes": "番号资料刮削",
-    "jav-covers": "封面批量抓取",
-    "entity-avatar": "补全资料图片",
-    "performer-profile": "补全女优资料",
-    "performer-alias": "补全女优别名",
-    "studio-mark": "补厂牌官网与标识",
-    "creator-identity": "查创作者身份",
-    "code-samples": "补番号样张",
-    "feed-check": "订阅源拉取",
-    "feed-scrape": "取新作资料",
-    "feed-cover": "补新作封面",
-    "want-scrape": "取想要的资料",
-    "timeline-thumbnails": "视频缩略图采集",
-    "download-postprocess": "云下载后处理",
-    "seed-import": "导入初始资料",
-    "follow-creator": "关注作者建档",
-    "amane-bridge": "重建 amane 桥",
-    "face-models": "下载人脸模型",
-}
-
-
-#: 触发方式的中文名。跳过原因是给人看的一句话，里面不留英文枚举值。
-TRIGGER_LABELS = {
-    "manual": "手动", "scheduled": "定时", "startup": "启动", "cli": "命令行",
-}
+#: 任务登记表。名字在 `resources/locales/<语言>/server.json` 的 `task.<key>`（ADR-0159）；
+#: 不在表里的 key 由界面原样显示，不猜。
+TASK_KEYS = (
+    "follow-check", "follow-resolve", "library-processing", "taste-refresh", "link-check", "link-prune",
+    "resource-scan", "resource-apply", "scraping-cover", "media-repair", "mp4-header-repair",
+    "jav-discovery-metadata", "diagnostic-export", "ledger-backup", "ledger-restore", "upgrade-repairs",
+    "upgrade-library", "follow-evidence-reclaim", "follow-backfill", "organize", "batch", "scrape-codes", "jav-covers",
+    "entity-avatar", "performer-profile", "performer-alias", "studio-mark", "creator-identity", "code-samples",
+    "feed-check", "feed-scrape", "feed-cover", "want-scrape", "want-search", "timeline-thumbnails", "download-postprocess",
+    "seed-import", "follow-creator", "amane-bridge", "source-check", "face-models", "cover-artwork-repair",
+)
 
 
 def task_label(task_key: str) -> str:
-    return TASK_LABELS.get(task_key, task_key)
+    return interface_text.text(f"server:task.{task_key}") if task_key in TASK_KEYS else task_key
 
 
 def trigger_label(trigger: str) -> str:
-    return TRIGGER_LABELS.get(trigger, trigger)
+    """触发方式的名字。跳过原因是给人看的一句话，里面不留英文枚举值。"""
+    return interface_text.label(f"manage:taskTrigger.{trigger}", trigger)
+
+
+#: 落库的进度说明与结束原因（ADR-0159 第二条）的键：文字在 `server.json` 的 `taskRun.progress.*`、
+#: `taskRun.error.*`。带 code 的那一句只存 code 与参数，`progress_label` / `error` 列留空，读出时
+#: 按资源渲染；没有 code 的那一句（文件名、异常原文）照旧存原文。
+#: `{{task}}`、`{{trigger}}`、`{{stage}}` 不进参数：库里只有 `task_key`、触发方式的 id 与阶段 code，
+#: 读的一方按界面语言换成名字。
+PROGRESS_KEYS = ("item", "items", "downloadLanded", "batch", "subjectStage", "videosStage",
+                 "waitingForUpdate", "waitingForService", "pausedWaiting", "schedulingRepairs")
+ERROR_KEYS = ("skippedBy", "skipped", "interrupted", "unknownFollowup", "dispatchInterrupted", "stoppedEarly")
+
+
+def _fill(key: str, task_key: str, params: dict) -> str:
+    names = {"task": task_label(task_key)}
+    if "trigger" in params:
+        names["trigger"] = trigger_label(str(params["trigger"]))
+    if "stage" in params:
+        names["stage"] = task_stages.text(str(params["stage"]))
+    return interface_text.text(f"server:{key}", {**params, **names})
+
+
+def coded_text(code: str, params: dict, task_key: str = "") -> str:
+    """库里一句带 code 的说明按资源渲染。阶段名的 code 是 `stage.<阶段>`；只说任务名的条目说明
+    （`item_progress` 不带条目名）渲染成任务名。"""
+    if code.startswith("stage."):
+        return task_stages.text(code.removeprefix("stage."))
+    if code == "taskRun.progress.item" and not params.get("name"):
+        return task_label(task_key)
+    return _fill(code, task_key, params)
+
+
+def run_progress(key: str, task_key: str = "", **params) -> dict:
+    """一句进度说明：`label` 是中文原文，`code` 与 `params` 供界面翻译。直接展开给 `progress`、`start`、`suspend`。"""
+    return {"label": _fill(f"taskRun.progress.{key}", task_key, params),
+            "code": f"taskRun.progress.{key}", "params": params}
+
+
+def item_progress(task_key: str, name: str = "") -> dict:
+    """后继正在做哪一件：「任务名：条目」。没有条目名时只写任务名，界面同样只显示任务名。"""
+    progress = run_progress("item", task_key, name=name)
+    return {**progress, "label": progress["label"] if name else task_label(task_key)}
+
+
+def run_error(key: str, task_key: str = "", **params) -> dict:
+    """一句结束原因：展开给 `finish`，`error` 是中文原文，`error_code` 与 `error_params` 供界面翻译。"""
+    return {"error": _fill(f"taskRun.error.{key}", task_key, params),
+            "error_code": f"taskRun.error.{key}", "error_params": params}
+
+
+def _coded(code: str | None, params: dict | None) -> tuple[str | None, str | None]:
+    """code 与参数按列存。没有 code 的那句把两列清空，不让上一句的 code 盖住这一句的原文。"""
+    if not code:
+        return None, None
+    return code, json.dumps(params or {}, ensure_ascii=False)
+
+
+def _text(text: str | None, code: str | None) -> str | None:
+    """原文那一列：带 code 的那句不存文字，读出时按资源渲染。"""
+    return None if code else text
+
+
+def _render(text: str | None, code: str | None, params: dict, task_key: str) -> str:
+    if code:
+        try:
+            return coded_text(code, params, task_key)
+        except (KeyError, TypeError, interface_text.InterfaceTextMissing):
+            LOGGER.warning("task_run text code %s has no resource entry", code)
+    return text or ""
+
+
+def _params(raw: str | None) -> dict:
+    try:
+        value = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def stamp(moment: datetime | None = None) -> str:
     """ISO-8601 UTC 文本，与 `entity`、`follow_schedule` 同一种写法。"""
     return (moment or datetime.now(timezone.utc)).astimezone(
         timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _delete_runs(connection, where: str, params) -> int:
+    """删掉满足 `where` 的运行行：下载任务指向它们的链接先清空，状态本身保留。"""
+    connection.execute("UPDATE download_task SET postprocess_run_id=NULL WHERE postprocess_run_id IN ("
+                       f"SELECT id FROM task_run WHERE {where})", params)
+    return connection.execute(f"DELETE FROM task_run WHERE {where}", params).rowcount
 
 
 def _parse(value: str | None) -> datetime | None:
@@ -171,6 +232,11 @@ class TaskRun:
     #: 这条后继要做的那件事的全名，同时是它的互斥键。不是后继时为空。
     followup_key: str = ""
     followup_depth: int = 0
+    #: `progress_label` 与 `error` 那两句的 code 和参数（ADR-0156 第三条）；旧行与没迁移的句子为空。
+    progress_code: str = ""
+    progress_params: dict = field(default_factory=dict)
+    error_code: str = ""
+    error_params: dict = field(default_factory=dict)
 
     @property
     def active(self) -> bool:
@@ -202,8 +268,12 @@ class TaskRun:
             "progress_current": self.progress_current,
             "progress_total": self.progress_total,
             "progress_label": self.progress_label,
-            "result_summary": self.result_summary,
+            "progress_code": self.progress_code,
+            "progress_params": self.progress_params,
+            "result_summary": task_outcomes.rendered(self.result_summary),
             "error": self.error,
+            "error_code": self.error_code,
+            "error_params": self.error_params,
             "parent_run_id": self.parent_run_id,
             "root_run_id": self.root_run_id,
             "followup_key": self.followup_key,
@@ -213,7 +283,8 @@ class TaskRun:
 
 _COLUMNS = ("id,task_key,trigger,status,mutex_key,pid,host,started_at,finished_at,"
             "heartbeat_at,progress_current,progress_total,progress_label,"
-            "result_summary,error,parent_run_id,root_run_id,followup_key,followup_depth")
+            "result_summary,error,parent_run_id,root_run_id,followup_key,followup_depth,"
+            "progress_code,progress_params,error_code,error_params")
 
 
 def _row(row: sqlite3.Row) -> TaskRun:
@@ -221,18 +292,23 @@ def _row(row: sqlite3.Row) -> TaskRun:
         summary = json.loads(row["result_summary"] or "{}")
     except ValueError:
         summary = {}
+    task_key = row["task_key"]
+    progress_code, progress_params = row["progress_code"] or "", _params(row["progress_params"])
+    error_code, error_params = row["error_code"] or "", _params(row["error_params"])
     return TaskRun(
-        id=row["id"], task_key=row["task_key"], trigger=row["trigger"],
+        id=row["id"], task_key=task_key, trigger=row["trigger"],
         status=row["status"], mutex_key=row["mutex_key"], pid=row["pid"],
         host=row["host"] or "", started_at=row["started_at"],
         finished_at=row["finished_at"], heartbeat_at=row["heartbeat_at"],
         progress_current=row["progress_current"], progress_total=row["progress_total"],
-        progress_label=row["progress_label"] or "",
+        progress_label=_render(row["progress_label"], progress_code, progress_params, task_key),
         result_summary=summary if isinstance(summary, dict) else {},
-        error=row["error"] or "",
+        error=_render(row["error"], error_code, error_params, task_key),
         parent_run_id=row["parent_run_id"], root_run_id=row["root_run_id"],
         followup_key=row["followup_key"] or "",
         followup_depth=int(row["followup_depth"] or 0),
+        progress_code=progress_code, progress_params=progress_params,
+        error_code=error_code, error_params=error_params,
     )
 
 
@@ -274,7 +350,9 @@ class TaskRunStore:
 
     def start(self, task_key: str, *, trigger: str, mutex_key: str | None = None,
               conflict: str = "skip", total: int | None = None,
-              label: str = "", pid: int | None = None) -> TaskRun | None:
+              label: str = "", pid: int | None = None,
+              summary: dict | None = None, code: str | None = None,
+              params: dict | None = None) -> TaskRun | None:
         from .update_tasks import admission
         with admission(self.database.db_path):
             from .job_recovery import current_run
@@ -282,17 +360,23 @@ class TaskRunStore:
             if resumed is not None:
                 return resumed
             return self._start(task_key, trigger=trigger, mutex_key=mutex_key,
-                               conflict=conflict, total=total, label=label, pid=pid)
+                               conflict=conflict, total=total, label=label, pid=pid,
+                               summary=summary, code=code, params=params)
 
-    def suspend(self, run_id: int, *, label: str = '等待安装完成后继续',
-                paused_for_update: bool = True) -> None:
+    def suspend(self, run_id: int, *, label: str | None = None, code: str | None = None,
+                params: dict | None = None, paused_for_update: bool = True) -> None:
+        """放回排队。不给说明时写「等待安装完成后继续」；只给原文、没给 code 的，界面照原文显示。"""
         if not self.enabled:
             return
+        if label is None:
+            waiting = run_progress("waitingForUpdate")
+            label, code, params = waiting["label"], waiting["code"], waiting["params"]
         with self.database.write_transaction(notify=False) as connection:
             connection.execute(
-                "UPDATE task_run SET status='pending',pid=0,progress_label=?,result_summary=? "
-                "WHERE id=? AND status='running'",
-                (label, json.dumps({'paused_for_update': True} if paused_for_update else {}), run_id))
+                "UPDATE task_run SET status='pending',pid=0,progress_label=?,progress_code=?,"
+                "progress_params=?,result_summary=? WHERE id=? AND status='running'",
+                (_text(label, code), *_coded(code, params),
+                 json.dumps({'paused_for_update': True} if paused_for_update else {}), run_id))
 
     def _resume(self, run_id, task_key):
         if run_id is None or not self.enabled:
@@ -307,16 +391,20 @@ class TaskRunStore:
 
     def _start(self, task_key: str, *, trigger: str, mutex_key: str | None = None,
                conflict: str = "skip", total: int | None = None,
-               label: str = "", pid: int | None = None) -> TaskRun | None:
+               label: str = "", pid: int | None = None,
+               summary: dict | None = None, code: str | None = None,
+               params: dict | None = None) -> TaskRun | None:
         """开一轮。互斥冲突时按 `conflict` 处理，返回 None 或抛 `TaskRunConflict`。
+
+        `summary` 是开跑时就知道的那部分摘要，例如这一轮处理的是哪部作品；结算时由最终摘要替换。
 
         `conflict="skip"` 是定时触发的语义：本轮不跑，但要留下一条记录说明被谁挡了。
         `conflict="raise"` 是手动触发的语义：告诉用户是哪一轮挡着，让他自己决定。
         """
         if trigger not in TRIGGERS:
-            raise ValueError(f"未知的触发方式：{trigger}")
+            raise ValueError(f"unknown trigger: {trigger}")
         if conflict not in ("skip", "raise"):
-            raise ValueError(f"未知的冲突处理方式：{conflict}")
+            raise ValueError(f"unknown conflict mode: {conflict}")
         if not self.enabled:
             return None
         moment = stamp()
@@ -325,11 +413,14 @@ class TaskRunStore:
                 cursor = connection.execute(
                     "INSERT INTO task_run(task_key,trigger,status,mutex_key,pid,host,"
                     "started_at,heartbeat_at,progress_current,progress_total,"
-                    "progress_label,result_summary) "
-                    "VALUES(?,?,'running',?,?,?,?,?,0,?,?,'{}')",
+                    "progress_label,progress_code,progress_params,result_summary) "
+                    "VALUES(?,?,'running',?,?,?,?,?,0,?,?,?,?,?)",
                     (task_key, trigger, mutex_key, pid if pid is not None else os.getpid(),
-                     self.host, moment, moment, total, label))
+                     self.host, moment, moment, total, _text(label, code), *_coded(code, params),
+                     json.dumps(summary or {}, ensure_ascii=False)))
                 run_id = int(cursor.lastrowid)
+                from .task_control import initialize_speed
+                initialize_speed(self, run_id, task_key=task_key)
         except sqlite3.IntegrityError:
             if mutex_key is None:
                 # 没声明互斥还撞上约束，说明坏的是别的东西（CHECK、列约束），
@@ -348,22 +439,25 @@ class TaskRunStore:
     def _record_skip(self, task_key: str, trigger: str, mutex_key: str,
                      blocking: TaskRun | None) -> None:
         """把一次静默跳过写成终态记录。它没有 `started_at`——这一轮从没开跑。"""
-        reason = (f"与第 {blocking.id} 轮（{trigger_label(blocking.trigger)}触发）冲突，本次跳过"
-                  if blocking else "已有一轮在进行，本次跳过")
+        reason = (run_error("skippedBy", run=blocking.id, trigger=blocking.trigger)
+                  if blocking else run_error("skipped"))
         summary = json.dumps({"blocked_by": blocking.id if blocking else None},
                              ensure_ascii=False)
         with self.database.write_transaction(notify=False) as connection:
             connection.execute(
                 "INSERT INTO task_run(task_key,trigger,status,mutex_key,pid,host,"
-                "finished_at,result_summary,error) "
-                "VALUES(?,?,'cancelled',?,?,?,?,?,?)",
-                (task_key, trigger, mutex_key, os.getpid(), self.host,
-                 stamp(), summary, reason))
+                "finished_at,result_summary,error,error_code,error_params) "
+                "VALUES(?,?,'cancelled',?,?,?,?,?,?,?,?)",
+                (task_key, trigger, mutex_key, os.getpid(), self.host, stamp(), summary,
+                 None, *_coded(reason["error_code"], reason["error_params"])))
 
     def progress(self, run_id: int | None, *, current: int | None = None,
                  total: int | None = None, label: str | None = None,
-                 throttle: float = PROGRESS_INTERVAL) -> bool:
+                 throttle: float = PROGRESS_INTERVAL, code: str | None = None,
+                 params: dict | None = None) -> bool:
         """推进度并顺带续租。已经进终态的行不再接受进度。
+
+        `label` 与它的 `code`、`params` 一起写：只给原文的那一次把 code 清掉。
 
         `throttle` 是墙钟节流：页面两秒轮询一次，比这更密的写入没有读者，只有代价。
         收尾前那一次要看到真实的最终计数，调用方传 `throttle=0`。
@@ -377,11 +471,13 @@ class TaskRunStore:
         assignments = ["heartbeat_at=?"]
         values: list[object] = [stamp()]
         for column, value in (("progress_current", current),
-                              ("progress_total", total),
-                              ("progress_label", label)):
+                              ("progress_total", total)):
             if value is not None:
                 assignments.append(f"{column}=?")
                 values.append(value)
+        if label is not None:
+            assignments += ["progress_label=?", "progress_code=?", "progress_params=?"]
+            values += [_text(label, code), *_coded(code, params)]
         return self._update_progress(run_id, assignments, values)
 
     def heartbeat(self, run_id: int | None, *,
@@ -401,7 +497,7 @@ class TaskRunStore:
                 first = run_id not in self._progress_failing
                 self._progress_failing.add(run_id)
             if first:
-                LOGGER.warning("第 %s 轮的进度没写进 task_run，下一次进度再写：%s",
+                LOGGER.warning("Progress for run %s was not written to task_run, will retry with the next update: %s",
                                run_id, error)
             return False
         with self._lock:
@@ -409,7 +505,8 @@ class TaskRunStore:
         return done
 
     def finish(self, run_id: int | None, status: str, *, summary: dict | None = None,
-               error: str = "") -> bool:
+               error: str = "", error_code: str | None = None,
+               error_params: dict | None = None) -> bool:
         """结算。只能从活跃态进终态，一条 UPDATE 带 WHERE 做 CAS。
 
         返回是否由本次调用落地。`False` 表示这一轮已经被别人结算过——租约回收和任务
@@ -418,14 +515,16 @@ class TaskRunStore:
         写锁拿不到时按 `finish_retry_delays` 重试，全部用完仍写不进去才抛。
         """
         if status not in TERMINAL_STATUSES:
-            raise ValueError(f"{status} 不是终态")
+            raise ValueError(f"{status} is not a terminal status")
         if not self.enabled or run_id is None:
             return False
         moment = stamp()
         assignments = ["status=?", "finished_at=?", "heartbeat_at=?", "result_summary=?",
-                       "error=?"]
+                       "error=?", "error_code=?", "error_params=?"]
+        coded = error_code if error else None
         values = [status, moment, moment,
-                  json.dumps(summary or {}, ensure_ascii=False), error]
+                  json.dumps(summary or {}, ensure_ascii=False), _text(error, coded),
+                  *_coded(coded, error_params)]
         delays = list(self.finish_retry_delays)
         while True:
             try:
@@ -435,7 +534,7 @@ class TaskRunStore:
                 if not delays:
                     raise
                 delay = delays.pop(0)
-                LOGGER.warning("第 %s 轮结算没写进 task_run，%s 秒后重试：%s",
+                LOGGER.warning("Settlement for run %s was not written to task_run, retrying in %s s: %s",
                                run_id, delay, failure)
                 time.sleep(delay)
         with self._lock:
@@ -449,8 +548,8 @@ class TaskRunStore:
                           followups) -> dict:
         """把一轮任务声明的后继写成 `pending` 行，返回这次入队的结果。
 
-        `followups` 的每一项是 `(key, task_key, label)`：`key` 是这件事的全名，同时是
-        互斥键；`task_key` 决定谁来跑它、活动页上显示成什么。
+        `followups` 的每一项是 `(key, task_key, label)`，可再带 `code, params`：`key` 是这件事的
+        全名，同时是互斥键；`task_key` 决定谁来跑它、活动页上显示成什么；`label` 是排队时的进度说明。
 
         三种没入队的情况分开计数，都不静默：`duplicates` 是同一件事已经在排或在跑
         （同一次声明里重复的也算），`truncated` 是超出 `MAX_FOLLOWUPS` 被截掉的，
@@ -469,42 +568,47 @@ class TaskRunStore:
             result["depth_exceeded"] = len(items)
             return result
         seen: set[str] = set()
-        planned: list[tuple[str, str, str]] = []
-        for key, task_key, label in items:
+        planned: list[tuple[str, str, str | None, str | None, str | None]] = []
+        for item in items:
+            key, task_key, label, code, params = (*item, None, None)[:5]
             key = str(key).strip()
             if not key or key in seen:
                 result["duplicates"] += 1
                 continue
             seen.add(key)
-            planned.append((key, str(task_key), str(label or "")))
+            planned.append((key, str(task_key), _text(str(label or ""), code), *_coded(code, params)))
         if len(planned) > MAX_FOLLOWUPS:
             result["truncated"] = len(planned) - MAX_FOLLOWUPS
             planned = planned[:MAX_FOLLOWUPS]
         root = parent.root_run_id or parent.id
         moment = stamp()
-        with self.database.write_transaction(notify=False) as connection:
+        from .task_control import initialize_speed
+        from .update_tasks import gate, state_for
+        with gate(state_for(self.database.db_path)), self.database.write_transaction(notify=False) as connection:
             # 父任务是裸任务时它就是这条链的根。补在这里而不是 `start`：开工那一刻还
             # 不知道这一轮会不会派后继，给每一行都填一个指向自己的 root 是无意义的噪声。
             connection.execute(
                 "UPDATE task_run SET root_run_id=id WHERE id=? AND root_run_id IS NULL",
                 (parent.id,))
-            for key, task_key, label in planned:
+            for key, task_key, label, code, params in planned:
                 try:
                     cursor = connection.execute(
                         "INSERT INTO task_run(task_key,trigger,status,mutex_key,pid,host,"
-                        "heartbeat_at,progress_label,result_summary,parent_run_id,"
-                        "root_run_id,followup_key,followup_depth) "
-                        "VALUES(?,?,'pending',?,?,?,?,?,'{}',?,?,?,?)",
+                        "heartbeat_at,progress_label,progress_code,progress_params,result_summary,"
+                        "parent_run_id,root_run_id,followup_key,followup_depth) "
+                        "VALUES(?,?,'pending',?,?,?,?,?,?,?,'{}',?,?,?,?)",
                         (task_key, parent.trigger, key, os.getpid(), self.host,
-                         moment, label, parent.id, root, key, depth))
+                         moment, label, code, params, parent.id, root, key, depth))
                 except sqlite3.IntegrityError:
                     # 活跃互斥索引拦下的：同一件事已经在排队或在跑，这一条不必再排。
                     result["duplicates"] += 1
                     continue
-                result["queued"].append(int(cursor.lastrowid))
+                run_id = int(cursor.lastrowid)
+                initialize_speed(self, run_id, parent)
+                result["queued"].append(run_id)
         return result
 
-    def continue_followup(self, run: TaskRun, label: str = "") -> int | None:
+    def continue_followup(self, run: TaskRun) -> int | None:
         """一条后继结算后说「还没做完」，在原地接一条同样的：同一个父任务、同一层、同一个键。
 
         不走 `enqueue_followups`：那是往下派一层，存量要跑几十轮的事会撞上 `MAX_FOLLOWUP_DEPTH`。
@@ -513,25 +617,34 @@ class TaskRunStore:
         """
         if not self.enabled or not run.followup_key:
             return None
-        with self.database.write_transaction(notify=False) as connection:
+        from .task_control import initialize_speed
+        from .update_tasks import gate, state_for
+        with gate(state_for(self.database.db_path)), self.database.write_transaction(notify=False) as connection:
             try:
+                # 接续的那一行只说任务名：要做的那一件还没领到，上一轮的条目已经做完。
+                waiting = item_progress(run.task_key)
                 cursor = connection.execute(
                     "INSERT INTO task_run(task_key,trigger,status,mutex_key,pid,host,"
-                    "heartbeat_at,progress_label,result_summary,parent_run_id,"
-                    "root_run_id,followup_key,followup_depth) "
-                    "VALUES(?,?,'pending',?,?,?,?,?,'{}',?,?,?,?)",
+                    "heartbeat_at,progress_label,progress_code,progress_params,result_summary,"
+                    "parent_run_id,root_run_id,followup_key,followup_depth) "
+                    "VALUES(?,?,'pending',?,?,?,?,?,?,?,'{}',?,?,?,?)",
                     (run.task_key, run.trigger, run.followup_key, os.getpid(), self.host,
-                     stamp(), label, run.parent_run_id, run.root_run_id, run.followup_key,
-                     run.followup_depth))
+                     stamp(), None, *_coded(waiting["code"], waiting["params"]),
+                     run.parent_run_id, run.root_run_id, run.followup_key, run.followup_depth))
             except sqlite3.IntegrityError:
                 return None
-        return int(cursor.lastrowid)
+            run_id = int(cursor.lastrowid)
+            initialize_speed(self, run_id, run)
+        return run_id
 
     def claim_followup(self, task_keys, first=()) -> TaskRun | None:
-        from .update_tasks import admission, UpdateBusy
+        """装更新期间返回 None；闸门锁被别人拿着时抛 `GateBusy`，调用方稍后再领。"""
+        from .update_tasks import admission, GateBusy, UpdateBusy
         try:
             with admission(self.database.db_path):
                 return self._claim_followup(task_keys, first)
+        except GateBusy:
+            raise
         except UpdateBusy:
             return None
 
@@ -546,13 +659,24 @@ class TaskRunStore:
             return None
         ahead = tuple(dict.fromkeys(str(key) for key in first or ())) or ("",)
         marks = ",".join("?" * len(keys))
+        from .task_control import requested
         moment = stamp()
         with self.database.write_transaction(notify=False) as connection:
-            row = connection.execute(
-                f"SELECT id FROM task_run WHERE followup_key IS NOT NULL "
+            rows = connection.execute(
+                f"SELECT id,parent_run_id,root_run_id FROM task_run WHERE followup_key IS NOT NULL "
                 f"AND status='pending' AND task_key IN ({marks}) "
-                f"ORDER BY task_key IN ({','.join('?' * len(ahead))}) DESC, id LIMIT 1",
-                (*keys, *ahead)).fetchone()
+                f"ORDER BY task_key IN ({','.join('?' * len(ahead))}) DESC, id",
+                (*keys, *ahead)).fetchall()
+            row = None
+            for candidate in rows:
+                action = requested(self.database.db_path, candidate['id'],
+                                   (candidate['parent_run_id'], candidate['root_run_id']))
+                if action == 'cancel':
+                    connection.execute("UPDATE task_run SET status='cancelled',finished_at=?,heartbeat_at=? "
+                                       "WHERE id=? AND status='pending'", (moment, moment, candidate['id']))
+                elif action != 'pause':
+                    row = candidate
+                    break
             if row is None:
                 return None
             run_id = int(row["id"])
@@ -583,12 +707,22 @@ class TaskRunStore:
                 (stamp(),))
         return [int(row["id"]) for row in rows]
 
-    def children(self, parent_run_id: int) -> list[TaskRun]:
-        """这一轮派出的后继，按入队顺序。"""
+    def children(self, parent_run_id: int, *, limit: int | None = None) -> list[TaskRun]:
+        """这一轮派出的后继，按入队顺序。
+
+        给了 `limit` 只取最近派出的那么多条，正在跑的另外一条不落：后继按 id 顺序认领，在跑的那条
+        往往是最早的，按 id 取最近几条只剩排队的。总数看 `followup_counts`。
+        """
         with self.database.read_connection() as connection:
-            rows = connection.execute(
-                f"SELECT {_COLUMNS} FROM task_run WHERE parent_run_id=? ORDER BY id",
-                (int(parent_run_id),)).fetchall()
+            if limit is None:
+                rows = connection.execute(
+                    f"SELECT {_COLUMNS} FROM task_run WHERE parent_run_id=? ORDER BY id",
+                    (int(parent_run_id),)).fetchall()
+            else:
+                rows = connection.execute(
+                    f"SELECT {_COLUMNS} FROM task_run WHERE parent_run_id=? AND (status='running' OR id IN ("
+                    "SELECT id FROM task_run WHERE parent_run_id=? ORDER BY id DESC LIMIT ?)) ORDER BY id",
+                    (int(parent_run_id), int(parent_run_id), max(1, int(limit)))).fetchall()
         return [_row(row) for row in rows]
 
     def _due(self, run_id: int, throttle: float) -> bool:
@@ -641,7 +775,7 @@ class TaskRunStore:
                     continue
             local = run.host == self.host
             alive = (local and run.pid is not None and run.pid != os.getpid()
-                     and process_alive(run.pid))
+                     and process_matches(run.pid, run.heartbeat_at or run.started_at, alive=process_alive))
             beat = _parse(run.heartbeat_at) or _parse(run.started_at)
             expired = beat is None or beat < deadline
             if alive or (not local and not expired):
@@ -650,32 +784,63 @@ class TaskRunStore:
                 from .job_recovery import read
                 recovery = read(self.database.db_path, run.task_key)
                 if recovery.get('status') == 'active' and recovery.get('run_id') == run.id:
-                    self.suspend(run.id, label='等待服务启动后继续')
+                    self.suspend(run.id, **run_progress("waitingForService"))
                     continue
-            if self.finish(run.id, "interrupted",
-                           error="服务重启，这一轮没有跑完"):
+            if self.finish(run.id, "interrupted", **run_error("interrupted")):
                 recovered.append(run.id)
         return recovered
 
-    def prune(self, task_key: str, keep: int = DEFAULT_KEEP) -> int:
+    def prune(self, task_key: str, keep: int = DEFAULT_KEEP, *, keep_errors: bool = False,
+              failed_days: float | None = FAILED_FOLLOWUP_DAYS) -> int:
         """每个 task_key 只留最近 `keep` 条终态记录，返回删掉多少条。
 
         活跃任务保留，指向已清退历史的父任务和根任务关联由删除触发器置空。
-        阈值用 `LIMIT 1 OFFSET keep` 取「第 keep+1 新的那条 id」。
+        随后清退整个数据根里已结束运行的控制文件（`task_control.prune_controls`），不限本 task_key。
+        后继使用 `keep_errors`：成功与取消的按 `keep` 条清退；失败与中断的不占条数，按结束时间
+        保留 `failed_days` 天，过了就清退。重试不读这一行——下载按自己的后处理状态重派，
+        升级补修按 `ledger_upgrade_item`——它只供任务中心里看最近出过什么错。`failed_days`
+        为 None 时失败行全留，交给类型自己按结论清退（`FollowupType.prunes_failures`）。
+        下载状态保留并清空已清退运行的链接。阈值用 `LIMIT 1 OFFSET keep` 取「第 keep+1 新的那条 id」。
         """
         if not self.enabled or keep < 0:
             return 0
-        marks = ",".join(f"'{name}'" for name in TERMINAL_STATUSES)
+        states = ('succeeded', 'cancelled') if keep_errors else TERMINAL_STATUSES
+        marks = ",".join(f"'{name}'" for name in states)
+        removed = 0
         with self.database.write_transaction(notify=False) as connection:
             threshold = connection.execute(
                 f"SELECT id FROM task_run WHERE task_key=? AND status IN ({marks}) "
                 "ORDER BY id DESC LIMIT 1 OFFSET ?", (task_key, keep)).fetchone()
-            if threshold is None:
-                return 0
-            cursor = connection.execute(
-                f"DELETE FROM task_run WHERE task_key=? AND status IN ({marks}) "
-                "AND id<=?", (task_key, threshold["id"]))
-        return cursor.rowcount
+            if threshold is not None:
+                removed = _delete_runs(connection, f"task_key=? AND status IN ({marks}) AND id<=?",
+                                       (task_key, threshold["id"]))
+            if keep_errors and failed_days is not None:
+                cutoff = stamp(datetime.now(timezone.utc) - timedelta(days=failed_days))
+                removed += _delete_runs(
+                    connection, "task_key=? AND status IN ('failed','interrupted') "
+                    "AND followup_key IS NOT NULL AND finished_at<?", (task_key, cutoff))
+        from .task_control import prune_controls
+        prune_controls(self)
+        return removed
+
+    def delete_finished(self, run_ids) -> int:
+        """删掉这几行已结束的运行（活跃的不碰），收走它们的控制文件，返回删掉的行数。
+
+        给按自己的结论清退失败后继的调用方（`upgrade_repairs.prune_settled_failures`）。
+        """
+        ids = sorted({int(run_id) for run_id in run_ids})
+        if not self.enabled or not ids:
+            return 0
+        removed = 0
+        terminal = ",".join(f"'{name}'" for name in TERMINAL_STATUSES)
+        with self.database.write_transaction(notify=False) as connection:
+            for offset in range(0, len(ids), 900):
+                batch = ids[offset:offset + 900]
+                removed += _delete_runs(
+                    connection, f"status IN ({terminal}) AND id IN ({','.join('?' * len(batch))})", batch)
+        from .task_control import prune_controls
+        prune_controls(self)
+        return removed
 
     # -- 查询 --------------------------------------------------------------
 
@@ -684,6 +849,52 @@ class TaskRunStore:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM task_run WHERE id=?", (run_id,)).fetchone()
         return _row(row) if row else None
+
+    def active_descendants(self, run_id: int, *, limit: int | None = None) -> list[TaskRun]:
+        """还在排或在跑的全部后代（不含自己），一条查询取回整行。
+
+        一轮补全能派出上千条后继；逐条 `get` 每条都开一次连接，任务中心每次轮询都要等好几秒。
+        只想知道有没有时给 `limit=1`。
+        """
+        sql = ("WITH RECURSIVE family(id) AS (SELECT id FROM task_run WHERE parent_run_id=? "
+               "UNION ALL SELECT t.id FROM task_run t JOIN family f ON t.parent_run_id=f.id) "
+               f"SELECT {_COLUMNS} FROM task_run WHERE id IN (SELECT id FROM family) "
+               "AND status IN ('pending','running') ORDER BY id")
+        params: tuple = (run_id,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params += (limit,)
+        with self.database.read_connection() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [_row(row) for row in rows]
+
+    def active_families(self) -> dict[int, list[tuple[int, str]]]:
+        """每条自己或后代还在排在跑的任务 → 这一族里在排在跑的 `(id, status)`（含自己），按 id 排。
+
+        键与 `live_ids` 相同。任务中心一页里每条在跑的任务都要问「族里谁还活着」：逐条递归查询、
+        逐条开连接，几千条排队后继时一次轮询要好几秒；这里一条查询沿父链往上一次取齐。
+        """
+        families: dict[int, list[tuple[int, str]]] = {}
+        with self.database.read_connection() as connection:
+            for ancestor, run_id, status in connection.execute(
+                    "WITH RECURSIVE up(ancestor, id, status) AS ("
+                    "SELECT id, id, status FROM task_run WHERE status IN ('pending','running') "
+                    "UNION SELECT t.parent_run_id, u.id, u.status FROM task_run t JOIN up u ON t.id=u.ancestor "
+                    "WHERE t.parent_run_id IS NOT NULL) SELECT ancestor, id, status FROM up ORDER BY ancestor, id"):
+                families.setdefault(int(ancestor), []).append((int(run_id), status))
+        return families
+
+    def live_ids(self) -> set[int]:
+        """自己或某个后代还在排或在跑的任务：在排在跑的那些，连同它们沿父链往上的每一层。
+
+        任务中心一页两百来条，绝大多数早已结束、后代也都结束了；先一条查询圈出这一份，
+        不在里面的就不必逐条再问控制状态与资源占用。
+        """
+        with self.database.read_connection() as connection:
+            return {int(row[0]) for row in connection.execute(
+                "WITH RECURSIVE live(id) AS (SELECT id FROM task_run WHERE status IN ('pending','running') "
+                "UNION SELECT t.parent_run_id FROM task_run t JOIN live l ON t.id=l.id "
+                "WHERE t.parent_run_id IS NOT NULL) SELECT id FROM live")}
 
     def blocking(self, mutex_key: str) -> TaskRun | None:
         """当前占着这把锁的那一轮。冲突时用它回答「是谁挡的」。"""
@@ -705,7 +916,7 @@ class TaskRunStore:
             clauses.append("status IN (%s)" % ",".join(f"'{s}'" for s in TERMINAL_STATUSES))
         elif status:
             if status not in (*ACTIVE_STATUSES, *TERMINAL_STATUSES):
-                raise ValueError(f"未知的状态：{status}")
+                raise ValueError(f"unknown status: {status}")
             clauses.append("status=?")
             values.append(status)
         if task_key:
@@ -718,8 +929,21 @@ class TaskRunStore:
                 [*values, max(1, min(int(limit), 500))]).fetchall()
         return [_row(row) for row in rows]
 
+    @staticmethod
+    def _finished_condition() -> str:
+        marks = ",".join(f"'{name}'" for name in TERMINAL_STATUSES)
+        active = ",".join(f"'{name}'" for name in ACTIVE_STATUSES)
+        return (f"t.status IN ({marks}) AND (t.parent_run_id IS NULL OR NOT EXISTS "
+                "(SELECT 1 FROM task_run p WHERE p.id=t.parent_run_id)) AND NOT EXISTS "
+                f"(SELECT 1 FROM task_run c WHERE c.parent_run_id=t.id AND c.status IN ({active}))")
+
+    def finished_count(self) -> int:
+        with self.database.read_connection() as connection:
+            return connection.execute(
+                f"SELECT count(*) FROM task_run t WHERE {self._finished_condition()}").fetchone()[0]
+
     def finished_page(self, *, before: tuple[str, int] | None = None,
-                      limit: int = 50) -> tuple[list[TaskRun], bool]:
+                      limit: int = 50, offset: int = 0) -> tuple[list[TaskRun], bool]:
         """终态行按结束时刻从新到旧取一页，返回这一页和它后面还有没有更早的。
 
         排序键是 `(finished_at, id)` 而不是 `id`：开跑早、结束晚的长任务按 id 会落进
@@ -735,11 +959,7 @@ class TaskRunStore:
         自动修复每分钟派一批，它们留在这里会占满第一页，「最近完成」就只剩一个「加载更早」。
         """
         size = max(1, min(int(limit), 500))
-        marks = ",".join(f"'{name}'" for name in TERMINAL_STATUSES)
-        active = ",".join(f"'{name}'" for name in ACTIVE_STATUSES)
-        where = (f"t.status IN ({marks}) AND (t.parent_run_id IS NULL OR NOT EXISTS "
-                 "(SELECT 1 FROM task_run p WHERE p.id=t.parent_run_id)) AND NOT EXISTS "
-                 f"(SELECT 1 FROM task_run c WHERE c.parent_run_id=t.id AND c.status IN ({active}))")
+        where = self._finished_condition()
         values: list[object] = []
         if before is not None:
             where += " AND (t.finished_at<? OR (t.finished_at=? AND t.id<?))"
@@ -748,12 +968,17 @@ class TaskRunStore:
         with self.database.read_connection() as connection:
             rows = connection.execute(
                 f"SELECT {columns} FROM task_run t WHERE {where} "
-                "ORDER BY t.finished_at DESC, t.id DESC LIMIT ?", [*values, size + 1]).fetchall()
+                "ORDER BY t.finished_at DESC, t.id DESC LIMIT ? OFFSET ?",
+                [*values, size + 1, max(0, int(offset))]).fetchall()
         page = [_row(row) for row in rows[:size]]
         return page + self.settled_followups([run.id for run in page]), len(rows) > size
 
-    def settled_followups(self, root_ids) -> list[TaskRun]:
-        """这几轮派出的、已经结束的后继，整条链上的都算。"""
+    def settled_followups(self, root_ids, *, limit: int | None = None) -> list[TaskRun]:
+        """这几轮派出的、已经结束的后继，整条链上的都算；每轮只取最近 `limit` 条。
+
+        任务中心有任务在跑时每两秒取一次，一轮派出上千条后继时不设上限就是每两秒几千行。
+        总数与失败数看 `followup_counts`，卡片展开时再按父任务取全（`/api/tasks/{id}`）。
+        """
         ids = [int(run_id) for run_id in root_ids]
         if not self.enabled or not ids:
             return []
@@ -761,9 +986,11 @@ class TaskRunStore:
         holes = ",".join("?" * len(ids))
         with self.database.read_connection() as connection:
             rows = connection.execute(
-                f"SELECT {_COLUMNS} FROM task_run WHERE root_run_id IN ({holes}) "
-                f"AND id NOT IN ({holes}) AND status IN ({marks}) ORDER BY id",
-                [*ids, *ids]).fetchall()
+                f"SELECT {_COLUMNS} FROM (SELECT *, ROW_NUMBER() OVER ("
+                "PARTITION BY root_run_id ORDER BY id DESC) AS recent FROM task_run "
+                f"WHERE root_run_id IN ({holes}) AND id NOT IN ({holes}) AND status IN ({marks})) "
+                "WHERE recent<=? ORDER BY id",
+                [*ids, *ids, max(1, int(SETTLED_FOLLOWUP_LIMIT if limit is None else limit))]).fetchall()
         return [_row(row) for row in rows]
 
     def active_parents(self) -> list[TaskRun]:
@@ -813,9 +1040,15 @@ class TaskRunStore:
                          conflict=conflict, total=total, label=label)
         handle = TaskRunHandle(self, run.id if run else None)
         try:
-            yield handle
+            from .task_control import bind, checkpoint
+            with bind(self, handle.run_id):
+                yield handle
+                checkpoint()
         except BaseException as error:
-            handle.finish("failed", error=f"{type(error).__name__}: {error}")
+            from .task_control import Cancelled
+            from .user_messages import failure_fields
+            handle.finish('cancelled' if isinstance(error, Cancelled) else 'failed',
+                          **({} if isinstance(error, Cancelled) else failure_fields(error)))
             raise
         else:
             handle.finish("succeeded")
@@ -848,7 +1081,7 @@ def cli_run(task_key: str, db_path: Path | str | None, *, label: str = "",
             candidate.query(limit=1)
             store = candidate
         except sqlite3.OperationalError:
-            print(f"[task-run] {db_path} 没有 task_run 表，本趟不登记进任务中心")
+            print(f"[task-run] {db_path} has no task_run table; this run is not recorded in the task center")
     if store is None:
         yield TaskRunHandle(TaskRunStore(Path(db_path or ":memory:"), enabled=False), None)
         return
@@ -857,15 +1090,16 @@ def cli_run(task_key: str, db_path: Path | str | None, *, label: str = "",
         yield handle
 
 
-def declared_rows(declared) -> list[tuple[str, str, str]]:
-    """任务结果里声明的后继（`[{"key", "task_key", "label"}]`）换成 `enqueue_followups` 要的行。
+def declared_rows(declared) -> list[tuple]:
+    """任务结果里声明的后继（`Followup.declared()` 的写法）换成 `enqueue_followups` 要的行。
 
     后台任务的结算与命令行入口共用这一份：任务结果是同一个函数给的，两边各拆一遍，
     命令行那边漏掉，就是一整轮新登记的女优全都没人去补头像和资料。
     """
     if not isinstance(declared, list):
         return []
-    return [(item.get("key"), item.get("task_key"), item.get("label", ""))
+    return [(item.get("key"), item.get("task_key"), item.get("label", ""),
+             item.get("label_code"), item.get("label_params") or {})
             for item in declared if isinstance(item, dict) and item.get("key")]
 
 
@@ -885,6 +1119,8 @@ class TaskRunHandle:
 
     def checkpoint(self, **fields) -> None:
         """领域结果提交后保存完成集合；后继重新领取时沿用。"""
+        from .task_control import checkpoint
+        checkpoint()
         if self.run_id is None or not self.store.enabled:
             return
         with self.store.database.write_transaction(notify=False) as connection:
@@ -898,17 +1134,24 @@ class TaskRunHandle:
 
     def progress(self, current: int | None = None, total: int | None = None,
                  label: str | None = None, *,
-                 throttle: float = PROGRESS_INTERVAL) -> None:
+                 throttle: float = PROGRESS_INTERVAL, code: str | None = None,
+                 params: dict | None = None) -> None:
+        from .task_control import checkpoint
+        checkpoint()
         self.store.progress(self.run_id, current=current, total=total,
-                            label=label, throttle=throttle)
+                            label=label, throttle=throttle, code=code, params=params)
 
     def heartbeat(self) -> None:
+        from .task_control import checkpoint
+        checkpoint()
         self.store.heartbeat(self.run_id)
 
     def finish(self, status: str, *, summary: dict | None = None,
-               error: str = "") -> bool:
+               error: str = "", error_code: str | None = None,
+               error_params: dict | None = None) -> bool:
         """结算一次。重复调用不再写入——终态一次性这条约束在句柄这一层也要成立。"""
         if self.settled:
             return False
         self.settled = True
-        return self.store.finish(self.run_id, status, summary=summary, error=error)
+        return self.store.finish(self.run_id, status, summary=summary, error=error,
+                                 error_code=error_code, error_params=error_params)

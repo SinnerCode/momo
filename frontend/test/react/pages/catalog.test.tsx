@@ -202,12 +202,12 @@ it('后退落到压在首页上的详情才挂上（中间去过别的页）：�
   await settle();
   await act(async () => { r.peachHistory.push('/stats') });
   await settle();
-  expect(log.slice(1)).toEqual(['release']);
+  expect(log.slice(1), '页面交给目标表面切换，目录宿主保留').toEqual([]);
   await pop('/assets/7', { usr: overlay, key: 'x', idx: 1 });
-  expect(log.slice(2), '压着的时候不开').toEqual([]);
+  expect(log.slice(1), '压着的时候不开').toEqual([]);
   await act(async () => { r.shellNavigate('/') });
   await settle();
-  expect(log.slice(2)).toEqual(['open /']);
+  expect(log.slice(1)).toEqual(['open /']);
 });
 
 it('首页上的 `?state=ads` 原地改写成垃圾文件的地址，由垃圾文件那一页整页打开并补标题', async () => {
@@ -247,7 +247,7 @@ it('后退前进按地址重读未归属；产地沿用', async () => {
   expect(filters(r).owner).toBe('none');
 });
 
-it('离开目录去管理区收起网格；去资料页、详情与沉浸不收', async () => {
+it('离开目录保留网格宿主，由目标页面切换可见表面', async () => {
   const r = await load('/');
   const { actions } = shellActions();
   await boot(r, actions);
@@ -262,7 +262,7 @@ it('离开目录去管理区收起网格；去资料页、详情与沉浸不收'
   await settle();
   await act(async () => { r.shellNavigate('/stats') });
   await settle();
-  expect(actions.catalog?.release).toHaveBeenCalledTimes(1);
+  expect(actions.catalog?.release).not.toHaveBeenCalled();
 });
 
 it('三个筛选态与垃圾文件的侧栏键与标签就是 `STATE_ROUTES` 与 `STATE_LABELS` 那一份', async () => {
@@ -270,6 +270,6 @@ it('三个筛选态与垃圾文件的侧栏键与标签就是 `STATE_ROUTES` 与
   for (const [key, path] of Object.entries(r.core.STATE_ROUTES)) {
     expect(r.routeMetaOf(path)).toEqual({ nav: key, title: r.core.STATE_LABELS[key] });
   }
-  expect(r.routeMetaOf('/trash')).toEqual({ section: 'trash' });
+  expect(r.routeMetaOf('/trash')).toEqual({ section: 'trash', title: '回收站' });
   expect(r.routeMetaOf('/')).toEqual({});
 });

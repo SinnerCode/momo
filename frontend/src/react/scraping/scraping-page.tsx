@@ -19,14 +19,18 @@ import { Input } from '@/components/base/input/input';
 import { Select, SelectItem } from '@/components/base/select/select';
 
 import { apiSend, errorMessage } from '../../api';
+import { momentText } from '../activity/tasks';
 import { useBackgroundJob } from '../background-job';
 import type { ScrapingProps } from '../bundle';
-import { LoadingDots } from '../components/loading-dots';
+import { IssueRow } from '../components/issue-row';
+import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
 import { Note } from '../components/note';
-import { StatusLabel } from '../components/status-label';
+import { StatusLabel, type StatusTone } from '../components/status-label';
 import { ConnectionStatus } from '../components/connection-status';
 import { Page } from '../components/page';
 import { SiteMark } from '../components/site-mark';
+import { SectionToc } from '../components/section-toc';
 import { SEGMENT, SEGMENTED_TRACK, SegmentedRadioGroup as RadioGroup } from '../components/segmented';
 import { queryClient } from '../query';
 import {
@@ -35,13 +39,16 @@ import {
 import { busyProps } from '../settings/use-action';
 import { CustomSources } from './custom-sources';
 import {
-  AMANE_BRIDGE_CHECK_URL, AMANE_BRIDGE_KEY, AMANE_BRIDGE_REBUILD_URL,
-  checkText, COOKIE_TEXT_LIMIT, COVER_JOB_KEY, fetchAmaneBridge, fetchCoverJob,
-  fetchSources, SCRAPING_CHECK_URL, SCRAPING_COVER_URL, SCRAPING_KEY, SCRAPING_SETTINGS_URL,
-  type AmaneBridge, type Check, type CoverJob, type ScrapingData, type Source,
+  AMANE_BRIDGE_CHECK_URL, AMANE_BRIDGE_KEY, AMANE_BRIDGE_REBUILD_URL, CHECK_ALL_KEY,
+  checkText, COOKIE_TEXT_LIMIT, COVER_JOB_KEY, fetchAmaneBridge, fetchCheckAllJob, fetchCoverJob,
+  fetchSources, SCRAPING_CHECK_ALL_URL, SCRAPING_CHECK_URL, SCRAPING_COVER_URL, SCRAPING_KEY,
+  SCRAPING_SETTINGS_URL, type AmaneBridge, type Check, type CheckAllJob, type CheckOutcome,
+  type CoverJob, type ReportedCheck, type ScrapingData, type Source, type SourceReport,
 } from './scraping';
+import { codedText, jobText, partsLabel, serverLabel } from '../../core/server-text';
+import { interfaceLanguage, joinList, t } from '../../i18n';
 
-const NETWORKS = [['peach', 'Peach 代理'], ['direct', '直接连接']] as const;
+const NETWORKS = [['peach', t('manage:customSources.peachProxy')], ['direct', t('manage:sourceSettings.direct')]] as const;
 
 /** 连接方式的选项。数据库里存着这两种以外的值（旧版写下的、手改的）时把它原样列成一项，
  *  下拉框照实显示现在是什么，不落到空占位上。 */
@@ -57,7 +64,7 @@ export function linkHost(url: string): string {
     return url;
   }
 }
-const COOKIE_METHODS = [['paste', '粘贴 Cookie'], ['file', '导入文件']] as const;
+const COOKIE_METHODS = [['paste', t('manage:sourceSettings.pasteCookie')], ['file', t('manage:sourceSettings.uploadFile')]] as const;
 
 function GitHubMark() {
   return <SiteMark source="github" />;
@@ -95,7 +102,7 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
           (row) => (row.source === result.saved.source ? result.saved : row)),
       });
       forgetSecrets();
-      toast(revoke ? 'Cookie 已撤销' : '来源设置已保存');
+      toast(revoke ? t('manage:sourceSettings.cookieRevoked') : t('manage:sourceSettings.saved'));
     },
   });
   const check = useMutation({
@@ -134,7 +141,7 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
       // 超限的多半根本不是 Cookie 文件。在浏览器里就拦住，不拿它去占一次请求。
       input.value = '';
       setFileName('');
-      setFileProblem('Cookie 文本超过 256 KiB');
+      setFileProblem(t('manage:sourceSettings.cookieTooLarge'));
       return;
     }
     try {
@@ -142,7 +149,7 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
       setCookieText(text);
       setFileName(selected.name);
     } catch {
-      setFileProblem('Cookie 文件未读取，请重新选择');
+      setFileProblem(t('manage:sourceSettings.cookieFileUnread'));
     }
   }
 
@@ -154,44 +161,44 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
   const detailed = network === 'peach' || source.accepts_cookie || source.browser || !!problem || results.length > 0;
 
   return (
-    <Section title={source.label} onSubmit={submit} aside={
+    <Section id={`source-${source.source}`} title={codedText(source, 'label')} onSubmit={submit} aside={
       <span className="flex min-w-0 items-center gap-1">
         <SiteMark source={source.source} />
         {source.login ? <ExternalLink href={source.login}>{linkHost(source.login)}</ExternalLink> : null}
       </span>
     }>
       <Rows>
-        <SettingsRow label="连接方式">
+        <SettingsRow label={t('manage:sourceSettings.connectionMode')}>
           {/* 定宽：数据库里的长取值按内容撑宽会把左边的「连接方式」挤成竖排，定宽后取值在框里截断。 */}
-          <Select aria-label="连接方式" className="w-44 min-w-0" selectedKey={network}
+          <Select aria-label={t('manage:sourceSettings.connectionMode')} className="w-44 min-w-0" selectedKey={network}
             onSelectionChange={(key) => { if (key !== null) setNetwork(String(key)) }}>
             {networkOptions(network).map(([key, name]) => <SelectItem key={key} id={key}>{name}</SelectItem>)}
           </Select>
         </SettingsRow>
       </Rows>
       {source.cooldown_until && source.cooldown_until > Date.now() / 1000 ? (
-        <Note tone="warning"><span className="inline-flex flex-wrap items-center gap-2"><StatusLabel tone="warning">冷却中</StatusLabel><span>可在 {new Date(source.cooldown_until * 1000).toLocaleString('zh-CN')} 后重试。</span></span></Note>
+        <Note tone="warning"><span className="inline-flex flex-wrap items-center gap-2"><StatusLabel tone="warning">{t('manage:sourceSettings.coolingDown')}</StatusLabel><span>{t('manage:sourceSettings.retryAfter', { time: new Date(source.cooldown_until * 1000).toLocaleString(interfaceLanguage) })}</span></span></Note>
       ) : null}
       {detailed ? <Stack divided>
         {network === 'peach'
           ? <span className="self-start">
               <LinkButton href="/settings/library#peachProxy" size="small" trailingIcon={RiArrowRightLine}>
-                配置 Peach 代理
+                {t('manage:sourceSettings.setUpProxy')}
               </LinkButton>
             </span>
           : null}
         {/* 由本机浏览器过验证的来源不收 Cookie：浏览器自己带着会话。留着「撤销 Cookie」让人清掉旧的。 */}
         {source.browser
           ? <p className="text-body-2-regular text-text-secondary">
-              人机验证由本机浏览器自动完成；需要点击时窗口会弹出。这台机器上不需要 Cookie。
+              {t('manage:sourceSettings.browserVerification')}
             </p>
           : null}
         {source.accepts_cookie && !source.browser ? <>
-          <div className="flex flex-col gap-2"><span className="self-start"><StatusLabel tone={source.cookie_saved ? 'success' : 'neutral'}>{source.cookie_saved ? 'Cookie 已保存' : 'Cookie 未配置'}</StatusLabel></span>
-            <p className="text-body-2-regular text-text-secondary">{source.cookie_saved ? '登录有效性待验证。' : '需要登录时，任选一种方式提供 Cookie。'}</p></div>
+          <div className="flex flex-col gap-2"><span className="self-start"><StatusLabel tone={source.cookie_saved ? 'success' : 'neutral'}>{source.cookie_saved ? t('manage:sourceSettings.cookieSaved') : t('manage:sourceSettings.cookieNotSet')}</StatusLabel></span>
+            <p className="text-body-2-regular text-text-secondary">{source.cookie_saved ? t('manage:sourceSettings.signInUnverified') : t('manage:sourceSettings.provideCookieHint')}</p></div>
           {/* 两种方式互斥，交上去的只能是其中一种：切换时把另一种的输入清掉，
               不让看不见的那一份跟着提交。 */}
-          <RadioGroup aria-label="提供 Cookie 的方式（二选一）" value={method}
+          <RadioGroup aria-label={t('manage:sourceSettings.cookieMethod')} value={method}
             onChange={(next) => { setMethod(next); forgetSecrets() }}
             className={SEGMENTED_TRACK}>
             {COOKIE_METHODS.map(([value, label]) => (
@@ -203,11 +210,11 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
           {method === 'paste'
             ? <Input type="password" label="Cookie" autoComplete="off" value={cookie} onChange={setCookie} />
             : <div className="flex flex-col gap-2">
-                <FieldLabel>Netscape Cookie 文件（.txt）</FieldLabel>
+                <FieldLabel>{t('manage:sourceSettings.cookieFileLabel')}</FieldLabel>
                 <div className="flex flex-wrap items-center gap-3">
-                  <Button variant="secondary" onClick={() => file.current?.click()}>选择文件</Button>
+                  <Button variant="secondary" onClick={() => file.current?.click()}>{t('manage:sourceSettings.chooseFile')}</Button>
                   <span className="min-w-0 text-body-2-regular break-all text-text-secondary">
-                    {fileName || '未选择文件'}
+                    {fileName || t('manage:sourceSettings.noFileChosen')}
                   </span>
                 </div>
                 {/* 原生文件选择器长相不可控，按钮归 BoardUI，输入框只留着接文件。 */}
@@ -216,63 +223,178 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
               </div>}
         </> : null}
         {problem ? <ErrorText>{problem}</ErrorText> : null}
-        {results.map((result) => (
-          <Note key={result.label} tone={result.ok ? 'success' : 'error'}>
-            <span className="flex flex-col items-start gap-1"><ConnectionStatus tone={result.ok ? 'success' : 'error'}>{result.ok ? '可访问' : '连接失败'}</ConnectionStatus><span>{checkText(result, source.label)}</span></span>
-          </Note>
-        ))}
+        {results.map((result) => {
+          const tone = result.kind === 'unchecked' ? 'neutral' : result.ok ? 'success' : 'error';
+          const status = result.kind === 'unchecked' ? t('manage:sourceSettings.unchecked')
+            : result.ok ? t('manage:sourceSettings.reachable') : t('manage:sourceSettings.connectionFailed');
+          return <Note key={result.label} tone={tone}>
+            <span className="flex flex-col items-start gap-1"><ConnectionStatus tone={tone}>{status}</ConnectionStatus><span>{checkText(result, codedText(source, 'label'))}</span></span>
+          </Note>;
+        })}
       </Stack> : null}
       {/* 主体动作在最右。次级动作先出现，`保存` 是这张卡唯一的写入，放在一行的末尾；
           表单里只有它一个 `type=submit`，所以挪位置不影响回车提交。 */}
       <Footer>
         {source.accepts_cookie && source.cookie_saved
-          ? <Button variant="secondary" onClick={revoke} {...busyProps(busy)}>撤销 Cookie</Button>
+          ? <Button variant="secondary" onClick={revoke} {...busyProps(busy)}>{t('manage:sourceSettings.revokeCookie')}</Button>
           : null}
-        <Button variant="secondary" onClick={connect} {...busyProps(busy)}>检查连接</Button>
-        <Button type="submit" {...busyProps(busy)}>保存</Button>
+        <Button variant="secondary" onClick={connect} {...busyProps(busy)}>{t('manage:sourceSettings.testConnection')}</Button>
+        <Button type="submit" {...busyProps(busy)}>{t('manage:shared.save')}</Button>
       </Footer>
     </Section>
   );
 }
 
+/** 报告口径的着色：要人去处理的标黄，连不上的标红，片商官网那种不在这里查的标灰。 */
+const OUTCOME_TONES: Record<CheckOutcome, StatusTone> = {
+  ok: 'success', auth: 'warning', http: 'error', cooldown: 'warning', network: 'error', skipped: 'neutral',
+};
+/** 摘要里各口径的先后：先可连接，再按要人动手的程度排。 */
+const OUTCOME_ORDER: CheckOutcome[] = ['ok', 'auth', 'cooldown', 'http', 'network', 'skipped'];
+
+/** 一项检查的名字：只查一跳的来源就是它本身。 */
+function targetName(report: SourceReport, check: ReportedCheck): string {
+  const source = codedText(report, 'label');
+  return check.target === 'cdn' ? t('manage:connectionCheck.hdImages', { source }) : source;
+}
+
+/** 全部来源一次检查完，与 `peach check-sources` 同一检查、同一报告口径。这一趟在后台跑，
+ *  离开页面再回来，读到的是服务端留着的那一份结果。 */
+function CheckAllCard({ toast }: ScrapingProps) {
+  const { job, running, start, query: taskQuery } = useBackgroundJob<CheckAllJob>({
+    queryKey: CHECK_ALL_KEY,
+    queryFn: ({ signal }) => fetchCheckAllJob(signal),
+    start: () => apiSend<CheckAllJob>(SCRAPING_CHECK_ALL_URL, {}),
+    onFinish: (state) => {
+      // 限流与拒绝访问会记下冷却，各来源卡上的「冷却中」跟着重读。
+      void queryClient.invalidateQueries({ queryKey: SCRAPING_KEY, exact: true });
+      if (state.status === 'complete') toast(state.failed ? t('manage:connectionCheck.doneWithFailures', { count: state.failed }) : t('manage:connectionCheck.doneAllReachable'));
+    },
+  });
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!taskQuery.data || running || start.isPending) return;
+    start.mutate();
+  };
+
+  const checks = (job?.results ?? []).flatMap(
+    (report) => report.results.map((check) => ({ source: report.source, name: targetName(report, check), check })));
+  // 站标跟名字走，同来源卡标题旁的那一枚。
+  const titled = (source: string, name: string) =>
+    <span className="inline-flex min-w-0 items-center gap-1.5"><SiteMark source={source} />{name}</span>;
+  const passed = checks.filter(({ check }) => check.outcome === 'ok');
+  // 按口径成组，组内保持来源顺序：要人去登录的排前面，不在这里查的片商官网垫底。
+  const problems = checks.filter(({ check }) => check.outcome !== 'ok').sort(
+    (a, b) => OUTCOME_ORDER.indexOf(a.check.outcome) - OUTCOME_ORDER.indexOf(b.check.outcome));
+  const problem = start.error ? errorMessage(start.error)
+    : taskQuery.error ? errorMessage(taskQuery.error)
+    : job?.status === 'failed' ? (jobText(job, 'error') || t('manage:connectionCheck.notFinished')) : '';
+  const finished = job?.status === 'complete' && job.completed_at
+    ? [momentText(new Date(job.completed_at * 1000).toISOString()),
+       job.elapsed_s !== undefined ? t('manage:connectionCheck.elapsed', { seconds: job.elapsed_s.toFixed(1) }) : ''].filter(Boolean).join(' · ')
+    : '';
+
+  return (
+    <Section id="check-all" title={t('manage:connectionCheck.title')} onSubmit={submit}>
+      <Stack>
+        {taskQuery.isPending ? <div role="status" aria-label={t('manage:connectionCheck.loadingStatus')} data-skeleton="" className="skeleton-sheen h-6 rounded-md" /> : null}
+        {/* 说明写在一行里：拆行的 JSX 文本渲染时多出空格，改字工具就对不上源码。 */}
+        <Help>{t('manage:connectionCheck.help')}</Help>
+        {running
+          ? <TaskProgress embedded kind="radar" value={job?.checked ?? 0} total={job?.total ?? 0}
+              label={t('manage:connectionCheck.checkedCount', { checked: job?.checked ?? 0, count: job?.total ?? 0 })} />
+          : null}
+        {problem ? <Note tone="error">{problem}</Note> : null}
+        {checks.length
+          ? <div className="flex flex-wrap gap-2">
+              {OUTCOME_ORDER.map((key) => {
+                const count = checks.filter(({ check }) => check.outcome === key).length;
+                return count ? <StatusLabel key={key} tone={OUTCOME_TONES[key]}>
+                  {codedText(checks.find(({ check }) => check.outcome === key)?.check, 'outcome_label')} {count}
+                </StatusLabel> : null;
+              })}
+            </div>
+          : null}
+        {problems.length
+          ? <ul className="flex min-w-0 flex-col">
+              {problems.map(({ source, name, check }) => (
+                <IssueRow key={name} title={titled(source, name)}>
+                  <span className="flex flex-wrap items-center gap-2">
+                    <StatusLabel tone={OUTCOME_TONES[check.outcome]}>{codedText(check, 'outcome_label')}</StatusLabel>
+                    {check.message
+                      ? <span className="text-body-2-regular text-text-secondary">{codedText(check, 'message')}</span>
+                      : null}
+                  </span>
+                </IssueRow>
+              ))}
+            </ul>
+          : null}
+        {passed.length
+          ? <Disclosure summary={t('manage:connectionCheck.reachableCount', { count: passed.length })}>
+              <FactList>
+                {passed.map(({ source, name, check }) => (
+                  <Fact key={name} term={titled(source, name)}>
+                    {[check.width ? `${check.width} × ${check.height}` : '',
+                      check.elapsed_s !== undefined ? t('manage:connectionCheck.seconds', { seconds: check.elapsed_s.toFixed(2) }) : ''].filter(Boolean).join(' · ')}
+                  </Fact>
+                ))}
+              </FactList>
+            </Disclosure>
+          : null}
+      </Stack>
+      <Footer status={finished ? t('manage:connectionCheck.lastChecked', { time: finished }) : undefined}>
+        <Button type="submit" disabled={!taskQuery.data} {...busyProps(running || start.isPending)}>{t('manage:connectionCheck.checkAll')}</Button>
+      </Footer>
+    </Section>
+  );
+}
+
+/** 封面任务成功那一句。 */
+const coverResult = (job: CoverJob) => serverLabel(job.result_code ?? '', job.result ?? '', job.result_params);
+
+/** 封面任务失败那一句：由几段拼成的逐段取译文，缺一段译文就整句用服务端原文。 */
+const coverFailure = (job: CoverJob): string => partsLabel(job.error_parts, jobText(job, 'error'));
+
 /** 按番号补一张高清封面。这一趟在后台跑，页面上留状态。 */
 function CoverCard({ toast }: ScrapingProps) {
   const [code, setCode] = useState('');
-  const { running, outcome, start } = useBackgroundJob<CoverJob>({
+  const { running, outcome, start, query: taskQuery } = useBackgroundJob<CoverJob>({
     queryKey: COVER_JOB_KEY,
     queryFn: ({ signal }) => fetchCoverJob(signal),
     start: () => apiSend<CoverJob>(SCRAPING_COVER_URL, { code }),
     onFinish: (state) => {
-      if (state.status === 'complete') toast(state.result || '封面采集完成');
+      if (state.status === 'complete') toast(coverResult(state) || t('manage:hdCover.fetched'));
     },
   });
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (running || start.isPending || !code.trim()) return;
+    if (!taskQuery.data || running || start.isPending || !code.trim()) return;
     start.mutate();
   };
 
   const problem = start.error ? errorMessage(start.error)
-    : outcome?.status === 'failed' ? (outcome.error || '采集未取得') : '';
+    : taskQuery.error ? errorMessage(taskQuery.error)
+    : outcome?.status === 'failed' ? (coverFailure(outcome) || t('manage:hdCover.notFound')) : '';
   return (
-    <Section title="高清封面" onSubmit={submit}>
+    <Section id="hd-cover" title={t('manage:hdCover.title')} onSubmit={submit}>
       <Stack>
+        {taskQuery.isPending ? <div role="status" aria-label={t('manage:hdCover.loadingStatus')} data-skeleton="" className="skeleton-sheen h-6 rounded-md" /> : null}
         <div className="flex flex-wrap items-end gap-2">
           <div className="min-w-0 flex-1">
-            <Input aria-label="馆藏番号" isRequired isDisabled={running} value={code} onChange={setCode}
-              placeholder="输入馆藏番号，如 ABW-232" />
+            <Input aria-label={t('manage:hdCover.codeLabel')} isRequired isDisabled={running} value={code} onChange={setCode}
+              placeholder={t('manage:hdCover.codePlaceholder')} />
           </div>
-          <Button type="submit" disabled={!code.trim()} {...busyProps(running || start.isPending)}>
-            抓取封面
+            <Button type="submit" disabled={!taskQuery.data || !code.trim()} {...busyProps(running || start.isPending)}>
+            {t('manage:hdCover.fetchCover')}
           </Button>
         </div>
         {/* 这一趟要挨个问几家站点、还可能走代理，没有可数的总量，也不能编一个百分比出来。
             关掉页面它照样在跑，回来能接上，所以状态得留在页面上，而不是只让按钮转一下。 */}
-        {running ? <LoadingDots label="正在抓取封面" /> : null}
+        {running ? <TaskProgress embedded kind={activityKind('scraping-cover')} label={t('manage:hdCover.fetching')} /> : null}
         {problem ? <Note tone="error">{problem}</Note> : null}
         {outcome?.status === 'complete'
-          ? <Note tone="success">{outcome.result || '封面采集完成'}</Note>
+          ? <Note tone="success">{coverResult(outcome) || t('manage:hdCover.fetched')}</Note>
           : null}
       </Stack>
     </Section>
@@ -290,11 +412,11 @@ function AmaneBridgeCard({ toast }: ScrapingProps) {
     jobOf: (card) => card.job,
     withJob: (card, started) => card && { ...card, job: started },
     onFinish: (state) => {
-      if (state.status === 'complete') toast(state.result || 'amane 桥已重建');
+      if (state.status === 'complete') toast(codedText(state, 'result') || t('manage:amaneRuntime.rebuilt'));
     },
   });
   const check = useMutation({
-    mutationFn: () => apiSend<{ latest: string }>(AMANE_BRIDGE_CHECK_URL, {}),
+    mutationFn: () => apiSend<{ latest: string; latest_code?: string }>(AMANE_BRIDGE_CHECK_URL, {}),
   });
 
   const data = bridge.data;
@@ -307,38 +429,35 @@ function AmaneBridgeCard({ toast }: ScrapingProps) {
   const busy = running || rebuild.isPending || check.isPending;
   const problem = rebuild.error ? errorMessage(rebuild.error)
     : check.error ? errorMessage(check.error)
-    : outcome?.status === 'failed' ? (outcome.error || '重建未完成') : '';
+    : outcome?.status === 'failed' ? (jobText(outcome, 'error') || t('manage:amaneRuntime.rebuildNotFinished')) : '';
   return (
     <Section id="amane" title="amane" aside={<ExternalLink href={data.repository} leadingIcon={GitHubMark}>{data.repository}</ExternalLink>}>
       <FactList>
-        <Fact term="已安装版本">{data.installed_version || '未安装'}</Fact>
-        <Fact term="上游最新版本">{check.data?.latest ?? '尚未检查'}</Fact>
-        <Fact term="运行环境">{data.installed ? '已安装' : '未安装'}</Fact>
-        <Fact term="内置站点">{data.sites.length.toLocaleString()} 个</Fact>
+        <Fact term={t('manage:amaneRuntime.installedVersion')}>{data.installed_version || t('manage:amaneRuntime.notInstalled')}</Fact>
+        <Fact term={t('manage:amaneRuntime.latestVersion')}>{check.data ? codedText(check.data, 'latest') : t('manage:amaneRuntime.notChecked')}</Fact>
+        <Fact term={t('manage:amaneRuntime.runtime')}>{data.installed ? t('manage:amaneRuntime.installed') : t('manage:amaneRuntime.notInstalled')}</Fact>
+        <Fact term={t('manage:amaneRuntime.builtInSites')}>{t('manage:amaneRuntime.siteCount', { count: data.sites.length })}</Fact>
       </FactList>
       <Stack divided>
         {data.sites.length
-          ? <Disclosure summary="查看内置站点">
-              <p className="text-body-2-regular text-text-secondary">{data.sites.map((site) => site.label).join('、')}</p>
+          ? <Disclosure summary={t('manage:amaneRuntime.showSites')}>
+              <p className="text-body-2-regular text-text-secondary">{joinList(data.sites.map((site) => codedText(site, 'label')))}</p>
             </Disclosure>
           : null}
         {data.problem
           ? <Note tone="error">{data.problem}</Note>
-          : <Help>
-              amane（{data.license}）提供这些内置站点的解析能力。首次需要时，Peach 会自动准备锁定的 {data.version} 版本；安装包内已有可用环境时直接使用。
-              手动安装也使用此版本，不随上游自动升级。
-            </Help>}
-        {running ? <LoadingDots label="正在重建运行环境" /> : null}
+          : <Help>{t('manage:amaneRuntime.help', { license: data.license, version: data.version })}</Help>}
+        {running ? <TaskProgress embedded kind={activityKind('amane-bridge')} label={t('manage:amaneRuntime.rebuilding')} /> : null}
         {problem ? <Note tone="error">{problem}</Note> : null}
-        {outcome?.status === 'complete' ? <Note tone="success">{outcome.result || 'amane 桥已重建'}</Note> : null}
+        {outcome?.status === 'complete' ? <Note tone="success">{codedText(outcome, 'result') || t('manage:amaneRuntime.rebuilt')}</Note> : null}
       </Stack>
       <Footer>
         <Button variant="secondary" onClick={() => { if (!busy) check.mutate() }} {...busyProps(check.isPending)}>
-          检查上游版本
+          {t('manage:amaneRuntime.checkUpstream')}
         </Button>
         <Button disabled={Boolean(data.problem)} onClick={() => { if (!busy) rebuild.mutate() }}
           {...busyProps(running || rebuild.isPending)}>
-          {data.installed ? '重新安装' : '安装'}
+          {data.installed ? t('manage:amaneRuntime.reinstall') : t('manage:amaneRuntime.install')}
         </Button>
       </Footer>
     </Section>
@@ -351,20 +470,30 @@ export function ScrapingPage({ toast }: ScrapingProps) {
   if (!data) {
     return (
       <Page>
-        <Note tone="error" title="采集来源读取失败">
-          {sources.error ? errorMessage(sources.error) : '读取采集来源失败'}
+        <Note tone="error" title={t('manage:scrapingSources.loadFailedTitle')}>
+          {sources.error ? errorMessage(sources.error) : t('manage:scrapingSources.loadFailed')}
         </Note>
       </Page>
     );
   }
   return (
     <Page>
-      <p className="text-body-2-regular text-text-secondary">高清图片可能要经代理才能下载，先检查连接。</p>
-      <CoverCard toast={toast} />
-      <CustomSources receipt={toast} />
-      {(data.sources || []).map(
-        (source) => <SourceCard key={source.source} source={source} toast={toast} />)}
-      <AmaneBridgeCard toast={toast} />
+      <p className="text-body-2-regular text-text-secondary">{t('manage:scrapingSources.proxyHint')}</p>
+      <SectionToc label={t('manage:scrapingSources.contents')} entries={[
+        { id: 'check-all', label: t('manage:connectionCheck.title') },
+        { id: 'hd-cover', label: t('manage:hdCover.title') },
+        { id: 'custom-sources', label: t('manage:customSources.title') },
+        ...(data.sources || []).map(source => ({ id: `source-${source.source}`,
+          label: codedText(source, 'label'), icon: source.source === 'makers' ? undefined : <SiteMark source={source.source} /> })),
+        { id: 'source-amane', label: 'amane' },
+      ]}>
+        <CheckAllCard toast={toast} />
+        <CoverCard toast={toast} />
+        <CustomSources receipt={toast} />
+        {(data.sources || []).map(
+          (source) => <SourceCard key={source.source} source={source} toast={toast} />)}
+        <div id="source-amane"><AmaneBridgeCard toast={toast} /></div>
+      </SectionToc>
     </Page>
   );
 }

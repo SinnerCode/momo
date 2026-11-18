@@ -10,11 +10,16 @@ export interface JavDetail {
   tags: string[]; has_cover: boolean; cover_version?: string; cover_url?: string;
   tag_refs?: { name: string; category: string; source_name: string }[];
   preview_video_url?: string;
+  /** 预告没取到时的原因；取到了（哪怕走的是备用来源或旧结果）就没有这一句。 */
+  preview_message?: string;
+  /** 本机没有封面时，上次取官方封面没取到的原因；`_code`／`_params` 给界面取当前语言。 */
+  cover_message?: string; cover_message_code?: string; cover_message_params?: Record<string, unknown>;
   source_image: boolean; preview_count: number; comments_count: number;
   source_url: string; wanted: boolean; want_id: number | null;
 }
 export interface JavEntityRef extends FaceRef { name: string; gender?: 'female' | 'male' | 'unknown'; has_logo?: boolean; source_actor_id?: string; source_avatar?: boolean }
-export interface JavReview { id: string; username: string; content: string; score?: number; created_at: string }
+/** 一条评论。没有用户名时 `username` 是服务端给的「匿名用户」原文，`username_code` 是它的 code。 */
+export interface JavReview { id: string; username: string; username_code?: string; content: string; score?: number; created_at: string }
 export interface JavReviews { ok: boolean; items: JavReview[]; page: number; more: boolean; message?: string; checked_at?: string; cache_stale?: boolean }
 export interface JavDetailProps {
   code: string; readOnly: boolean;

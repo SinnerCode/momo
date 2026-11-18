@@ -1,49 +1,53 @@
 /* feed 域控制器：本域状态与动作，启动由 Application 的生命周期统一安装。 */
 import { coverImage, remoteCoverUrl } from './../card-art/markup';
 import { feedIdentity } from './../card-art/feed-identity';
+import { coverStateHtml } from './../card-art/cover-state';
 import { $, api, esc, foldName, icon, isCatalogPath } from '../core';
 import { javTitleHtml } from '../core/jav-title';
 import { COVER_FRONT_RATIO } from './../appearance/layout';
 import { catalogState } from './catalog.js';
+import { state } from '../shell/index';
+import { feedNewSkeletonHtml } from '../feed-new-skeleton';
 import { managedTaken, openManagedRoute, releaseManagedRoute, updateManagedRoute } from './../history/managed';
-import { loadingDotsHtml, noteHtml, stopAutoScroll, wireAutoScroll } from '../ui-kit';
+import { appSettingsStore } from './../appearance/settings';
+import { noteHtml, stopAutoScroll, wireAutoScroll } from '../ui-kit';
 import { preferencesState, wireDrag } from './preferences.js';
 import { pushEntityPage } from './entity.js';
 import { applicationEffects } from './effects';
+import { t } from '../i18n';
 export const feedState = { FEED_SKELETON_CARDS: undefined, feedNewSkeletonHtml: undefined, entityShapes: undefined, entityShapesComplete: false, hasEntityShape: undefined, hasEntityPart: undefined, feedNewSkeletonSection: undefined, COSTAR_SKELETON_PEOPLE: undefined, costarSkeletonFoot: undefined, factsSkeleton: undefined, feedRevision: undefined, feedNewHelpers: undefined, feedNewActions: undefined, HERO_WIDE_PX: undefined };
 
 export function feedNewCoverHtml(item){
   if(item.has_cover)return coverImage(item,'big');
-  if(!item.cover_url||!item.code)return item.cover_fetching
-    ?`<span class="nopic" data-feed-cover-state="fetching">${loadingDotsHtml('抓取中')}</span>`
-    :'<span class="nopic" data-feed-cover-state="missing">无封面</span>';
+  // 还没有封面：说清在等什么、为什么没有，排队的可以当场先取（后台那条队可能被存量补修占着几个小时）。
+  if(!item.cover_url||!item.code)return coverStateHtml(item);
   // 官方图经 Peach 代理取，断网或上游失败时换成「封面未取得」占位。
   return coverImage(item,'big').replace(/ src="[^"]*"/,
     ` src="${esc(remoteCoverUrl(item))}" data-panel-prior="1"`)
-    .replace('data-drop="self"', 'data-drop="initial" data-initial="封面未取得" data-drop-class="nopic"');
+    .replace('data-drop="self"', `data-drop="initial" data-initial="${esc(t('shell:artworkGap.coverNotFound'))}" data-drop-class="nopic"`);
 }
 
 export function feedNewCardHtml(item){
   // 署名与日期各占一行，长出演名单可从悬停说明查看。
   const label=[item.performers&&`<span class="feednewperformers" title="${esc(item.performers)}">${esc(item.performers)}</span>`,
-    item.release_date&&`<span>${esc(item.release_date)}</span>`].filter(Boolean)
+    item.release_date&&`<time class="feednewdate" datetime="${esc(item.release_date)}">${esc(item.release_date)}</time>`].filter(Boolean)
     .join('');
   const cover=feedNewCoverHtml(item);
   // 番号与标题排在同一个两行的标题块里，和资产卡一样：番号加粗打头，标题接在后面截断。
-  const name=item.code||String(item.title||'').trim()||'未命名新作';
+  const name=item.code||String(item.title||'').trim()||t('shell:feedNew.untitled');
   const heading=item.code
     ?javTitleHtml({is_jav:true,code:item.code,name:item.code,display_title:item.title||''})
     :esc(name);
   const open=item.code
-    ?`<a class="feednewopen" href="/works/${encodeURIComponent(item.code)}" aria-label="打开 ${esc(name)} 的作品详情"></a>`:'';
+    ?`<a class="feednewopen" href="/works/${encodeURIComponent(item.code)}" aria-label="${esc(t('shell:feedNew.openDetails', { name }))}"></a>`:'';
   return `<article class="card feednewcard${item.read?' isread':''}" data-feed-id="${item.id}">
     ${open}<div class="pic" style="--card-ratio:${COVER_FRONT_RATIO}">${cover}
       <div class="hovertools feednewtools">
-        <button type="button" data-feed-action="${item.wanted?'unwant':'want'}" aria-pressed="${!!item.wanted}" title="${item.wanted?'取消想要':'想要'}" aria-label="想要 ${esc(name)}">${icon('star')}</button>
-        <button type="button" data-feed-action="ignore" title="不想看" aria-label="不想看 ${esc(name)}">${icon('x')}</button>
-        <button type="button" data-feed-action="read" title="标为已看过" aria-label="标为已看过 ${esc(name)}">${icon('check')}</button></div></div>
+        <button type="button" data-feed-action="${item.wanted?'unwant':'want'}" aria-pressed="${!!item.wanted}" title="${esc(item.wanted?t('catalog:javWant.remove'):t('catalog:javWant.want'))}" aria-label="${esc(t('shell:feedNew.wantNamed', { name }))}">${icon('star')}</button>
+        <button type="button" data-feed-action="ignore" title="${esc(t('shell:feedNew.ignore'))}" aria-label="${esc(t('shell:feedNew.ignoreNamed', { name }))}">${icon('x')}</button>
+        <button type="button" data-feed-action="read" title="${esc(t('shell:feedNew.markRead'))}" aria-label="${esc(t('shell:feedNew.markReadNamed', { name }))}">${icon('check')}</button></div></div>
     <div class="meta">${feedIdentity(item)}<div class="mtext"><span class="t">${heading}</span>
-      <div class="s mono">${label||(item.title?'':'资料还没取到')}</div></div></div></article>`;
+      <div class="s mono">${label||(item.title?'':t('shell:feedNew.metadataPending'))}</div></div></div></article>`;
 }
 
 export function installEntityShapeBootstrap(){
@@ -84,7 +88,7 @@ export function recalledHomeFeed(){
 
 export function prepareHomeFeed(host){
   // 一打开，宿主就归路由树：骨架只在打开之前铺，之后由画出来的那一行或空着说话。
-  if(!host||managedTaken(host)||host.querySelector('[data-feed-id]'))return;
+  if(!homeFeedCurrent()||!host||managedTaken(host)||host.querySelector('[data-feed-id]'))return;
   host.hidden=catalogState.homeHasFeed!==true;
   if(catalogState.homeHasFeed!==true)return;
   host.setAttribute('aria-busy','true');
@@ -93,14 +97,17 @@ export function prepareHomeFeed(host){
 
 export function feedNetworkNote(unreachable,items){
   if(!(unreachable>0)||!items.some(item=>!item.has_cover))return '';
-  return noteHtml(`${unreachable} 部新作的封面连不上 DMM 图片主机，中国移动宽带常见。把 DMM / FANZA 的连接方式设成 Peach 代理，下一轮会自动重取。`,
-    {variant:'warning',className:'feednetwork',actionLabel:'配置连接方式',actionHref:'/sources'});
+  return noteHtml(t('shell:feedNew.dmmUnreachable', { count: unreachable }),
+    {variant:'warning',className:'feednetwork',actionLabel:t('shell:feedNew.configureConnection'),actionHref:'/sources'});
 }
 
-export function feedRowHtml(data){
+/* `allHref` 给了就在行尾多一张「查看全部新作」卡，跳到 JAV 页的新作分区；首页那一行给，资料页那一行不给。 */
+export function feedRowHtml(data,allHref=''){
   const items=data&&!data.error?(data.items||[]):[];
+  const all=allHref&&items.length
+    ?`<a class="feednewall" href="${esc(allHref)}" style="--card-ratio:${COVER_FRONT_RATIO}"><span>${t('shell:feedNew.viewAll')}</span>${icon('chevron-right')}</a>`:'';
   return feedNetworkNote(data?.cover_network,items)
-    +`<div class="feednewrow srow">${items.map(feedNewCardHtml).join('')}</div>`;
+    +`<div class="feednewrow srow">${items.map(feedNewCardHtml).join('')}${all}</div>`;
 }
 
 export function wireFeedNewRow(row){
@@ -109,23 +116,35 @@ export function wireFeedNewRow(row){
   if(preferencesState.appSettings.feedAutoScroll)wireAutoScroll(row);
 }
 
-export function isFeedNewPath(path){return isCatalogPath(path)&&path!=='/junk-files'}
+/* 首页这一行在不在场：设置里关掉「在首页显示新作」就哪条目录路径上都没有它，骨架也不铺。人物页那一行另走资料页。 */
+export function isFeedNewPath(path){return appSettingsStore().value.feedNewRows!==false&&isCatalogPath(path)&&path!=='/junk-files'}
 
+function homeFeedCurrent(){return isFeedNewPath(location.pathname)&&state.browse!=='folders'}
 
 export function renderHomeFeed(){
+  if(!homeFeedCurrent()){clearHomeFeed();return}
   const host=$('#feedNew');
-  if(managedTaken(host)){updateManagedRoute(host,{revision:++feedState.feedRevision});return}
+  if(managedTaken(host)){host.hidden=catalogState.homeHasFeed!==true;return}
   prepareHomeFeed(host);
-  /* 这一行不随筛选变，判在不在场只看路径：换筛选换掉的是目录的代次，不该把它这一趟作废。 */
+  /* 同一目录里换筛选不重开；离开目录或进入文件夹浏览时撤销这一趟打开。 */
   void openManagedRoute('feed-new',{host,revision:feedState.feedRevision,helpers:feedState.feedNewHelpers,actions:feedState.feedNewActions},
-    {container:host,isCurrent:()=>isFeedNewPath(location.pathname)});
+    {container:host,isCurrent:homeFeedCurrent});
 }
 
 export function clearHomeFeed(){
   const host=$('#feedNew');
   host.querySelectorAll('.feednewrow').forEach(stopAutoScroll);
+  // 隐藏之外也卸掉查询订阅并撤销在途打开，封面轮询或刷新不能再把宿主亮出来。
   releaseManagedRoute(host);
-  host.hidden=true;host.innerHTML='';host.removeAttribute('aria-busy');
+  host.replaceChildren();
+  host.removeAttribute('aria-busy');
+  host.hidden=true;
+}
+
+/* 设置里切了「在首页显示新作」：关掉就把画着的那一行连同它的查询一起卸掉，之后不再取数；打开时人正在目录上就当场画。 */
+export function syncHomeFeedSetting(folders){
+  if(appSettingsStore().value.feedNewRows===false){clearHomeFeed();return}
+  if(isFeedNewPath(location.pathname)&&!folders)renderHomeFeed();
 }
 
 export function refreshFeedRows(){
@@ -152,11 +171,7 @@ export function syncHeroWide([entry]){
 
 export function installFeed13() {
 feedState.FEED_SKELETON_CARDS = 8;
-feedState.feedNewSkeletonHtml = ()=>`<div class="feednewrow srow" data-skeleton="feed/new" aria-hidden="true">${
-  `<article class="card feednewcard feednewskeleton"><div class="pic imgwait" style="--card-ratio:${COVER_FRONT_RATIO}"></div>
-    <div class="meta"><div class="mtext"><span class="t"><span class="skeleton"></span></span>
-      <div class="s mono"><span class="skeleton">&#8203;</span></div></div></div></article>`
-    .repeat(feedState.FEED_SKELETON_CARDS)}</div>`;
+feedState.feedNewSkeletonHtml = ()=>feedNewSkeletonHtml(feedState.FEED_SKELETON_CARDS);
 feedState.entityShapes = null;
 feedState.entityShapesComplete = false;
 feedState.hasEntityShape = (kind,name)=>feedState.entityShapesComplete||!!feedState.entityShapes?.has(`${kind}/${foldName(name)}`);

@@ -205,11 +205,15 @@ it('关注元素：后退回到关注页时列表已被收掉就整页打开，�
   const r = await load('/follow');
   const stats = statsSurface();
   const calls = serve();
-  const scrolled = vi.spyOn(window, 'scrollTo').mockImplementation(() => {});
+  let scrollTop = 0;
+  vi.spyOn(window, 'scrollY', 'get').mockImplementation(() => scrollTop);
+  const scrolled = vi.spyOn(window, 'scrollTo').mockImplementation((options: number | ScrollToOptions | undefined) => {
+    if (typeof options === 'object') scrollTop = options.top ?? scrollTop;
+  });
   const { actions } = shellActions(r);
   await boot(r, actions);
   await until(() => page(stats) !== null, '整页画上');
-  r.shell.writeShell({ followScrollY: 640 });
+  scrollTop = 640;
   // 去别的页面：那一页认领表面时收掉关注页。
   await act(async () => { r.shellNavigate('/immerse') });
   await settle();
@@ -221,7 +225,8 @@ it('关注元素：后退回到关注页时列表已被收掉就整页打开，�
   expect(opens(actions), '整页打开一次').toBe(2);
   expect(calls('/api/follow'), '代次没变，列表不重取').toBe(1);
   expect(r.managedEntry(stats)?.props).toMatchObject({ revision: 0 });
-  expect(scrolled).toHaveBeenLastCalledWith({ top: 640, behavior: 'instant' });
+  await until(() => scrollTop === 640, '恢复历史阅读位置');
+  expect(scrolled).toHaveBeenLastCalledWith({ left: 0, top: 640, behavior: 'smooth' });
 });
 
 it('关注元素：进详情、关掉回列表都由壳认领写地址，列表不重挂、不重取', async () => {
@@ -287,6 +292,7 @@ it('播放列表元素：按地址整页打开；停在这一页要求重读时�
   expect(r.managedEntry(stats)?.props).toEqual({ revision: 1 });
   expect(opens(actions)).toBe(1);
   await openRouted(r, '/playlists');
-  await until(() => calls('/api/playlists') === 3 && page(stats) !== null && page(stats) !== painted, '整页重开');
+  await until(() => page(stats) !== null && page(stats) !== painted, '整页重开');
+  expect(calls('/api/playlists'), '重回同一份列表复用缓存').toBe(2);
   expect(opens(actions), '再点一次侧栏整页重开').toBe(2);
 });

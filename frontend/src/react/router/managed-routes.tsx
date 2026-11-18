@@ -20,12 +20,15 @@ import { prefetchTasks } from '../activity/tasks';
 import { BatchDockSurface } from '../batch-dock/batch-dock-island';
 import type { DataCleanupSection, LibraryProcessingProps } from '../bundle';
 import { CatalogFilterPage } from '../catalog-filter/catalog-filter-page';
-import { prefetchCatalogGrid } from '../catalog-grid/catalog-grid';
 import { CatalogGridPage } from '../catalog-grid/catalog-grid-page';
-import { prefetchDataCleanup } from '../data-cleanup/data-cleanup';
+import { prefetchCatalogGrid } from '../catalog-grid/catalog-grid';
+import { catalogView } from '../catalog-grid/catalog-view';
+import { prefetchDataCleanup, prefetchDataCleanupTool } from '../data-cleanup/data-cleanup';
+import { CLEANUP_TOOLS, type CleanupToolPath } from '../../cleanup-tools';
 import { prefetchEntityPage, type EntityPageProps } from '../entity-page/entity-page';
 import { EntityPage } from '../entity-page/entity-page-view';
 import { prefetchDuplicates } from '../duplicates/duplicates';
+import { prefetchRepairs } from '../settings/repair-center-data';
 import { prefetchDiagnostics } from '../diagnostics/diagnostics';
 import { prefetchFeedNew } from '../feed-new/feed-new';
 import { FeedNewPage } from '../feed-new/feed-new-page';
@@ -64,6 +67,7 @@ import type {
   IndexOpenPropsTable, IndexRoutePath, ManagedOpenProps, ManagedPath, ResidentName, ResidentOpenProps, ShellActions,
   SurfaceName, SurfaceOpenProps,
 } from './shell-actions';
+import { t } from '../../i18n';
 
 interface ManagedRoute<P> {
   prefetch(open: P, signal: AbortSignal): Promise<void>;
@@ -107,6 +111,7 @@ const configurationPage = routeChunk(async () => {
 const activityPage = routeChunk(() => import('../activity/activity-page'));
 const followManagePage = routeChunk(() => import('../follow-manage/follow-manage-page'));
 const playlistsPage = routeChunk(() => import('../playlists/playlists-page'));
+const repairCenterPage = routeChunk(() => import('../settings/repair-center'));
 
 /* 数据管理页读数卡的去处里，只有重复文件不按管理区身份找：它报的是数据管理的身份。 */
 function openCleanupSection(section: DataCleanupSection, actions: ShellActions, go: (path: string) => void) {
@@ -120,23 +125,41 @@ function openCleanupSection(section: DataCleanupSection, actions: ShellActions, 
  * 紧接着就读它画出来的结构（配置页按地址里的 `#peachProxy` 滚过去，那一刻选中的页签已经是「网络与访问」）。 */
 const configurationRoute = (path: ConfigurationPath): ManagedRoute<ManagedOpenProps['/settings/library']> => ({
   element: <ManagedMatch path={path} />,
-  prefetch: (_open, signal) => withPage(configurationPage, Promise.all([
-    prefetchConfiguration(signal), ...(path === '/settings/diagnostics' ? [prefetchDiagnostics(signal)] : [])]).then(() => {})),
+  prefetch: (_open, signal) => {
+    if (path === '/settings/diagnostics') void prefetchDiagnostics(signal).catch(() => {});
+    return withPage(configurationPage, prefetchConfiguration(signal));
+  },
   page: (open, actions) => {
     const { ConfigurationPage, DiagnosticsPage } = configurationPage.get();
     return <ConfigurationPage receipt={message => actions.receipt(message)}
-      reopenTutorial={actions.reopenTutorial} section={path === '/settings/diagnostics' ? '系统诊断' : open.section ?? ''}
+      reopenTutorial={actions.reopenTutorial} section={path === '/settings/diagnostics' ? 'diagnostics' : open.section ?? ''}
       diagnostics={<DiagnosticsPage openItem={actions.openItem} receipt={message => actions.receipt(message)} />} />;
   },
 });
 
+const cleanupRoutes = CLEANUP_TOOLS.reduce((routes, tool) => {
+  routes[tool.path] = {
+    element: <ManagedMatch path={tool.path} />,
+    prefetch: (_open: Record<string, never>, signal: AbortSignal) =>
+      withPage(dataCleanupPage, prefetchDataCleanupTool(tool.key, signal)),
+    page: (_open: Record<string, never>, actions: ShellActions) => {
+      const { DataCleanupToolPage } = dataCleanupPage.get();
+      return <DataCleanupToolPage tool={tool.key} failure={actions.failure}
+        toast={(message, { warning = false, undo } = {}) => (
+          warning ? actions.toast({ text: message }, { sound: 'warning' }) : actions.receipt(message, undo ? { undo } : {}))} />;
+    },
+  };
+  return routes;
+}, {} as Pick<ManagedRouteTable, CleanupToolPath>);
+
 export const MANAGED_ROUTES: ManagedRouteTable = {
+  ...cleanupRoutes,
   '/jav': {
     element: <ManagedMatch path="/jav" />,
     prefetch: (open, signal) => withPage(javPage, prefetchJav(open.tab, signal)),
     page: (open, actions) => {
       const { JavPage } = javPage.get();
-      return <JavPage {...open} navigate={actions.navigate} receipt={message => actions.receipt(message)} />;
+      return <JavPage {...open} navigate={actions.navigate} receipt={(message, { undo } = {}) => actions.receipt(message, undo ? { undo } : {})} />;
     },
   },
   '/stats': {
@@ -166,18 +189,18 @@ export const MANAGED_ROUTES: ManagedRouteTable = {
     page: (open, actions) => {
       const { ReviewPage } = reviewPage.get();
       return <ReviewPage {...open} route={actions.routeReview} openItem={actions.openItem} openEntity={actions.openEntity}
-        revealSource={actions.revealSource} toast={(message) => actions.receipt(message)} />;
+        revealSource={actions.revealSource} toast={(message, { undo } = {}) => actions.receipt(message, undo ? { undo } : {})} />;
     },
   },
-  /* 首屏等顶上那排读数里自己的几份、两张后台任务卡与整理卡；复核、高清版与链接各读各的。 */
+  /* 首页只展开日常扫描；维护工具各自预取自己的二级页数据。 */
   '/data-cleanup': {
     element: <ManagedMatch path="/data-cleanup" />,
     prefetch: (_open, signal) => withPage(dataCleanupPage, prefetchDataCleanup(signal)),
     page: (_open, actions, go) => {
       const { DataCleanupPage } = dataCleanupPage.get();
-      return <DataCleanupPage failure={actions.failure} open={(section) => openCleanupSection(section, actions, go)}
-        toast={(message, { warning = false } = {}) => (
-          warning ? actions.toast({ text: message }, { sound: 'warning' }) : actions.receipt(message))} />;
+      return <DataCleanupPage navigate={go} failure={actions.failure} open={(section) => openCleanupSection(section, actions, go)}
+        toast={(message, { warning = false, undo } = {}) => (
+          warning ? actions.toast({ text: message }, { sound: 'warning' }) : actions.receipt(message, undo ? { undo } : {}))} />;
     },
   },
   '/duplicates': {
@@ -212,6 +235,15 @@ export const MANAGED_ROUTES: ManagedRouteTable = {
   '/settings/network': configurationRoute('/settings/network'),
   '/settings/maintenance': configurationRoute('/settings/maintenance'),
   '/settings/diagnostics': configurationRoute('/settings/diagnostics'),
+  /* 「应用与维护」之下的子页，不在配置页签里：页头画面包屑回到「应用与维护」；首屏数据随路由预取，等待时画路由骨架。 */
+  '/settings/maintenance/repairs': {
+    element: <ManagedMatch path="/settings/maintenance/repairs" />,
+    prefetch: (_open, signal) => withPage(repairCenterPage, prefetchRepairs(signal)),
+    page: () => {
+      const { RepairCenterPage } = repairCenterPage.get();
+      return <RepairCenterPage />;
+    },
+  },
   '/tasks': {
     element: <ManagedMatch path="/tasks" />,
     prefetch: (_open, signal) => withPage(activityPage, prefetchTasks(signal)),
@@ -228,7 +260,7 @@ export const MANAGED_ROUTES: ManagedRouteTable = {
     page: (open, actions) => {
       const { FollowManagePage } = followManagePage.get();
       return <FollowManagePage {...open} route={actions.routeFollowManage} savePreference={actions.saveFollowPreference}
-        toast={(message) => actions.receipt(message)} openFollow={actions.openFollow} />;
+        toast={(message, { undo } = {}) => actions.receipt(message, undo ? { undo } : {})} openFollow={actions.openFollow} />;
     },
   },
 };
@@ -288,8 +320,8 @@ export const INDEX_ROUTES: IndexRouteTable = {
 };
 
 /* 资料页：资料卡、筛选浮层、新作那一行与正文是同一页的四块。框架由元素排好（`openManagedRoute` 的
-   `place`），页面画进资料卡那一格，再经 portal 画进另外三块。首屏把资料（连同新作与头几张封面）、
-   作品第一页与照片取齐再画；换头像的候选不在首屏里，资料页每进一次就打一遍图库的话，多数时候没人
+   `place`），页面画进资料卡那一格，再经 portal 画进另外三块。身份资料先显示，作品、照片与新作各自加载；
+   换头像的候选不在首屏里，资料页每进一次就打一遍图库的话，多数时候没人
    点开它。壳交进来的筛选、视图与展示设置之后经 `updateManagedRoute` 推进来，页面按新键重取、不重挂。卡片与
    遗留层拼的 HTML（头像、新作那一行、源文件键）都是壳的那一份，跟着打开走。 */
 const entityRoute: ManagedRoute<EntityPageProps> = {
@@ -307,13 +339,14 @@ export const ENTITY_ROUTES: EntityRouteTable = {
    网格、用 `/junk-files` 打开队列，槽里记的路径说的是画着哪一页、不是地址。按地址分键会在三处出错：网格在
    `/trash` 打开之后去 `/` 是就地推，槽里的路径不跟着变；`?state=ads` 落在 `/` 上，画的是垃圾队列；冷启动
    落在详情地址上时，网格在 `/assets/:id` 底下补画。
-   网格首屏取第一页再画；队列不在打开前等，画上就铺自己那份骨架（`junk-queue-page.tsx` 开头）。之后换
+   目录网格在打开前取第一页，壳铺的骨架一直留到数据到，挂上就是卡片：先挂再取的话，岛挂得晚于骨架显示
+   门槛时，壳那份骨架会再淡出换成岛自己的一份。队列不在打开前等，画上即取数并显示自己的骨架。之后换
    筛选或分类、换版式、选择模式与刷新代次都由壳经 `updateManagedRoute` 推进来，页面按新键重取、自己铺
    骨架，不重挂。 */
 export const CATALOG_ROUTES: CatalogRouteTable = {
   '/': {
     element: <CatalogMatch />,
-    prefetch: (open, signal) => prefetchCatalogGrid(open, signal),
+    prefetch: (open, signal) => prefetchCatalogGrid(open, catalogView(), signal),
     page: (open) => <CatalogGridPage {...open} />,
   },
   '/junk-files': {
@@ -332,7 +365,7 @@ const LibraryProcessing = (props: LibraryProcessingProps) => (
 
 /* 页面里的页面内组件，按名字登记：壳每次打开交进来整份 props，之后经 `updateManagedRoute` 推补丁，页面就地
    重渲染。首页筛选条与搜索下拉不在打开前等数据（筛选条的读数与头像由壳推进来，搜索下拉的记录与推荐聚焦
-   时才取）；首页新作行连头几张封面一起等，再一次换掉骨架；任务面先取一份进度快照。 */
+   时才取）；首页新作条目先显示，封面各自加载；任务面先取一份进度快照。 */
 export const SURFACE_ROUTES: SurfaceRouteTable = {
   'catalog-filter': {
     prefetch: async () => {},
@@ -417,7 +450,7 @@ function routeOf(path: RoutedPath): ManagedRoute<object> {
 
 /** 首屏取数（`openManagedRoute` 经 `connectManagedRoutes` 调它）。 */
 export function prefetchManagedRoute(path: string, open: object, signal: AbortSignal): Promise<void> {
-  if (!isRoutedPath(path)) return Promise.reject(new Error(`路由树里没有这一页：${path}`));
+  if (!isRoutedPath(path)) return Promise.reject(new Error(t('shell:router.unknownRoute', { path })));
   return routeOf(path).prefetch(open, signal);
 }
 

@@ -1,4 +1,4 @@
-import { followPageUrl, FOLLOW_RANDOM_SORT, type FollowFeedActions, type FollowFeedHelpers, type FollowFeedProps, type FollowView } from './follow-feed';
+import { FOLLOW_RANDOM_SORT, type FollowFeedActions, type FollowFeedHelpers, type FollowFeedProps, type FollowView } from './follow-feed';
 import { followViewPath, readFollowView } from './follow-view';
 
 export interface FollowSession {
@@ -36,12 +36,10 @@ export function createFollowController(ports: FollowControllerPorts, helpers: Fo
   };
   const push = (patch: Partial<FollowFeedProps>) => { if (ports.live()) ports.push(patch) };
   const route = (view: FollowView, patch: Partial<FollowFeedProps> = {}) => {
-    const before = followPageUrl(ports.view(), 0);
     ports.adoptView(view);
     ports.route(followViewPath(view));
     push({ ...patch, view: ports.view() });
     ports.syncPhotoWalls();
-    if (followPageUrl(ports.view(), 0) !== before) ports.scrollTop();
   };
   const shuffle = () => {
     const seed = ports.rollSeed();
@@ -57,22 +55,24 @@ export function createFollowController(ports: FollowControllerPorts, helpers: Fo
   };
   return {
     actions, props, read, route, shuffle,
-    refresh(): boolean {
+    refresh(restored?: Pick<FollowFeedProps, 'view' | 'seed' | 'revision'>): boolean {
+      if (restored) {
+        ports.adoptView(restored.view);
+        ports.writeSession({ discoverySeed: restored.seed, revision: restored.revision });
+      }
       const view = read();
       if (!ports.live()) return false;
       ports.revealFeed();
-      ports.writeSession({ revision: ports.session().revision + 1 });
       push({ view, seed: ports.session().discoverySeed, revision: ports.session().revision });
       ports.syncPhotoWalls();
-      ports.scrollTop();
       return true;
     },
     enter(fresh = false): void {
-      if (fresh || ports.location().pathname === '/follow') {
+      if (fresh) {
         ports.writeSession({ discoverySeed: ports.enterSeed(), scrollY: 0,
-          ...(ports.live() ? {} : { revision: ports.session().revision + 1 }) });
+          revision: ports.session().revision + 1 });
         ports.openPage('/follow');
-      } else ports.openPage(followViewPath(ports.view()));
+      } else if (ports.location().pathname !== '/follow') ports.openPage(followViewPath(ports.view()));
     },
   };
 }

@@ -20,6 +20,7 @@ import httpx
 from curl_cffi import requests as curl_requests
 from curl_cffi.requests.exceptions import CurlError
 from . import peach_proxy
+from .task_control import controlled, checkpoint
 
 #: 只在本机或局域网里有意义的名字后缀。外面递进来的地址落到它们上，只可能是想让
 #: Peach 替人去探内网。
@@ -199,7 +200,7 @@ class HttpxTransport:
     def client(self):
         with self._client_lock:
             if self._closed and self._client is None:
-                raise RuntimeError("HTTP 客户端已关闭")
+                raise RuntimeError("HTTP client is closed")
             if self._client is None:
                 self._client = httpx.Client(
                     **peach_proxy.client_options(),
@@ -212,12 +213,15 @@ class HttpxTransport:
         with self._client_lock:
             self._client = value
 
+    @controlled
     def __call__(
         self,
         request: HttpRequest,
         timeout: float,
         max_bytes: int,
     ) -> HttpResponse:
+        from .processing_control import checkpoint as processing_checkpoint
+        processing_checkpoint('network')
         method = request.method
         url = httpx.URL(request.url)
         headers = dict(request.headers)
@@ -252,7 +256,7 @@ class HttpxTransport:
                 headers = _without(headers, ("content-length", "content-type"))
             url = target
         raise httpx.TooManyRedirects(
-            f"超过 {self.MAX_REDIRECTS} 次重定向", request=response.request)
+            f"exceeded {self.MAX_REDIRECTS} redirects", request=response.request)
 
     def close(self) -> None:
         if self._owns_client:
@@ -280,6 +284,7 @@ def _bounded_body(chunks, max_bytes: int) -> bytes:
     kept: list[bytes] = []
     total = 0
     for chunk in chunks:
+        checkpoint()
         remaining = max_bytes + 1 - total
         if remaining <= 0:
             break
@@ -308,20 +313,23 @@ class CurlCffiTransport:
     def session(self):
         with self._session_lock:
             if self._closed and self._session is None:
-                raise RuntimeError("浏览器指纹客户端已关闭")
+                raise RuntimeError("browser fingerprint client is closed")
             if self._session is None:
                 self._session = curl_requests.Session(impersonate=self._impersonate,
                                                       **peach_proxy.curl_options())
             return self._session
 
+    @controlled
     def __call__(
         self,
         request: HttpRequest,
         timeout: float,
         max_bytes: int,
     ) -> HttpResponse:
+        from .processing_control import checkpoint as processing_checkpoint
+        processing_checkpoint('network')
         from .processing_traffic import unobserved
-        unobserved('浏览器指纹传输流量未观测')
+        unobserved('labels.taskResources.network.fingerprint')
         chunks: list[bytes] = []
         total = 0
         try:
@@ -334,6 +342,7 @@ class CurlCffiTransport:
                 allow_redirects=True,
             ) as response:
                 for chunk in response.iter_content():
+                    checkpoint()
                     remaining = max_bytes + 1 - total
                     if remaining <= 0:
                         break

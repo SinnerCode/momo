@@ -121,6 +121,7 @@ LIT_PAGE = """
 LIT_ICON = ("https://prd.storage.lit.link/images/creators/"
             "91eec176-2db8-4484-bc85-6892cb9eeaa2/icons/"
             "3a347ccf-c2c3-40b8-84e9-8c2b5a5fa0c4.jpe")
+LIT_POSTER = LIT_ICON.split("/icons/", 1)[0] + "/ogp/ogp_image.jpg"
 
 
 class Response:
@@ -186,6 +187,77 @@ class XPageTests(unittest.TestCase):
         self.assertEqual(parsed["bio_urls"], ["https://lit.link/shaku_alice"])
 
 
+class LinkPageTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_module()
+
+    def test_lit_profile_icon_uses_its_declared_original_instead_of_share_or_link_images(self):
+        original_path = "images/creator/example/profile.jpeg"
+        original = "https://prd.storage.lit.link/" + original_path
+        body = (f'<meta property="og:image" content="{LIT_POSTER}">'
+                f'<img src="{LIT_ICON}">'
+                '<img alt="profile icon" src="https://prd.resource-api.lit.link/v1/images/resized'
+                f'?image_url={original_path}&amp;width=240">'
+                f'<script>self.__next_f.push({json.dumps(json.dumps({"pictureUrl": original}))})</script>')
+        self.assertEqual(self.module.parse_link_page(
+            "https://lit.link/example", body)["icon"], original)
+
+    def test_lit_profile_icon_without_a_declared_original_keeps_its_display_url(self):
+        icon = "https://prd.resource-api.lit.link/v1/images/resized?image_url=images/creator/example/a.jpeg&width=240"
+        body = f'<img alt="profile icon" src="{icon.replace("&", "&amp;")}">'
+        self.assertEqual(self.module.parse_link_page(
+            "https://lit.link/example", body)["icon"], icon)
+
+    def test_lit_icons_keep_the_full_filename_and_query(self):
+        for extension in ("jpe", "jpeg", "jpg", "png", "webp"):
+            with self.subTest(extension=extension):
+                icon = LIT_ICON.rsplit(".", 1)[0] + f".{extension}?v=1&size=large"
+                body = (f'<meta property="og:image" content="{LIT_POSTER}">'
+                        f'<img src="{icon.replace("&", "&amp;")}">')
+                self.assertEqual(self.module.parse_link_page(
+                    "https://lit.link/example", body)["icon"], icon)
+
+    def test_lit_icons_in_json_use_unescaped_urls(self):
+        body = json.dumps({"icon": LIT_ICON}).replace("/", r"\/")
+        self.assertEqual(self.module.parse_link_page(
+            "https://lit.link/example", body)["icon"], LIT_ICON)
+
+    def test_lit_share_poster_is_not_an_avatar_and_links_remain_available(self):
+        body = (f'<meta property="og:image" content="{LIT_POSTER}">'
+                '<a href="https://x.com/example">X</a>')
+        page = self.module.parse_link_page("https://lit.link/example", body)
+        self.assertEqual(page["icon"], "")
+        self.assertEqual(page["anchors"], ["https://x.com/example"])
+
+    def test_other_link_pages_keep_their_og_image(self):
+        body = '<meta property="og:image" content="https://example.com/avatar.jpg">'
+        self.assertEqual(self.module.parse_link_page(
+            "https://allmylinks.com/example", body)["icon"], "https://example.com/avatar.jpg")
+
+
+class PendingCandidateTests(unittest.TestCase):
+    def test_share_posters_are_not_carried_forward_but_portraits_and_manual_rows_are(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            database = root / "ledger.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE review_decision(category, item_key)")
+            connection.close()
+            old_rows = [
+                {"entity_id": "1", "provider": "social-web", "source_url": LIT_POSTER},
+                {"entity_id": "2", "provider": "social-web", "source_url": LIT_ICON},
+                {"entity_id": "3", "provider": "url", "source_url": LIT_POSTER},
+                {"entity_id": "4", "provider": "social-web", "source_url": X_BASE + ".jpg"},
+            ]
+            module.write_rows(root / "performer-avatar-candidate-old.csv",
+                              ("entity_id", "provider", "source_url"), old_rows)
+            rows = []
+            with unittest.mock.patch.object(module, "GENERATED_DIR", root):
+                module.merge_prior_pending(database, root / "new.csv", rows)
+            self.assertEqual([row["entity_id"] for row in rows], ["2", "3", "4"])
+
+
 class ClassifyTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
@@ -202,7 +274,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(self.module.classify("https://lit.link/shaku_alice"),
                          ("social", "链接集（lit.link）"))
         self.assertEqual(self.module.classify("https://notx.com/alice"),
-                         ("official", "官方网站"))
+                         ("official", "official-site"))
 
 
 class IdentityGateTests(unittest.TestCase):
@@ -498,11 +570,13 @@ class InstallGateTests(unittest.TestCase):
     def test_a_missing_face_model_records_the_reason_instead_of_raising(self):
         """下不到 ONNX 不该把「今天没网」变成「所有人都没有头像」。"""
         from peach.avatar_face import FaceProbe
+        from peach.face_detect import FaceModelUnavailable
         probe = FaceProbe()
         with unittest.mock.patch("peach.avatar_face.FaceDetector",
-                                 side_effect=RuntimeError("模型未取得")):
+                                 side_effect=FaceModelUnavailable("errors.faceDetect.faceModelFetchFailed",
+                                                                  {"error": "network is unreachable"})):
             self.assertIsNone(probe(Path("/tmp/nope.jpg")))
-        self.assertEqual(probe.unavailable, "模型未取得")
+        self.assertEqual(probe.unavailable, "取人脸模型失败：network is unreachable")
         # 记住之后不再反复重试，也不再抛。
         self.assertIsNone(probe(Path("/tmp/nope.jpg")))
 
@@ -567,6 +641,21 @@ class HarvestTests(unittest.TestCase):
         winner, _ = self.module.select_winner(result["candidates"])
         self.assertEqual(winner["sha256"], hashlib.sha256(original).hexdigest())
 
+    def test_lit_share_posters_are_not_fetched_as_avatar_candidates(self):
+        body = LIT_PAGE.replace(f'<img src="{LIT_ICON}"/>',
+                                f'<meta property="og:image" content="{LIT_POSTER}">')
+        http = FakeHttp({
+            "https://x.com/alice_710_": (200, X_PAGE.encode("utf-8")),
+            "https://lit.link/shaku_alice": (200, body.encode("utf-8")),
+            LIT_POSTER: (200, jpeg(1000, 524)),
+        })
+        result = self.module.harvest_entity(self.record({"x": "alice_710_"}), http,
+                                            self.limiter, 5.0, self.caches)
+        self.assertEqual(result["candidates"], [])
+        self.assertNotIn(LIT_POSTER, http.calls)
+        self.assertTrue(any(link["label"] == "Instagram @shaku._.alice"
+                            for link in result["links"]))
+
     def test_a_name_mismatch_sends_links_to_review_not_to_the_ledger(self):
         """闸门断掉的链路只进复核；错误归属的链接比没有链接更糟。"""
         routes = {"x": "alice_710_"}
@@ -591,10 +680,10 @@ class HarvestTests(unittest.TestCase):
         rows = [
             {"portrait_url": "http://www.jae.tokyo/jae2015/images/a.jpg",
              "page": "http://www.jae.tokyo/jae2015/actress.html#joyu038",
-             "matched_name": "釈アリス", "verdict": "命中"},
+             "matched_name": "釈アリス", "verdict": "matched"},
             {"portrait_url": "http://www.jae.tokyo/jae2017/images/b.jpg",
              "page": "http://www.jae.tokyo/jae2017/actress/12.html",
-             "matched_name": "釈アリス", "verdict": "命中"},
+             "matched_name": "釈アリス", "verdict": "matched"},
         ]
         http = FakeHttp({rows[0]["portrait_url"]: (200, jpeg(200, 300)),
                          rows[1]["portrait_url"]: (200, big)})
@@ -611,7 +700,7 @@ class HarvestTests(unittest.TestCase):
 
     def test_a_jae_portrait_that_does_not_load_only_leaves_a_note(self):
         rows = [{"portrait_url": "http://www.jae.tokyo/jae2014/images/gone.jpg",
-                 "page": "http://www.jae.tokyo/jae2014/performer/", "verdict": "命中"}]
+                 "page": "http://www.jae.tokyo/jae2014/performer/", "verdict": "matched"}]
         result = self.module.harvest_entity(self.record({"jae": rows}), FakeHttp({}),
                                             self.limiter, 5.0, self.caches)
         self.assertEqual(result["candidates"], [])
@@ -662,7 +751,7 @@ class TargetTests(unittest.TestCase):
     def test_a_creator_rides_the_babepedia_route_from_the_candidates_csv(self):
         (self.tmp / "babepedia-candidates.csv").write_text(
             "entity_id,creator,verdict,babepedia_name,portrait_url\n"
-            "6705,SexySaffron,命中,Saffron Bacchus,"
+            "6705,SexySaffron,matched,Saffron Bacchus,"
             "https://www.babepedia.com/pics/Saffron%20Bacchus.jpg\n",
             encoding="utf-8-sig")
         connection = self.ledger([(6705, "creator", "SexySaffron")])
@@ -675,6 +764,7 @@ class TargetTests(unittest.TestCase):
             connection.close()
 
     def test_merged_babepedia_candidates_bind_to_the_current_performer(self):
+        # 旧版候选表写中文 `命中`，读入时归一成 `matched`。
         (self.tmp / 'babepedia-candidates.csv').write_text(
             'entity_id,creator,verdict,babepedia_name,portrait_url\n'
             '10,Melody Marks,命中,Melody Marks,https://www.babepedia.com/pics/Melody.jpg\n', encoding='utf8')
@@ -688,6 +778,7 @@ class TargetTests(unittest.TestCase):
             targets = self.module.load_targets(connection, self.avatars, [], False)
             self.assertEqual(targets[0]['entity_id'], 20)
             self.assertEqual(targets[0]['routes']['babepedia']['babepedia_name'], 'Melody Marks')
+            self.assertEqual(targets[0]['routes']['babepedia']['verdict'], 'matched')
         finally:
             connection.close()
 
@@ -695,18 +786,19 @@ class TargetTests(unittest.TestCase):
         (self.tmp / "jae-performer-links-portraits.csv").write_text(
             "entity_id,kind,name,matched_name,portrait_url,source,page,verdict\n"
             "1,performer,释爱丽丝,釈アリス,http://www.jae.tokyo/jae2015/images/a.jpg,"
-            "jae,http://www.jae.tokyo/jae2015/actress.html#joyu038,命中\n"
+            "jae,http://www.jae.tokyo/jae2015/actress.html#joyu038,matched\n"
             "1,performer,释爱丽丝,釈アリス,http://www.jae.tokyo/jae2017/images/b.jpg,"
             "jae,http://www.jae.tokyo/jae2017/actress/12.html,命中\n"
             "2,performer,另一位,,http://www.jae.tokyo/jae2017/images/c.jpg,"
-            "jae,http://www.jae.tokyo/jae2017/actress/13.html,需人工消歧\n",
+            "jae,http://www.jae.tokyo/jae2017/actress/13.html,ambiguous\n",
             encoding="utf-8-sig")
         connection = self.ledger([(1, "performer", "释爱丽丝"), (2, "performer", "另一位")])
         try:
             targets = self.module.load_targets(connection, self.avatars, [], False)
             self.assertEqual([t["entity_id"] for t in targets], [1],
                              "名字没定下来的行不进路线，头像装错人和链接装错人一样严重")
-            self.assertEqual(len(targets[0]["routes"]["jae"]), 2)
+            # 第二行是旧版人像表写的中文 `命中`，照样认。
+            self.assertEqual([row["verdict"] for row in targets[0]["routes"]["jae"]], ["matched", "matched"])
         finally:
             connection.close()
 

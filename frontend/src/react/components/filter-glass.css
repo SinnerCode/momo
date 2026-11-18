@@ -3,3 +3,7 @@
   --strand-dash: 100;
   --strand-cycle: 2.2s;
 }
+.peach-react [data-filter-glass] > [data-filter-row="bottom"] {
+  /* 横滚行不接管纵向滚动，避免多出垂直边缘遮罩，把整块玻璃切成两层。 */
+  overflow-y: hidden;
+}

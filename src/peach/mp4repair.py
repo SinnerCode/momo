@@ -22,6 +22,9 @@ from pathlib import Path
 from .smb_media import input_url
 
 from .mp4index import _iter_boxes
+from .task_control import run as run_task_process
+from .task_stages import stage as stage_fields
+from .user_messages import UserFacingError, failure_fields
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,14 +32,18 @@ LOGGER = logging.getLogger(__name__)
 CONTAINERS = frozenset({b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts"})
 #: 头部盒子加起来的上限；超过这个数就不是我们认识的片源，宁可不修。
 HEADER_LIMIT = 64 << 20
-PROBE_TIMEOUT_SECONDS = 900
+#: 连续没有任何解码输出的等待时间；整片解码不按片长限制总耗时。
+PROBE_IDLE_SECONDS = 900
 SIDECAR_MAGIC = b"PEACHMP4\x02"
 LEGACY_SIDECAR_MAGIC = b"PEACHMP4\x01"
 SIDECAR_SUFFIX = ".mp4hdr"
 
 
-class RepairUnavailable(RuntimeError):
-    """这个片源修不了。调用方照旧走转码分片，不要把异常当故障报。"""
+class RepairUnavailable(UserFacingError, RuntimeError):
+    """这个片源修不了。调用方照旧走转码分片，不要把异常当故障报。
+
+    原因写成 `errors.mp4repair.*` 的 code，后台补头失败时随任务行带给任务中心。
+    """
 
 
 @dataclass(frozen=True)
@@ -127,7 +134,7 @@ def _decode_times(stts: bytes) -> list[int]:
     cursor = 8
     for _ in range(count):
         if cursor + 8 > len(stts):
-            raise RepairUnavailable("stts 长度和声明的条目数对不上")
+            raise RepairUnavailable("errors.mp4repair.sttsLengthMismatch")
         run, delta = struct.unpack_from(">II", stts, cursor)
         cursor += 8
         for _ in range(run):
@@ -136,7 +143,7 @@ def _decode_times(stts: bytes) -> list[int]:
     return times
 
 
-def _display_order(ffprobe: Path, source: Path, decode_times: list[int]) -> list[int]:
+def _display_order(ffprobe: Path, source: Path, decode_times: list[int], *, progress=None) -> list[int]:
     """每个样本（解码序）的显示名次。
 
     解码器吐出来的帧就是显示顺序，每帧的 `pts` 原样来自它那个样本；这里 pts 就等于 dts，
@@ -146,40 +153,53 @@ def _display_order(ffprobe: Path, source: Path, decode_times: list[int]) -> list
 
     对不上就抛 `RepairUnavailable`：宁可不修，也不能写一张错的表。
 
-    `-threads 0` 不是调参，是补上 ffprobe 默认没开的解码线程：6297 上实测 300 秒内容
-    从 27 秒降到 4 秒，整片从十几分钟降到一两分钟。
+    解码线程沿用任务档位，高强度和独立调用交给 FFmpeg 自动分配。
     """
+    from .task_resources import media_input
+    from .processing_control import ffmpeg_options
+    media_input(source)
     command = (
-        str(ffprobe), "-v", "error", "-threads", "0",
+        str(ffprobe), "-v", "error", *(ffmpeg_options() or ['-threads', '0']),
         "-ignore_editlist", "1", "-select_streams", "v:0",
         "-show_entries", "frame=pts", "-of", "csv=p=0", input_url(source),
     )
+    frames = 0
+
+    def report(chunk):
+        nonlocal frames
+        frames += chunk.count(b'\n')
+        if progress is not None:
+            progress(min(frames, len(decode_times)), len(decode_times))
+
     try:
-        completed = subprocess.run(command, capture_output=True, timeout=PROBE_TIMEOUT_SECONDS,
+        completed = run_task_process(command, capture_output=True, idle_timeout=PROBE_IDLE_SECONDS,
+                                   on_stdout=report,
                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RepairUnavailable(f"ffprobe 没跑完：{exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RepairUnavailable("errors.mp4repair.probeIdle", {"seconds": PROBE_IDLE_SECONDS}) from exc
+    except OSError as exc:
+        raise RepairUnavailable("errors.mp4repair.probeIncomplete", {"error": str(exc)}) from exc
     if completed.returncode:
-        raise RepairUnavailable(f"ffprobe 退出码 {completed.returncode}")
+        raise RepairUnavailable("errors.mp4repair.probeExitCode", {"code": completed.returncode})
 
     index_of = {value: index for index, value in enumerate(decode_times)}
     if len(index_of) != len(decode_times):
-        raise RepairUnavailable("dts 有重复，认不出哪一帧是哪一帧")
+        raise RepairUnavailable("errors.mp4repair.duplicateDts")
     rank = [-1] * len(decode_times)
     seen = 0
     for line in completed.stdout.decode("utf-8", "replace").splitlines():
         text = line.strip().rstrip(",")
         if not text or text == "N/A":
-            raise RepairUnavailable("有帧没有时间戳")
+            raise RepairUnavailable("errors.mp4repair.frameWithoutTimestamp")
         index = index_of.get(int(text))
         if index is None:
-            raise RepairUnavailable("解码器报的时间戳不在 stts 里")
+            raise RepairUnavailable("errors.mp4repair.timestampNotInStts")
         if rank[index] >= 0:
-            raise RepairUnavailable("同一帧被输出了两次")
+            raise RepairUnavailable("errors.mp4repair.frameOutputTwice")
         rank[index] = seen
         seen += 1
     if seen != len(decode_times):
-        raise RepairUnavailable(f"解码出 {seen} 帧，样本表里有 {len(decode_times)} 个")
+        raise RepairUnavailable("errors.mp4repair.frameCountMismatch", {"decoded": seen, "samples": len(decode_times)})
     return rank
 
 
@@ -266,11 +286,11 @@ def _track_duration(root: _Box, trak: _Box) -> int:
     mdia = trak.find(b"mdia")
     mdhd = mdia.find(b"mdhd") if mdia else None
     if not (mvhd and mvhd.payload and mdhd and mdhd.payload):
-        raise RepairUnavailable("算不出轨道时长")
+        raise RepairUnavailable("errors.mp4repair.trackDurationUnknown")
     movie_scale = struct.unpack_from(">I", mvhd.payload, 20 if mvhd.payload[0] == 1 else 12)[0]
     media_scale = struct.unpack_from(">I", mdhd.payload, 20 if mdhd.payload[0] == 1 else 12)[0]
     if not media_scale:
-        raise RepairUnavailable("媒体时间刻度是 0")
+        raise RepairUnavailable("errors.mp4repair.zeroTimescale")
     return _timed_field(mdhd.payload, 16, 24) * movie_scale // media_scale
 
 
@@ -286,7 +306,7 @@ def _shift_chunk_offsets(box: _Box, delta: int) -> None:
             count = struct.unpack_from(">I", child.payload, 4)[0]
             values = [struct.unpack_from(">I", child.payload, 8 + n * 4)[0] + delta for n in range(count)]
             if any(value > 0xFFFFFFFF for value in values):
-                raise RepairUnavailable("偏移超出 32 位，这个片源要 co64 才修得了")
+                raise RepairUnavailable("errors.mp4repair.offsetNeedsCo64")
             child.payload = child.payload[:8] + b"".join(struct.pack(">I", value) for value in values)
         elif child.kind == b"co64":
             count = struct.unpack_from(">I", child.payload, 4)[0]
@@ -319,18 +339,18 @@ def _layout(source: Path) -> _Layout:
         boxes = _top_level(handle)
         kinds = {kind for kind, *_ in boxes}
         if not {b"moov", b"mdat"} <= kinds:
-            raise RepairUnavailable("顶层缺 moov 或 mdat")
+            raise RepairUnavailable("errors.mp4repair.missingMoovOrMdat")
         if any(sum(box[0] == kind for box in boxes) != 1 for kind in (b"moov", b"mdat")):
-            raise RepairUnavailable("顶层必须各有一个 moov 和 mdat")
+            raise RepairUnavailable("errors.mp4repair.needsSingleMoovAndMdat")
         mdat = next(box for box in boxes if box[0] == b"mdat")
         moov = next(box for box in boxes if box[0] == b"moov")
         if mdat[3] - mdat[2] <= 0 or moov[3] - moov[1] > HEADER_LIMIT:
-            raise RepairUnavailable("moov 太大或 mdat 是空的")
+            raise RepairUnavailable("errors.mp4repair.moovTooLargeOrMdatEmpty")
         if mdat[2] > HEADER_LIMIT:
-            raise RepairUnavailable("媒体前的索引段太大")
+            raise RepairUnavailable("errors.mp4repair.leadingIndexTooLarge")
         if moov[1] < mdat[1]:
             if any(box[1] > mdat[1] for box in boxes):
-                raise RepairUnavailable("mdat 后面还有盒子，这个布局还没支持")
+                raise RepairUnavailable("errors.mp4repair.boxesAfterMdat")
             handle.seek(moov[1])
             moov_box = handle.read(moov[3] - moov[1])
             handle.seek(0)
@@ -340,7 +360,7 @@ def _layout(source: Path) -> _Layout:
             return _Layout(before, mdat_header, b"", mdat, moov_box, moov[2] - moov[1], moov[1])
         after_size = handle.seek(0, 2) - mdat[3]
         if after_size > HEADER_LIMIT - mdat[2]:
-            raise RepairUnavailable("媒体后的索引段太大")
+            raise RepairUnavailable("errors.mp4repair.trailingIndexTooLarge")
         handle.seek(0)
         before = handle.read(mdat[1])
         handle.seek(mdat[1])
@@ -353,9 +373,17 @@ def _layout(source: Path) -> _Layout:
                        after[start:stop], moov[2] - moov[1], None)
 
 
-def repaired_header(source: Path, ffprobe: Path) -> RepairedHeader:
-    """算出修好的头。修不了就抛 `RepairUnavailable`。"""
-    layout = _layout(source)
+def read_layout(path) -> _Layout:
+    """`_layout` 的子进程入口：路径按本机文件读。"""
+    return _layout(Path(path))
+
+
+def repaired_header(source: Path, ffprobe: Path, *, progress=None, read_layout=None) -> RepairedHeader:
+    """算出修好的头。修不了就抛 `RepairUnavailable`。
+
+    `read_layout` 代替本进程读片头（批量修复交给带期限的子进程读）。
+    """
+    layout = (read_layout or _layout)(source)
     mdat = layout.mdat
     tree = _parse(layout.moov_box, layout.moov_body, len(layout.moov_box))
     root = _Box(b"moov", None, tree)
@@ -363,18 +391,18 @@ def repaired_header(source: Path, ffprobe: Path) -> RepairedHeader:
     video = next((trak for trak in traks if _is_video(trak)), None)
     stbl = _sample_table(video) if video else None
     if stbl is None:
-        raise RepairUnavailable("找不到视频轨的样本表")
+        raise RepairUnavailable("errors.mp4repair.videoSampleTableMissing")
     if stbl.find(b"ctts") is not None:
-        raise RepairUnavailable("这个片源已经有 ctts")
+        raise RepairUnavailable("errors.mp4repair.cttsPresent")
     stts = stbl.find(b"stts")
     if stts is None or stts.payload is None:
-        raise RepairUnavailable("视频轨没有 stts")
+        raise RepairUnavailable("errors.mp4repair.videoSttsMissing")
 
     decode_times = _decode_times(stts.payload)
     offsets, shift = _composition_offsets(
-        decode_times, _display_order(ffprobe, source, decode_times))
+        decode_times, _display_order(ffprobe, source, decode_times, progress=progress))
     if not shift and all(value == 0 for value in offsets):
-        raise RepairUnavailable("显示顺序本来就等于解码顺序，没有要修的")
+        raise RepairUnavailable("errors.mp4repair.nothingToRepair")
 
     stbl.children.insert(stbl.children.index(stts) + 1, _Box(b"ctts", _ctts(offsets), []))
     edts = video.find(b"edts")
@@ -382,7 +410,7 @@ def repaired_header(source: Path, ffprobe: Path) -> RepairedHeader:
     if layout.moov_before_start is None and elst and elst.payload:
         def checked_start(value: int) -> int:
             if value > shift + _half_frame(decode_times):
-                raise RepairUnavailable("尾部索引的编辑起点无法区分预卷与裁剪")
+                raise RepairUnavailable("errors.mp4repair.editStartAmbiguous")
             return value
 
         _edit_times(elst.payload, checked_start)
@@ -409,15 +437,18 @@ def repaired_header(source: Path, ffprobe: Path) -> RepairedHeader:
     rebuilt = root.serialize()
     prefix = assemble(rebuilt)
     if len(prefix) - mdat[2] != delta:
-        raise RepairUnavailable("重建后的头长度对不上")
+        raise RepairUnavailable("errors.mp4repair.rebuiltHeaderLengthMismatch")
     return RepairedHeader(prefix=prefix, payload_start=mdat[2], payload_end=mdat[3], suffix=layout.suffix)
 
 
-def has_tail_moov(source: Path) -> bool:
-    """只读顶层盒子位置，识别旧布局判据会跳过的尾部索引。"""
-    from .smb_media import SmbResource
-    with (source.open() if isinstance(source, SmbResource) else open(source, 'rb')) as handle:
-        boxes = _top_level(handle)
+def top_level_boxes(path) -> list[tuple[bytes, int, int, int]]:
+    """本机文件的顶层盒子；`media_io.MountWorker` 在子进程里调用。"""
+    with open(path, 'rb') as handle:
+        return _top_level(handle)
+
+
+def tail_moov(boxes) -> bool:
+    """顶层只有一个 `moov` 与一个 `mdat`，且索引在媒体之后：旧布局判据会跳过的尾部索引。"""
     moovs = [box for box in boxes if box[0] == b'moov']
     mdats = [box for box in boxes if box[0] == b'mdat']
     return len(moovs) == len(mdats) == 1 and moovs[0][1] > mdats[0][1]
@@ -438,10 +469,10 @@ def write_sidecar(path: Path, header: RepairedHeader) -> None:
 def _time_runs(payload: bytes) -> list[tuple[int, int]]:
     """边车内的 version 0 时间表；保留游程，不展开整片帧时间。"""
     if len(payload) < 8 or payload[:4] != bytes(4):
-        raise RepairUnavailable("旧边车的时间表版本无效")
+        raise RepairUnavailable("errors.mp4repair.legacyTimetableVersion")
     count = struct.unpack_from(">I", payload, 4)[0]
     if len(payload) != 8 + count * 8:
-        raise RepairUnavailable("旧边车的时间表长度不符")
+        raise RepairUnavailable("errors.mp4repair.legacyTimetableLength")
     return [struct.unpack_from(">II", payload, 8 + index * 8) for index in range(count)]
 
 
@@ -451,10 +482,10 @@ def _legacy_timing(stts: bytes, ctts: bytes) -> tuple[int, int]:
     offsets = _time_runs(ctts)
     samples = sum(run for run, _ in times)
     if not samples or sum(run for run, _ in offsets) != samples:
-        raise RepairUnavailable("旧边车的样本数不符")
+        raise RepairUnavailable("errors.mp4repair.legacySampleCount")
     shift, remainder = divmod(sum(run * value for run, value in offsets), samples)
     if remainder:
-        raise RepairUnavailable("旧边车的整体平移量不完整")
+        raise RepairUnavailable("errors.mp4repair.legacyShiftIncomplete")
     # 最后一帧的 duration 不是两个相邻 DTS 的间距，与新头的半帧判据保持一致。
     remaining, gaps = samples - 1, []
     for run, delta in times:
@@ -474,7 +505,7 @@ def _upgrade_legacy_header(header: RepairedHeader) -> RepairedHeader:
     span = next(((body, stop) for kind, body, stop in _iter_boxes(
         header.prefix, 0, len(header.prefix)) if kind == b"moov"), None)
     if span is None:
-        raise RepairUnavailable("旧边车没有 moov")
+        raise RepairUnavailable("errors.mp4repair.legacyNoMoov")
     root = _Box(b"moov", None, _parse(header.prefix, *span))
     video = next((child for child in root.children if child.kind == b"trak" and _is_video(child)), None)
     stbl = _sample_table(video) if video else None
@@ -483,18 +514,18 @@ def _upgrade_legacy_header(header: RepairedHeader) -> RepairedHeader:
     edts = video.find(b"edts") if video else None
     elst = edts.find(b"elst") if edts else None
     if not (stts and stts.payload and ctts and ctts.payload and elst and elst.payload):
-        raise RepairUnavailable("旧边车缺少修复时间表")
+        raise RepairUnavailable("errors.mp4repair.legacyNoTimetable")
     shift, tolerance = _legacy_timing(stts.payload, ctts.payload)
     payload = _edit_times(elst.payload, lambda value: value - shift
                           if value > shift and abs(value - 2 * shift) <= tolerance else value)
     if payload is None:
-        raise RepairUnavailable("旧边车的编辑列表无效")
+        raise RepairUnavailable("errors.mp4repair.legacyEditListInvalid")
     if payload == elst.payload:
         return header
     elst.payload = payload
     rebuilt = root.serialize()
     if len(rebuilt) != span[1] - span[0] + 8:
-        raise RepairUnavailable("旧边车的重建头长度不符")
+        raise RepairUnavailable("errors.mp4repair.legacyHeaderLength")
     return RepairedHeader(header.prefix[:span[0] - 8] + rebuilt + header.prefix[span[1]:],
                           header.payload_start, header.payload_end, header.suffix)
 
@@ -532,28 +563,33 @@ class HeaderRepairStore:
     所以只在后台算、一次只算一部，算不出来就记下来别再试——调用方照旧走转码分片。
     """
 
-    def __init__(self, root: Path, resolver, *, max_concurrent: int = 1, cached: int = 4):
+    def __init__(self, root: Path, resolver, *, max_concurrent: int = 1, cached: int = 4, runs=None):
         self.root = Path(root)
         self.resolver = resolver
         self._slots = threading.Semaphore(max(1, max_concurrent))
         self._running: set[str] = set()
-        self._failed: set[str] = set()
+        #: 算不出来的那几份头，值是写进任务行的报错字段（带 code 的原因连同 `error_code`）。
+        self._failed: dict[str, dict] = {}
         # 一份头有几 MB（整个 moov 加 ctts），而播放时每个 Range 请求都要问一次。
         # 同时在播的片子就那么一两部，留最近几份在手边，别反复读同一个文件。
         self._cached: dict[str, RepairedHeader] = {}
         self._cache_size = max(1, cached)
         self._guard = threading.Lock()
+        self.runs = runs
+        self._jobs = {}
 
-    def _name(self, asset_id: int, source: Path) -> str | None:
-        try:
-            stat = source.stat()
-        except OSError:
-            return None
+    def _name(self, asset_id: int, source: Path, stat=None) -> str | None:
+        if stat is None:
+            from . import media_io
+            try:
+                stat = media_io.bounded(media_io.mount_key(source), source.stat)
+            except OSError:
+                return None
         return f"{asset_id}-{stat.st_size}-{stat.st_mtime_ns}{SIDECAR_SUFFIX}"
 
-    def lookup(self, asset_id: int, source: Path) -> RepairedHeader | None:
-        """已经算好的头；没有就返回 None，不去算。"""
-        name = self._name(asset_id, source)
+    def lookup(self, asset_id: int, source: Path, *, stat=None) -> RepairedHeader | None:
+        """已经算好的头；没有就返回 None，不去算。`stat` 是调用方刚取过的片源 stat，给了就不再问网盘。"""
+        name = self._name(asset_id, source, stat)
         if not name:
             return None
         with self._guard:
@@ -568,9 +604,9 @@ class HeaderRepairStore:
                 self._cached[name] = header
         return header
 
-    def has_invalid_sidecar(self, asset_id: int, source: Path) -> bool:
-        """已有损坏边车仍可重建；区别于没有产物的既有解码失败。"""
-        name = self._name(asset_id, source)
+    def has_invalid_sidecar(self, asset_id: int, source: Path, *, stat=None) -> bool:
+        """已有损坏边车仍可重建；区别于没有产物的既有解码失败。`stat` 同 `lookup`。"""
+        name = self._name(asset_id, source, stat)
         if not name:
             return False
         path = self.root / name
@@ -584,14 +620,37 @@ class HeaderRepairStore:
         with self._guard:
             if name in self._running or name in self._failed:
                 return
-        threading.Thread(
-            target=self.repair_now, args=(asset_id, source),
-            name=f"PeachMp4Header-{asset_id}", daemon=True,
-        ).start()
+            previous = self._jobs.get(name)
+            if previous is not None:
+                state = previous.snapshot() or {}
+                if state.get('status') in ('running', 'cancelled'):
+                    return
+            from .jobs import BackgroundJob
+            job = BackgroundJob(f'PeachMp4Header-{asset_id}', task_key='mp4-header-repair',
+                                mutex_key=f'mp4-header-repair:{name}', runs=self.runs)
+            self._jobs[name] = job
 
-    def repair_now(self, asset_id: int, source: Path) -> bool:
-        """当场算一份头并存下来。已经有、正在算或上次算不出来都返回 False。"""
-        name = self._name(asset_id, source)
+        def work(job_id):
+            made = self.repair_now(asset_id, source, progress=lambda current, total: job.update(
+                job_id, checked=current, total=total))
+            failure = {'error': ''} if made else self._failed.get(name) or failure_fields(
+                RepairUnavailable("errors.mp4repair.headerNotRepaired"))
+            job.update(job_id, status='complete' if made else 'failed', repaired=int(made), **failure)
+
+        job.start(work, initial={**stage_fields('mediaRepair.readTimestamps'), 'name': source.name, 'asset_id': asset_id})
+
+    def stop(self):
+        with self._guard:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            job.stop()
+
+    def repair_now(self, asset_id: int, source: Path, *, progress=None, stat=None, read_layout=None) -> bool:
+        """当场算一份头并存下来。已经有、正在算或上次算不出来都返回 False。
+
+        `stat` 同 `lookup`；`read_layout` 见 `repaired_header`。
+        """
+        name = self._name(asset_id, source, stat)
         ffprobe = self.resolver.ffprobe()
         if not name or ffprobe is None or read_sidecar(self.root / name) is not None:
             return False
@@ -600,8 +659,17 @@ class HeaderRepairStore:
                 return False
             self._running.add(name)
         try:
-            with self._slots:
-                write_sidecar(self.root / name, repaired_header(source, ffprobe.path))
+            from .task_control import checkpoint
+            while not self._slots.acquire(timeout=.1):
+                checkpoint()
+            try:
+                checkpoint()
+                options = {key: value for key, value in (('progress', progress), ('read_layout', read_layout))
+                           if value is not None}
+                header = repaired_header(source, ffprobe.path, **options)
+                write_sidecar(self.root / name, header)
+            finally:
+                self._slots.release()
             for stale in self.root.glob(f"{asset_id}-*{SIDECAR_SUFFIX}"):
                 if stale.name != name:
                     stale.unlink(missing_ok=True)
@@ -609,7 +677,8 @@ class HeaderRepairStore:
         except (RepairUnavailable, OSError, struct.error) as exc:
             LOGGER.info("mp4 header repair unavailable for asset %s: %s", asset_id, exc)
             with self._guard:
-                self._failed.add(name)
+                self._failed[name] = (failure_fields(exc) if isinstance(exc, UserFacingError)
+                                      else {'error': str(exc)})
             return False
         finally:
             with self._guard:

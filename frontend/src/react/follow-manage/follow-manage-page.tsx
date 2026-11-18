@@ -16,15 +16,12 @@
  * 行之间也只用分隔线，不各自套框；字号只取 BoardUI 排好的那几档 token。 */
 import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Tab, TabPanel, Tabs } from 'react-aria-components';
 
 import { resolveFollowSort } from '../../follow-sort';
 import type { FollowManageProps } from '../bundle';
-import { cardClass } from '../components/card';
 import { Note } from '../components/note';
 import { Page } from '../components/page';
-import { TagManager } from '../index/tag-manager';
-import { PillAriaTabList } from '../components/pill-aria-tab-list';
+import { SortableBoardTabs } from '../components/navigation-order';
 import { STAT_STRIP_SIX } from '../components/stat-card';
 import { ExternalLink } from '../settings/section';
 import { AddSource } from './add-source';
@@ -38,26 +35,14 @@ import {
   SORT_DEFAULT_DIR, type CredentialData, type FollowData, type Layout, type SortDir, type SortKey,
 } from './follow-manage';
 import { SourceList } from './source-list';
+import { MeasuredReading } from './measured-reading';
 import { FOLLOW_MANAGE_NAV as TABS } from './manage-route';
+import { t } from '../../i18n';
+import { enterPageSelection, usePageSelection } from '../components/page-selection';
 
 type TabKey = (typeof TABS)[number][0];
 
 const isTab = (value: unknown): value is TabKey => TABS.some(([key]) => key === value);
-
-/** 一格读数：一个名字、一个大数、一句它的量词。旧 `.fmanageoverview>div` 的填充卡。 */
-function Reading({ term, figure, unit }: { term: string; figure: number; unit: string }) {
-  return (
-    <div className={cardClass({ padding: 'none', className: 'flex flex-col gap-3 px-6 py-5 max-sm:gap-2 max-sm:p-4' })}>
-      <span className="text-body-medium text-text-secondary">{term}</span>
-      {/* 六位数起小一号字、七位数起再小一号，六卡并排时读数和单位仍在一行；更长时单位落到下一行，不顶出卡片。 */}
-      <b data-follow-reading="" className={`flex min-w-0 flex-wrap items-baseline gap-x-1 tabular-nums text-text-primary ${
-        figure >= 1000000 ? 'text-headline-medium' : figure >= 100000 ? 'text-title-3-medium' : 'text-title-1-medium'}`}>
-        <span className="min-w-0 wrap-anywhere">{figure.toLocaleString()}</span>
-        <small className="whitespace-nowrap text-body-2-regular text-text-secondary">{` ${unit}`}</small>
-      </b>
-    </div>
-  );
-}
 
 export function FollowManagePage(props: FollowManageProps) {
   const {
@@ -73,6 +58,9 @@ export function FollowManagePage(props: FollowManageProps) {
      它不进地址栏——那是这一刻手里的一批东西，不是这一页的身份。 */
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set<number>());
   const [feedSelected, setFeedSelected] = useState<ReadonlySet<number>>(new Set<number>());
+  /* 关注列表与订阅源的勾选接右上角多选开关：勾了就进入多选，点开关退出时两份都清空。 */
+  usePageSelection(() => { setSelected(new Set<number>()); setFeedSelected(new Set<number>()) });
+  useEffect(() => { if (selected.size || feedSelected.size) enterPageSelection() }, [selected, feedSelected]);
 
   const follow = useQuery({ queryKey: FOLLOW_MANAGE_KEY, queryFn: ({ signal }) => fetchFollow(signal) });
   const credentials = useQuery({
@@ -117,10 +105,10 @@ export function FollowManagePage(props: FollowManageProps) {
   return (
     <Page>
       {readOnly ? (
-        <Note tone="warning" title="本机只能浏览"
+        <Note tone="warning" title={t('follow:followManagePage.readOnly')}
           extra={writerUrl
             ? <p className="text-body-2-regular">
-                <ExternalLink href={writerUrl}>前往写入端管理关注</ExternalLink>
+                <ExternalLink href={writerUrl}>{t('follow:followManagePage.goToPrimary')}</ExternalLink>
               </p>
             : undefined}>
           {readOnlyMessage}
@@ -128,36 +116,29 @@ export function FollowManagePage(props: FollowManageProps) {
       ) : null}
 
       {/* 前四张是关注，后两张是 JAV 订阅源：订了几位、拉回来的新作还有几条没看。 */}
-      <div className={STAT_STRIP_SIX} aria-label="关注概览">
-        <Reading term="关注创作者" figure={groups.length} unit="位" />
-        <Reading term="启用来源" figure={enabled} unit={`/ ${sources.length}`} />
-        <Reading term="检查失败" figure={broken} unit="个来源" />
-        <Reading term="未看更新" figure={data.counts?.new || 0} unit="条" />
-        <Reading term="JAV 订阅" figure={subscribed} unit="位" />
-        <Reading term="未看新作" figure={feeds.data?.unread || 0} unit="条" />
+      <div className={STAT_STRIP_SIX} aria-label={t('follow:followManagePage.overview')}>
+        <MeasuredReading field="creators" figure={follow.data ? groups.length : undefined} failed={follow.isError} />
+        <MeasuredReading field="enabled" figure={follow.data ? enabled : undefined} total={sources.length} failed={follow.isError} />
+        <MeasuredReading field="failed" figure={follow.data ? broken : undefined} failed={follow.isError} />
+        <MeasuredReading field="updates" figure={follow.data ? data.counts?.new || 0 : undefined} failed={follow.isError} />
+        <MeasuredReading field="subscriptions" figure={feeds.data ? subscribed : undefined} failed={feeds.isError} />
+        <MeasuredReading field="releases" figure={feeds.data ? feeds.data.unread || 0 : undefined} failed={feeds.isError} />
       </div>
 
-      <Tabs selectedKey={tab} onSelectionChange={(key) => {
-        const next = String(key);
-        if (!isTab(next)) return;
-        setSelected(new Set());
-        setFeedSelected(new Set());
-        setTab(next);
-        go({ tab: next });
-      }} className="flex flex-col gap-6">
-        <PillAriaTabList aria-label="关注管理区域" data-section-nav data-section-items
-          className="flex max-w-full flex-nowrap overflow-x-auto">
-          {TABS.map(([key, name]) => (
-            <Tab key={key} id={key} data-pill-selected={tab === key ? '' : undefined} data-pill-variant="gray"
-              className="cursor-pointer whitespace-nowrap">{name}</Tab>
-          ))}
-        </PillAriaTabList>
+      <div className="flex flex-col gap-6">
+        <div data-section-nav>
+          <SortableBoardTabs group="follow" label={t('follow:followManagePage.sectionTabs')} value={tab} panelPrefix="follow" sectionItems
+            tabs={TABS.map(([value, label]) => ({ value, label }))} className=""
+            itemClassName="cursor-pointer whitespace-nowrap" onChange={next => {
+              setSelected(new Set()); setFeedSelected(new Set()); setTab(next); go({ tab: next });
+            }} />
+        </div>
 
-        <TabPanel id="list" className="flex flex-col gap-4">
+        {tab === 'list' ? <div role="tabpanel" id="follow-panel-list" aria-labelledby="follow-tab-list" className="flex flex-col gap-4">
           <FeedSources readOnly={readOnly} toast={toast}
             onAdd={() => { setTab('add'); go({ tab: 'add' }) }}
             selection={{ ids: feedSelected, onChange: setFeedSelected, onActivate: () => setSelected(new Set()) }} />
-          <SourceList data={data} sort={sort} dir={dir} page={page} layout={layout}
+          {follow.data ? <SourceList data={data} sort={sort} dir={dir} page={page} layout={layout}
             pageSize={pageSize} selected={selected} readOnly={readOnly} toast={toast}
             openFollow={openFollow}
             onAdd={() => { setTab('add'); go({ tab: 'add' }) }}
@@ -180,23 +161,22 @@ export function FollowManagePage(props: FollowManageProps) {
               setPage(1);
               savePreference({ pageSize: next });
               go({ page: 1 });
-            }} />
-        </TabPanel>
+            }} /> : follow.isError ? <Note tone="error">{t('follow:followManagePage.listFailed')}</Note>
+            : <div role="status" aria-label={t('follow:followManagePage.listLoading')} data-skeleton="" className="skeleton-sheen h-32 rounded-lg" />}
+        </div> : null}
 
-        <TabPanel id="add" className="flex flex-col gap-8">
-          <AddSource data={data} credentials={creds} readOnly={readOnly} toast={toast} />
+        {tab === 'add' ? <div role="tabpanel" id="follow-panel-add" aria-labelledby="follow-tab-add" className="flex flex-col gap-8">
+          {credentials.data && follow.data ? <AddSource data={data} credentials={creds} readOnly={readOnly} toast={toast} />
+            : credentials.isError || follow.isError ? <Note tone="error">{t('follow:followManagePage.credentialsFailed')}</Note>
+            : <div role="status" aria-label={t('follow:followManagePage.credentialsLoading')} data-skeleton="" className="skeleton-sheen h-32 rounded-lg" />}
           <AddFeed readOnly={readOnly} toast={toast}
             onAdded={() => { void feeds.refetch(); setTab('list'); go({ tab: 'list' }) }} />
-          <AliasManager groups={data.author_aliases || []} readOnly={readOnly} toast={toast}
-            suggestions={data.alias_suggestions || []} sources={data.sources} />
-        </TabPanel>
+          {follow.data ? <AliasManager groups={data.author_aliases || []} readOnly={readOnly} toast={toast}
+            suggestions={data.alias_suggestions || []} sources={data.sources} /> : null}
+        </div> : null}
 
-        <TabPanel id="tags" className="flex flex-col gap-4">
-          <TagManager scope="online" />
-        </TabPanel>
-
-      </Tabs>
-      <div><ButtonLink variant="secondary" href="/settings/subscriptions">来源与订阅设置{pending ? `（${pending}）` : ''}</ButtonLink></div>
+      </div>
+      <div><ButtonLink variant="secondary" href="/settings/subscriptions">{pending ? t('follow:followManagePage.feedSettingsPending', { count: pending }) : t('follow:followManagePage.feedSettings')}</ButtonLink></div>
     </Page>
   );
 }

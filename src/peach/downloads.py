@@ -26,18 +26,25 @@ import json
 import logging
 import re
 import sqlite3
+import stat
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
-from typing import Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .content_words import (CLOUD_BLOCKED, CLOUD_DUPLICATE_WORDS, CLOUD_INVALID_LINK_WORDS, CLOUD_QUOTA_WORDS,
+                            CLOUD_STORAGE_FULL, PROMO_NAME)
 from .follow_secrets import CredentialStore
 from .fsutil import atomic_write_text
 from .push_discovery import CloudPathError, CloudPrefix, map_cloud_path, normalise_prefix
-from .repository import LedgerDatabase
+from . import interface_text
+from .coded_text import Said, coded, columns, from_error, restored
+from .user_messages import UserFacingError, UserValueError, nested_message
+from .repository import LedgerDatabase, in_background
+from .task_retry import RETRY_DELAYS, retry_delay
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +60,8 @@ INGESTED = "ingested"
 FAILED = "failed"
 CANCELLED = "cancelled"
 STALLED = "stalled"
+#: 提交时网盘暂时没应答，磁力还没交出去；对账线程按退避再交，见 `SUBMIT_RETRY_WINDOW`。
+SUBMIT_PENDING = "submit_pending"
 
 POSTPROCESS_NOT_REQUESTED = "not_requested"
 POSTPROCESS_PENDING = "pending"
@@ -60,19 +69,21 @@ POSTPROCESS_QUEUED = "queued"
 POSTPROCESS_RUNNING = "running"
 POSTPROCESS_COMPLETE = "complete"
 POSTPROCESS_FAILED = "failed"
-POSTPROCESS_LABELS = {
-    POSTPROCESS_NOT_REQUESTED: "整理未开始", POSTPROCESS_PENDING: "等待整理",
-    POSTPROCESS_QUEUED: "整理已排队", POSTPROCESS_RUNNING: "整理中",
-    POSTPROCESS_COMPLETE: "整理完成", POSTPROCESS_FAILED: "整理失败",
-}
+POSTPROCESS_STATES = (POSTPROCESS_NOT_REQUESTED, POSTPROCESS_PENDING, POSTPROCESS_QUEUED, POSTPROCESS_RUNNING,
+                      POSTPROCESS_COMPLETE, POSTPROCESS_FAILED)
+STATES = (CANDIDATE, SELECTED, SUBMITTED, REMOTE_RUNNING, REMOTE_DONE, LANDED, INGESTED, FAILED, CANCELLED, STALLED,
+          SUBMIT_PENDING)
 
-STATE_LABELS = {
-    CANDIDATE: "待选择的资源", SELECTED: "已选定", SUBMITTED: "已提交", REMOTE_RUNNING: "网盘下载中",
-    REMOTE_DONE: "网盘下载完成", LANDED: "文件已可访问", INGESTED: "已入库",
-    FAILED: "失败", CANCELLED: "已取消", STALLED: "长时间未完成",
-}
-#: 轮询要看的状态。远端完成与已落地还在等账本里出现那个文件。
-TRACKED_STATES = frozenset({SUBMITTED, REMOTE_RUNNING, REMOTE_DONE, LANDED})
+
+def state_label(state: str) -> str:
+    """下载状态的名字，在 `server:download.state.<state>`（ADR-0159）；认不得的状态照原样。"""
+    return interface_text.label(f"server:download.state.{state}", state)
+
+
+def postprocess_label(state: str) -> str:
+    return interface_text.label(f"server:download.postprocess.{state}", state)
+#: 轮询要看的状态。远端完成与已落地还在等账本里出现那个文件；等待重新提交的还要再交一次。
+TRACKED_STATES = frozenset({SUBMIT_PENDING, SUBMITTED, REMOTE_RUNNING, REMOTE_DONE, LANDED})
 #: 可以再提交一次的状态。已入库的不必，在跑的接管就行。
 RESUBMITTABLE_STATES = frozenset({FAILED, CANCELLED, STALLED})
 
@@ -80,23 +91,31 @@ RESUBMITTABLE_STATES = frozenset({FAILED, CANCELLED, STALLED})
 @dataclass(frozen=True)
 class FailureKind:
     key: str
-    label: str
     retryable: bool = False
+
+    @property
+    def label(self) -> str:
+        """失败类别的名字，在 `server:download.failure.<key>`。"""
+        return interface_text.text(f"server:download.failure.{self.key}")
 
 
 FAILURE_KINDS: dict[str, FailureKind] = {kind.key: kind for kind in (
-    FailureKind("config", "配置或登录有误"),
-    FailureKind("quota", "下载额度已用完"),
-    FailureKind("rejected", "网盘拒绝下载该资源"),
-    FailureKind("invalid_link", "链接无效"),
-    FailureKind("no_source", "没有可用下载源或进度长时间未更新"),
-    FailureKind("not_accepted", "网盘没有收下任务"),
-    FailureKind("removed", "网盘任务被删除"),
-    FailureKind("duplicate", "下载任务已存在"),
-    FailureKind("not_landed", "目标目录中未找到下载文件"),
-    FailureKind("mismatch", "下载内容与目标作品不符"),
-    FailureKind("network", "网络暂时不可用", retryable=True),
+    FailureKind("config"), FailureKind("quota"), FailureKind("storage"), FailureKind("rejected"), FailureKind("invalid_link"),
+    FailureKind("no_source"), FailureKind("not_accepted"), FailureKind("removed"), FailureKind("duplicate"),
+    FailureKind("not_landed"), FailureKind("mismatch"), FailureKind("network", retryable=True),
 )}
+
+
+#: 渠道级失败：额度用完、网盘空间不足、配置或登录失效时，交给这个渠道的每一个任务都会同样失败。
+#: 网络故障本身按任务自动重提交；只有带 `channel_down` 的（CloudDrive2 根本连不上）才算渠道级。
+CHANNEL_FAILURES = frozenset({"quota", "storage", "config"})
+#: 网盘空间不足的说法。115 经 CloudDrive2 回 `190031 云空间不足`，有时走 gRPC 错误，有时写在 `errorMessage` 里；
+#: PikPak 的错误码是 `file_space_not_enough`。
+STORAGE_FULL = re.compile(CLOUD_STORAGE_FULL, re.IGNORECASE)
+
+
+def storage_full(text: object) -> bool:
+    return bool(STORAGE_FULL.search(str(text or "")))
 
 
 def never_seen(task: "DownloadTask") -> bool:
@@ -104,44 +123,84 @@ def never_seen(task: "DownloadTask") -> bool:
     return task.progress is None and not task.remote_id
 
 
-class DownloadError(RuntimeError):
-    """一次远端操作失败。`detail` 是给用户看的中文原因，不含凭据。
+class DownloadError(UserFacingError, RuntimeError):
+    """一次远端操作失败。`failure` 是故障类别；原因写成 code 与参数，不含凭据。
 
+    `detail` 是按 zh-CN 渲染的那一句（`Said`，带着 code），任务行的失败原因与设置页的检查报告照旧读它。
     `block` 只给 115 的违规拦截（`50038`）：这类失败不重试，同一 infohash 以后直接拒收。
+    `channel_down` 表示整个渠道连不上（服务没在运行、地址不通），不是一次超时。
     """
 
-    def __init__(self, failure: str, detail: str, *, block: bool = False):
+    def __init__(self, failure: str, code: str, params: Mapping[str, Any] | None = None, *,
+                 block: bool = False, channel_down: bool = False):
         if failure not in FAILURE_KINDS:
-            raise ValueError(f"未知的失败类别：{failure}")
-        super().__init__(detail)
+            raise ValueError(f"unknown failure kind: {failure}")
+        super().__init__(code, params)
         self.failure = failure
-        self.detail = detail
+        self.detail = from_error(self)
         self.block = block
+        self.channel_down = channel_down
+
+    @property
+    def channel_wide(self) -> bool:
+        """这次失败说明整个渠道暂时用不了，交给它的其他任务也会一样失败。"""
+        return self.failure in CHANNEL_FAILURES or self.channel_down
 
     @property
     def retryable(self) -> bool:
         return FAILURE_KINDS[self.failure].retryable
 
 
+class Problem(str):
+    """设置块与检查报告里的一条问题（ADR-0159）：值是按 zh-CN 渲染的原句，`code`、`params` 给页面取译文。
+
+    仍是 `str`：去重、比对与老前端读 `problems` 都照旧；`problem_codes` 把它们并行列给页面。
+    """
+
+    code: str
+    params: dict
+
+    def __new__(cls, code: str, params: Mapping[str, Any] | None = None) -> "Problem":
+        values = dict(params or {})
+        problem = super().__new__(cls, interface_text.text(f"server:{code}", values))
+        problem.code, problem.params = code, values
+        return problem
+
+    @classmethod
+    def of(cls, error: UserFacingError) -> "Problem":
+        return cls(error.code, error.params)
+
+
+def problem_codes(problems) -> list[dict]:
+    """与 `problems` 一一对应的 code 与参数；不带 code 的旧原句给空 code，页面照原文显示。"""
+    return [{"code": getattr(problem, "code", ""), "params": dict(getattr(problem, "params", {}))}
+            for problem in problems]
+
+
 #: 115 对违规内容的离线拦截码。CloudDrive2 把 115 的原文放进 `errorMessage`，
 #: 只认得出码或「违规」字样，所以两样都匹配。
-BLOCKED_PATTERN = re.compile(r"50038|违规|敏感")
+BLOCKED_PATTERN = re.compile(CLOUD_BLOCKED)
+#: 远端原话里的字样到失败类别，按顺序取第一个对上的。字样是网盘接口的原话（内容数据，在 `content_words`）。
+REMOTE_WORDS = tuple(
+    (re.compile("|".join(map(re.escape, words)), re.IGNORECASE), failure, code)
+    for words, failure, code in ((CLOUD_QUOTA_WORDS, "quota", "errors.downloads.remoteQuota"),
+                                 (CLOUD_DUPLICATE_WORDS, "duplicate", "errors.downloads.remoteDuplicate"),
+                                 (CLOUD_INVALID_LINK_WORDS, "invalid_link", "errors.downloads.remoteInvalidLink")))
 
 
 def classify_remote_message(message: str) -> DownloadError:
     """远端只给一句话时按字面归类。认不出的归「资源被拒」，原文照抄给用户。"""
-    text = str(message or "").strip() or "远端没有给出原因"
-    lowered = text.casefold()
+    text = str(message or "").strip()
+    if not text:
+        return DownloadError("rejected", "errors.downloads.remoteRejectedNoReason")
     if BLOCKED_PATTERN.search(text):
-        return DownloadError("rejected", f"115 拦截了这个资源（违规内容，50038），不会重试：{text}",
-                             block=True)
-    if any(word in lowered for word in ("配额", "quota", "次数", "上限", "limit")):
-        return DownloadError("quota", f"离线配额不够：{text}")
-    if any(word in lowered for word in ("已存在", "exist", "重复", "duplicate")):
-        return DownloadError("duplicate", f"远端已有同一个任务：{text}")
-    if any(word in lowered for word in ("链接", "无效", "invalid", "url", "格式")):
-        return DownloadError("invalid_link", f"远端不认这个链接：{text}")
-    return DownloadError("rejected", f"远端拒绝了这个任务：{text}")
+        return DownloadError("rejected", "errors.downloads.remoteBlocked", {"text": text}, block=True)
+    if storage_full(text):
+        return DownloadError("storage", "errors.downloads.remoteStorageFull")
+    for pattern, failure, code in REMOTE_WORDS:
+        if pattern.search(text):
+            return DownloadError(failure, code, {"text": text})
+    return DownloadError("rejected", "errors.downloads.remoteRejected", {"text": text})
 
 
 # ---------------------------------------------------------------- 磁力
@@ -168,7 +227,7 @@ def normalise_info_hash(raw: str) -> str:
             return base64.b32decode(text.upper()).hex()
         except binascii.Error:
             pass
-    raise ValueError("磁力链接里的 infohash 不是 40 位十六进制或 32 位 base32")
+    raise UserValueError("errors.downloads.infohashInvalid")
 
 
 _TRACKER = re.compile(r"^(?:udp|https?|wss?)://[A-Za-z0-9.\-]+(?::\d{1,5})?(?:/[!-~]*)?$")
@@ -202,7 +261,7 @@ def parse_magnet(raw: str) -> Magnet:
     """解析用户粘贴的磁力，或一个裸 infohash。只认 `urn:btih`，v2 的 `btmh` 不在幂等键口径内。"""
     text = str(raw or "").strip()
     if not text:
-        raise ValueError("请粘贴磁力链接")
+        raise UserValueError("errors.downloads.magnetRequired")
     if not text.casefold().startswith("magnet:"):
         info_hash = normalise_info_hash(text)
         return Magnet(info_hash, f"magnet:?xt=urn:btih:{info_hash}")
@@ -212,7 +271,7 @@ def parse_magnet(raw: str) -> Magnet:
             info_hash = normalise_info_hash(value[len("urn:btih:"):])
             name = (query.get("dn") or [""])[0].strip()
             return Magnet(info_hash, clean_magnet(text), name[:300])
-    raise ValueError("磁力链接里没有 urn:btih，Peach 只接受 BitTorrent 磁力")
+    raise UserValueError("errors.downloads.magnetNotBittorrent")
 
 
 def magnet_info_hash(uri: str) -> str:
@@ -236,6 +295,13 @@ class RemoteStatus:
     message: str = ""
     #: 提交时远端目录里已有同一 infohash 的任务，接过来跟踪，没有调提交接口。
     adopted: bool = False
+    #: 远端只报失败、没给原文时，渠道自己写的原因 code；有它就不再按 `message` 的字面归类。
+    message_code: str = ""
+
+    def failure(self) -> "DownloadError":
+        if self.message_code:
+            return DownloadError("rejected", self.message_code)
+        return classify_remote_message(self.message)
 
 
 RUNNING, DONE, ERROR, MISSING = "running", "done", "error", "missing"
@@ -273,6 +339,13 @@ def parse_iso(text: str | None) -> float | None:
 
 #: 提交后第一次看的间隔，之后按这张表退避，最后一档封顶。JavBoss 提交后 10 秒查一次。
 POLL_DELAYS = (10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0)
+#: 提交时网盘暂时没应答（如 CloudDrive2 刷新 115 离线列表超时），从第一次提交起按 `POLL_DELAYS`
+#: 再交，这么久还没交上才算失败。
+SUBMIT_RETRY_WINDOW = 3600.0
+#: 正在提交的任务这么久之内不归后台对账：一次提交要依次调好几个接口，每个最多等 30 秒。
+#: 新任务没有排下次检查时间时会被对账线程当作到期，读到「已提交」去查离线列表，再把这份旧状态
+#: 写回去，盖掉提交线程刚记下的「等待重新提交」，磁力从没交出去就被判成网盘没收下。
+SUBMIT_IN_FLIGHT = 600.0
 #: 远端完成后先等推送发现登记；过了这一段账本里还没有，才定向登记一次。
 LANDING_GRACE = 60.0
 #: 远端完成之后最多等这么久让文件出现在挂载目录、进入账本，超过算「落地未见」。
@@ -284,6 +357,18 @@ MISSING_GRACE = 180.0
 UNSEEN_GRACE = 900.0
 DEFAULT_WAIT_HOURS = 168
 MAX_WAIT_HOURS = 24 * 60
+#: 判成「长时间未完成」之后，远端任务多半还挂在网盘里，冷门种子过几天才凑齐源的也有。
+#: 之后每隔这么久再看一眼，远端完成就照常落地入库；最多再看这么久就彻底不管。
+#: 做法同 SakuraMedia `551715b321`：超时只是不再催，不等于远端不会完成。
+STALL_RECHECK = 6 * 3600.0
+STALL_RECHECK_HORIZON = 7 * 86400.0
+
+
+def _stall_cutoff(now: float) -> float:
+    """停滞早于这一刻的，下一次复查就会超出期限（`_recheck_stalled` 的同一条界线）。"""
+    return now - (STALL_RECHECK_HORIZON - STALL_RECHECK)
+
+
 #: 已落地的目录最多登记这么多个文件；种子里成千上万个小文件交给全量扫描。
 MAX_LANDED_FILES = 500
 
@@ -325,6 +410,20 @@ class DownloadTask:
     postprocess_detail: str | None = None
     postprocess_run_id: int | None = None
     postprocessed_at: str | None = None
+    postprocess_retries: int = 0
+
+    @property
+    def postprocess_label_code(self) -> tuple[str, dict]:
+        """整理状态显示名的 code 与参数：排了自动重试的说第几次，其余按状态取。"""
+        if self.postprocess_state == POSTPROCESS_PENDING and self.next_check_at:
+            return "labels.downloads.postprocessRetrying", {
+                "retries": self.postprocess_retries, "limit": len(RETRY_DELAYS)}
+        return f"download.postprocess.{self.postprocess_state}", {}
+
+    @property
+    def postprocess_label(self) -> str:
+        code, params = self.postprocess_label_code
+        return interface_text.label(f"server:{code}", self.postprocess_state, params)
 
     @property
     def location(self) -> str:
@@ -333,7 +432,11 @@ class DownloadTask:
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "DownloadTask":
-        return cls(**{name: row[name] for name in row.keys()})
+        values = {name: row[name] for name in row.keys()}
+        for name in _CODED_COLUMNS:
+            values[name] = restored(values.get(name), values.pop(f"{name}_code", None),
+                                    values.pop(f"{name}_params", None))
+        return cls(**values)
 
     def payload(self, asset: dict | None = None) -> dict:
         from .catalog_rules import jav_fallback_title, release_code_from_filename, same_release_code
@@ -359,18 +462,22 @@ class DownloadTask:
             "source_uri": self.source_uri, "display_name": self.display_name,
             "target": self.target, "code": self.code, "title": self.title, "origin": self.origin,
             "display_code": display_code, "display_title": display_title,
-            "state": self.state, "state_label": STATE_LABELS.get(self.state, self.state),
+            "state": self.state, "state_label": state_label(self.state),
             "failure": self.failure, "failure_label": kind.label if kind else None,
-            "failure_detail": self.failure_detail,
+            **coded("failure_detail", self.failure_detail),
             "progress": self.progress, "remote_name": self.remote_name,
             "ledger_path": self.ledger_path, "asset_id": self.asset_id,
             "submitted_at": self.submitted_at, "updated_at": self.updated_at,
             "finished_at": self.finished_at, "blocked": bool(self.blocked_at),
             "postprocess_state": self.postprocess_state,
-            "postprocess_label": POSTPROCESS_LABELS.get(self.postprocess_state, self.postprocess_state),
-            "postprocess_detail": self.postprocess_detail,
+            "postprocess_label": self.postprocess_label,
+            "postprocess_label_code": self.postprocess_label_code[0],
+            "postprocess_label_params": self.postprocess_label_code[1],
+            **coded("postprocess_detail", self.postprocess_detail),
             "postprocess_run_id": self.postprocess_run_id,
             "postprocessed_at": self.postprocessed_at,
+            "postprocess_retries": self.postprocess_retries,
+            "postprocess_retry_at": self.next_check_at if self.postprocess_state == POSTPROCESS_PENDING else None,
             "postprocess_active": self.postprocess_state in {
                 POSTPROCESS_PENDING, POSTPROCESS_QUEUED, POSTPROCESS_RUNNING},
             "postprocess_retryable": self.state == INGESTED and self.postprocess_state == POSTPROCESS_FAILED,
@@ -385,7 +492,20 @@ _TASK_COLUMNS = (
     "ledger_path", "asset_id", "checks", "submitted_at", "remote_done_at", "updated_at",
     "finished_at", "next_check_at", "blocked_at",
     "postprocess_state", "postprocess_detail", "postprocess_run_id", "postprocessed_at",
+    "postprocess_retries",
 )
+#: 只有一列原句的说明字段；旁边的 `<列>_code`、`<列>_params` 存 code 与参数（迁移 0056）。
+_CODED_COLUMNS = ("failure_detail", "postprocess_detail")
+
+
+def _task_values(task: "DownloadTask") -> tuple[tuple[str, ...], list]:
+    """任务行要写的列与值：`_TASK_COLUMNS`，再加每个说明字段的 code 与参数两列。"""
+    names = list(_TASK_COLUMNS)
+    values = [getattr(task, name) for name in _TASK_COLUMNS]
+    for name in _CODED_COLUMNS:
+        names += [f"{name}_code", f"{name}_params"]
+        values += columns(getattr(task, name))
+    return tuple(names), values
 
 
 class DownloadStore:
@@ -393,6 +513,15 @@ class DownloadStore:
 
     def __init__(self, database: LedgerDatabase):
         self.database = database
+        self._listeners: list = []
+
+    def on_save(self, callback) -> None:
+        """每次 `save` 写完后在写入线程里调用 `callback(task)`。
+
+        同进程里关心任务状态的一方（浏览器入库）靠它知道状态变了，不必定时去扫。
+        任务状态只经 `save` 改；后处理字段的写入不通知。
+        """
+        self._listeners.append(callback)
 
     def get(self, task_id: int) -> DownloadTask | None:
         with self.database.read_connection() as connection:
@@ -422,13 +551,17 @@ class DownloadStore:
                 (max(1, min(int(limit), 500)),)).fetchall()
         return [DownloadTask.from_row(row) for row in rows]
 
-    def page(self, limit: int, before_id: int | None = None) -> list[DownloadTask]:
+    def count(self) -> int:
+        with self.database.read_connection() as connection:
+            return connection.execute("SELECT count(*) FROM download_task").fetchone()[0]
+
+    def page(self, limit: int, before_id: int | None = None, *, offset: int = 0) -> list[DownloadTask]:
         """按提交顺序读取一页；状态更新时间不影响分页位置。"""
         where = " WHERE id<?" if before_id is not None else ""
         args = (before_id, limit) if before_id is not None else (limit,)
         with self.database.read_connection() as connection:
             rows = connection.execute(
-                f"SELECT * FROM download_task{where} ORDER BY id DESC LIMIT ?", args).fetchall()
+                f"SELECT * FROM download_task{where} ORDER BY id DESC LIMIT ? OFFSET ?", (*args, offset)).fetchall()
         return [DownloadTask.from_row(row) for row in rows]
 
     def display_assets(self, tasks: list[DownloadTask]) -> dict[int, dict]:
@@ -443,38 +576,52 @@ class DownloadStore:
         return {row["id"]: dict(row) for row in rows}
 
     def due(self, now: float) -> list[DownloadTask]:
+        # 停滞的任务排了复查时间才算到期；时间为空表示已经不再复查。例外是停滞还没满复查期限、
+        # 时间却为空的：那是有低频复查之前就判停滞的旧任务，当作到期，复查一次后照常排下一次。
         states = tuple(sorted(TRACKED_STATES))
         marks = ",".join("?" for _ in states)
         with self.database.read_connection() as connection:
             rows = connection.execute(
-                f"SELECT * FROM download_task WHERE state IN ({marks}) "
-                "AND (next_check_at IS NULL OR next_check_at<=?) ORDER BY next_check_at, id",
-                (*states, iso(now))).fetchall()
+                f"SELECT * FROM download_task WHERE (state IN ({marks}) "
+                "AND (next_check_at IS NULL OR next_check_at<=?)) "
+                "OR (state=? AND next_check_at IS NOT NULL AND next_check_at<=?) "
+                "OR (state=? AND next_check_at IS NULL AND finished_at>=?) "
+                "OR (state=? AND postprocess_state=? AND next_check_at<=?) ORDER BY next_check_at, id",
+                (*states, iso(now), STALLED, iso(now), STALLED, iso(_stall_cutoff(now)),
+                 INGESTED, POSTPROCESS_PENDING, iso(now))).fetchall()
         return [DownloadTask.from_row(row) for row in rows]
 
-    def next_due(self) -> float | None:
+    def next_due(self, now: float) -> float | None:
         states = tuple(sorted(TRACKED_STATES))
         marks = ",".join("?" for _ in states)
         with self.database.read_connection() as connection:
             row = connection.execute(
-                f"SELECT min(coalesce(next_check_at,'')) FROM download_task WHERE state IN ({marks})",
-                states).fetchone()
+                f"SELECT min(coalesce(next_check_at,'')) FROM download_task WHERE state IN ({marks}) "
+                "OR (state=? AND next_check_at IS NOT NULL) "
+                "OR (state=? AND next_check_at IS NULL AND finished_at>=?) "
+                "OR (state=? AND postprocess_state=? AND next_check_at IS NOT NULL)",
+                (*states, STALLED, STALLED, iso(_stall_cutoff(now)), INGESTED, POSTPROCESS_PENDING)).fetchone()
         if row is None or row[0] is None:
             return None
         return parse_iso(row[0]) or 0.0
 
     def save(self, task: DownloadTask) -> DownloadTask:
-        values = [getattr(task, name) for name in _TASK_COLUMNS]
+        names, values = _task_values(task)
         with self.database.write_transaction(notify=False) as connection:
             if task.id:
-                assignments = ",".join(f"{name}=?" for name in _TASK_COLUMNS)
+                assignments = ",".join(f"{name}=?" for name in names)
                 connection.execute(f"UPDATE download_task SET {assignments} WHERE id=?",
                                    (*values, task.id))
             else:
-                marks = ",".join("?" for _ in _TASK_COLUMNS)
+                marks = ",".join("?" for _ in names)
                 cursor = connection.execute(
-                    f"INSERT INTO download_task({','.join(_TASK_COLUMNS)}) VALUES({marks})", values)
+                    f"INSERT INTO download_task({','.join(names)}) VALUES({marks})", values)
                 task.id = int(cursor.lastrowid)
+        for listener in list(self._listeners):
+            try:
+                listener(task)
+            except Exception:
+                LOGGER.exception("download task listener failed: %s", task.id)
         return task
 
     def record_submission(self, *, task: DownloadTask, outcome: str, now: float,
@@ -482,16 +629,19 @@ class DownloadStore:
         with self.database.write_transaction(notify=False) as connection:
             connection.execute(
                 "INSERT INTO download_submission(task_id,info_hash,provider,source_uri,target,code,"
-                "origin,outcome,failure,detail,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "origin,outcome,failure,detail,detail_code,detail_params,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (task.id or None, task.info_hash, task.provider, task.source_uri, task.target,
-                 task.code, task.origin, outcome, failure, detail, iso(now)))
+                 task.code, task.origin, outcome, failure, detail, *columns(detail), iso(now)))
 
     def submissions(self, task_id: int) -> list[dict]:
         with self.database.read_connection() as connection:
             rows = connection.execute(
-                "SELECT outcome,failure,detail,provider,created_at FROM download_submission "
-                "WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
-        return [dict(row) for row in rows]
+                "SELECT outcome,failure,detail,detail_code,detail_params,provider,created_at "
+                "FROM download_submission WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
+        return [{"outcome": row["outcome"], "failure": row["failure"],
+                 **coded("detail", restored(row["detail"], row["detail_code"], row["detail_params"])),
+                 "provider": row["provider"], "created_at": row["created_at"]} for row in rows]
 
     def assets_under(self, location: str, ledger_path: str) -> list[dict]:
         """账本里这条路径或目录下的全部活动资产；路径按 Windows 口径不区分。"""
@@ -514,24 +664,26 @@ class DownloadStore:
         def rank(row):
             shown = row.get("code") or release_code_from_filename(row.get("name") or "")
             exact = bool(code and shown and same_release_code(code, shown))
-            promo = bool(re.search(r"(?i)(?:manko\.fun|广告|廣告|扫码|掃碼|最新地址)",
+            promo = bool(re.search(rf"(?i)(?:{PROMO_NAME})",
                                    str(row.get("name") or "")))
             duration = float(row.get("duration") or 0)
             pixels = int(row.get("width") or 0) * int(row.get("height") or 0)
             return (exact, not promo, duration, pixels, int(row.get("size") or 0), -int(row["id"]))
         return int(max(rows, key=rank)["id"])
 
-    def pending_postprocess(self) -> list[DownloadTask]:
+    def pending_postprocess(self, now: float | None = None) -> list[DownloadTask]:
         with self.database.read_connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM download_task WHERE state=? AND postprocess_state=? ORDER BY id",
-                (INGESTED, POSTPROCESS_PENDING)).fetchall()
+                "SELECT * FROM download_task WHERE state=? AND postprocess_state=? "
+                "AND (next_check_at IS NULL OR next_check_at<=?) ORDER BY id",
+                (INGESTED, POSTPROCESS_PENDING, iso(time.time() if now is None else now))).fetchall()
         return [DownloadTask.from_row(row) for row in rows]
 
     def postprocess(self, task_id: int, state: str, *, detail: str | None = None,
                     run_id: int | None = None, finished: str | None = None) -> None:
-        assignments = ["postprocess_state=?", "postprocess_detail=?"]
-        values: list[object] = [state, detail]
+        assignments = ["postprocess_state=?", "postprocess_detail=?", "postprocess_detail_code=?",
+                       "postprocess_detail_params=?", "next_check_at=NULL"]
+        values: list[object] = [state, detail, *columns(detail)]
         if run_id is not None:
             assignments.append("postprocess_run_id=?")
             values.append(run_id)
@@ -541,6 +693,25 @@ class DownloadStore:
         with self.database.write_transaction(notify=False) as connection:
             connection.execute(f"UPDATE download_task SET {','.join(assignments)} WHERE id=?",
                                (*values, int(task_id)))
+
+    def fail_postprocess(self, task_id: int, error: Exception, *, now: float | None = None) -> bool:
+        """在原任务上排下一次后处理；终止条件与错误都保留，不重交磁力。"""
+        task = self.get(task_id)
+        delay = retry_delay(error, task.postprocess_retries)
+        detail = from_error(error, f'{type(error).__name__}: {error}')
+        if delay is None:
+            if task.postprocess_retries >= len(RETRY_DELAYS):
+                detail = Said("labels.downloads.postprocessRetriesExhausted",
+                              retries=task.postprocess_retries, detail=detail)
+            self.postprocess(task_id, POSTPROCESS_FAILED, detail=detail)
+            return False
+        with self.database.write_transaction(notify=False) as connection:
+            connection.execute(
+                'UPDATE download_task SET postprocess_state=?,postprocess_detail=?,postprocess_detail_code=?,'
+                'postprocess_detail_params=?,postprocess_retries=?,next_check_at=? WHERE id=?',
+                (POSTPROCESS_PENDING, detail, *columns(detail), task.postprocess_retries + 1,
+                 iso((time.time() if now is None else now) + delay), task_id))
+        return True
 
 
 # ---------------------------------------------------------------- 设置
@@ -556,7 +727,7 @@ def normalise_target(raw: str) -> str:
     """网盘里的目标目录统一成 `/a/b`。CloudDrive2 与 PikPak 都是 POSIX 口径。"""
     text = normalise_prefix(raw)
     if text == "/" or any(part in {".", ".."} for part in text.split("/")):
-        raise ValueError("目标目录要写成网盘里的一个具体文件夹，不能是网盘根目录")
+        raise UserValueError("errors.downloads.targetIsRoot")
     return text
 
 
@@ -580,19 +751,19 @@ def clean_address(raw) -> str:
         return ""
     if "://" not in text:
         text = "http://" + text
-    message = "CloudDrive2 地址只写协议、主机和端口，例如 http://127.0.0.1:19798"
+    message = "errors.downloads.addressFormat"
     if len(text) > 2048 or "\\" in text or any(char.isspace() or ord(char) < 32 for char in text):
-        raise ValueError(message)
+        raise UserValueError(message)
     try:
         parts = urlsplit(text)
         port = parts.port
     except ValueError:
-        raise ValueError("CloudDrive2 地址的端口必须是 1–65535 的整数，IPv6 地址须放在方括号内") from None
+        raise UserValueError("errors.downloads.addressPortInvalidIpv6") from None
     if parts.scheme not in {"http", "https"} or not parts.hostname or parts.path not in {"", "/"} \
             or parts.query or parts.fragment or parts.username is not None or parts.password is not None:
-        raise ValueError(message)
+        raise UserValueError(message)
     if port == 0 or parts.netloc.endswith(":"):
-        raise ValueError("CloudDrive2 地址的端口必须是 1–65535 的整数")
+        raise UserValueError("errors.downloads.addressPortInvalid")
     return f"{parts.scheme}://{parts.netloc}"
 
 
@@ -608,15 +779,15 @@ class DownloadSettings:
         except FileNotFoundError:
             return DownloadConfig()
         except (OSError, ValueError):
-            LOGGER.warning("云下载设置读不出来，按默认值跑：%s", self.path)
-            return DownloadConfig(problems=("云下载设置无法读取，请检查设置文件或重新填写。",))
+            LOGGER.warning("Could not read cloud download settings, using defaults: %s", self.path)
+            return DownloadConfig(problems=(Problem("labels.downloads.settingsUnreadable"),))
         if not isinstance(payload, dict):
-            return DownloadConfig(problems=("云下载设置格式不符，请检查设置文件或重新填写。",))
+            return DownloadConfig(problems=(Problem("labels.downloads.settingsMalformed"),))
         try:
             return self._parse(payload, declared_roots=None, saved=True)
         except ValueError:
-            LOGGER.warning("云下载设置有不合法的值，按默认值跑：%s", self.path)
-            return DownloadConfig(problems=("云下载设置含有无效值，请检查目标目录和等待上限。",))
+            LOGGER.warning("Cloud download settings contain invalid values, using defaults: %s", self.path)
+            return DownloadConfig(problems=(Problem("labels.downloads.settingsInvalid"),))
 
     def _parse(self, body: dict, *, declared_roots, saved: bool = False) -> DownloadConfig:
         from .media_sources import SOURCE_REGISTRY
@@ -630,15 +801,17 @@ class DownloadSettings:
         if root and declared_roots is not None:
             known = {str(item).casefold(): str(item) for item in declared_roots.get("pikpak", ())}
             if root.casefold() not in known:
-                shown = "、".join(known.values()) or "（设置文件里没有 pikpak 来源）"
-                raise ValueError(f"{root} 不是已声明的 PikPak 媒体根；已知：{shown}")
+                if not known:
+                    raise UserValueError("errors.downloads.notPikpakRootNoneDeclared", {"root": root})
+                raise UserValueError("errors.downloads.notPikpakRoot",
+                                     {"root": root, "known": list(known.values())})
             root = known[root.casefold()]
         try:
             hours = int(body.get("wait_hours") or DEFAULT_WAIT_HOURS)
         except (TypeError, ValueError) as error:
-            raise ValueError("等待上限要写成小时数") from error
+            raise UserValueError("errors.downloads.waitHoursNotNumber") from error
         if not 1 <= hours <= MAX_WAIT_HOURS:
-            raise ValueError(f"等待上限在 1 到 {MAX_WAIT_HOURS} 小时之间")
+            raise UserValueError("errors.downloads.waitHoursOutOfRange", {"max": MAX_WAIT_HOURS})
         problems = ()
         try:
             address = clean_address(body.get("clouddrive_address"))
@@ -646,12 +819,12 @@ class DownloadSettings:
             if not saved:
                 raise
             address = str(body.get("clouddrive_address") or "").strip()
-            problems = (str(error),)
+            problems = (Problem.of(error) if isinstance(error, UserFacingError) else str(error),)
         return DownloadConfig(address, targets, root, hours, problems)
 
     def save(self, body: dict, declared_roots) -> DownloadConfig:
         if not isinstance(body, dict):
-            raise ValueError("设置必须是一个对象")
+            raise ValueError("settings must be an object")
         config = self._parse(body, declared_roots=declared_roots)
         atomic_write_text(self.path, json.dumps(config.payload(), ensure_ascii=False, indent=2) + "\n")
         return config
@@ -671,7 +844,7 @@ class SubmitResult:
 
 #: 提交结果的几种说法。`adopted` 是本机已有同一 infohash 的任务；`adopted_remote` 是远端
 #: 目录里已有同一个离线任务，接过来跟踪、没有调提交接口，也就没有扣配额。
-SUBMIT_OUTCOMES = ("submitted", "adopted", "adopted_remote", "refused", "failed")
+SUBMIT_OUTCOMES = ("submitted", "adopted", "adopted_remote", "deferred", "refused", "failed")
 
 
 class DownloadService:
@@ -698,6 +871,9 @@ class DownloadService:
         self.after_ingest = after_ingest
         self.channel_catalog = channel_catalog
         self.config = self.settings.load()
+        #: 按 provider 记最近一次渠道级失败（`CHANNEL_FAILURES`），这个渠道下一次提交成功时撤掉。
+        #: 只放在内存里：重启后第一次提交自然会再试一次。
+        self._channel_alerts: dict[str, dict] = {}
         self._submit_lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -709,16 +885,16 @@ class DownloadService:
                code: str | None = None, title: str | None = None,
                origin: str | None = None, dedupe_code: bool = False) -> SubmitResult:
         if not self.available:
-            raise ValueError("云下载只在允许修改数据库的设备上可用")
+            raise UserValueError("errors.downloads.writerOnly")
         magnet = parse_magnet(source)
         channels = self.channel_snapshot()["providers"]
         channel = next((row for row in channels if row["key"] == provider), None)
         if channel is None or (self.channel_catalog is not None and not channel["configured"]):
-            raise ValueError("请选择媒体库中可用的云下载渠道")
+            raise UserValueError("errors.downloads.channelUnavailable")
         folder = normalise_target(target or channel["target"])
         if provider.startswith("clouddrive:") and not (
                 folder == channel["target"] or folder.startswith(channel["target"].rstrip("/") + "/")):
-            raise ValueError("下载目标目录必须位于所选媒体库内")
+            raise UserValueError("errors.downloads.targetOutsideLibrary")
         with self._submit_lock:
             now = self.clock()
             if dedupe_code and code and (existing := self.store.active_by_code(code)) is not None:
@@ -736,19 +912,64 @@ class DownloadService:
             try:
                 status = self.providers(provider).submit(magnet, folder)
             except DownloadError as error:
+                self.note_channel(provider, error, now)
+                if not error.retryable:
+                    self._fail(task, error, now)
+                    self.store.record_submission(task=task, outcome="failed", now=now,
+                                                 failure=error.failure, detail=error.detail)
+                    return SubmitResult("failed", task)
+                task.state = SUBMIT_PENDING
+                self._reschedule(task, now, error.detail)
+                outcome = "deferred"
+                self.store.record_submission(task=task, outcome=outcome, now=now,
+                                             failure=error.failure, detail=error.detail)
+            else:
+                self.note_channel(provider, None, now)
+                self._accepted(task, status, now)
+                outcome = "adopted_remote" if status.adopted else "submitted"
+                self.store.record_submission(task=task, outcome=outcome, now=now)
+        self._wake.set()
+        return SubmitResult(outcome, task)
+
+    def _accepted(self, task: DownloadTask, status: RemoteStatus, now: float) -> None:
+        task.remote_id = status.remote_id or task.remote_id
+        task.remote_name = status.name or task.remote_name
+        task.state = SUBMITTED
+        task.checks = 0
+        task.failure_detail = None
+        task.next_check_at = iso(now + POLL_DELAYS[0])
+        self.store.save(task)
+
+    def _retry_submit(self, task: DownloadTask, now: float) -> None:
+        """再交一次提交时网盘没应答的磁力。远端收下后从这一刻起按新提交对账。"""
+        with self._submit_lock:
+            latest = self.store.get(task.id)
+            if latest is None or latest.state != SUBMIT_PENDING:
+                return  # 到期之后、拿到提交锁之前被取消或重新提交了。
+            task = latest
+            try:
+                status = self.providers(task.provider).submit(parse_magnet(task.source_uri), task.target)
+            except DownloadError as error:
+                self.note_channel(task.provider, error, now)
+                started = parse_iso(task.submitted_at) or now
+                if error.retryable and now - started < SUBMIT_RETRY_WINDOW:
+                    self._reschedule(task, now, error.detail)
+                    return
+                if error.retryable:
+                    error = DownloadError(error.failure, "errors.downloads.retriesExhausted",
+                                          {"detail": nested_message(error), "checks": task.checks})
                 self._fail(task, error, now)
                 self.store.record_submission(task=task, outcome="failed", now=now,
                                              failure=error.failure, detail=error.detail)
-                return SubmitResult("failed", task)
-            task.remote_id = status.remote_id or task.remote_id
-            task.remote_name = status.name or task.remote_name
-            task.state = SUBMITTED
-            task.next_check_at = iso(now + POLL_DELAYS[0])
-            self.store.save(task)
-            outcome = "adopted_remote" if status.adopted else "submitted"
-            self.store.record_submission(task=task, outcome=outcome, now=now)
-        self._wake.set()
-        return SubmitResult(outcome, task)
+                return
+            latest = self.store.get(task.id)
+            if latest is None or latest.state != SUBMIT_PENDING:
+                return  # 再交的这段时间里任务被取消了。
+            task.submitted_at = iso(now)
+            self.note_channel(task.provider, None, now)
+            self._accepted(task, status, now)
+            self.store.record_submission(task=task, outcome="adopted_remote" if status.adopted else "submitted",
+                                         now=now)
 
     def _fresh(self, task, magnet: Magnet, provider, folder, code, title, origin, now) -> DownloadTask:
         """新任务，或把失败／取消／停滞的那一行重置成一次新的提交。"""
@@ -759,7 +980,7 @@ class DownloadService:
             code=_short(code) or (task.code if task else None),
             title=_short(title) or (task.title if task else None),
             origin=_short(origin) or (task.origin if task else None),
-            submitted_at=iso(now), updated_at=iso(now))
+            submitted_at=iso(now), updated_at=iso(now), next_check_at=iso(now + SUBMIT_IN_FLIGHT))
         return self.store.save(fresh)
 
     def _fail(self, task: DownloadTask, error: DownloadError, now: float, *, state: str = FAILED) -> None:
@@ -768,7 +989,7 @@ class DownloadService:
         task.failure_detail = error.detail
         task.finished_at = iso(now)
         task.updated_at = iso(now)
-        task.next_check_at = None
+        task.next_check_at = iso(now + STALL_RECHECK) if state == STALLED else None
         if error.block:
             task.blocked_at = iso(now)
         self.store.save(task)
@@ -777,17 +998,17 @@ class DownloadService:
 
     def cancel(self, task_id: int) -> DownloadTask:
         if not self.available:
-            raise ValueError("云下载只在允许修改数据库的设备上可用")
+            raise UserValueError("errors.downloads.writerOnly")
         task = self.store.get(int(task_id))
         if task is None:
-            raise ValueError("没有这个下载任务")
+            raise UserValueError("errors.downloads.taskNotFound")
         if task.state not in TRACKED_STATES:
-            raise ValueError("这个任务已经结束，不能取消")
+            raise UserValueError("errors.downloads.taskFinished")
         if task.state in {SUBMITTED, REMOTE_RUNNING}:
             try:
                 self.providers(task.provider).cancel(task)
             except DownloadError as error:
-                raise ValueError(f"远端没有取消成功：{error.detail}") from error
+                raise UserValueError("errors.downloads.cancelFailed", {"detail": nested_message(error)}) from error
         now = self.clock()
         task.state = CANCELLED
         task.finished_at = iso(now)
@@ -796,9 +1017,11 @@ class DownloadService:
         self.store.save(task)
         return task
 
-    def snapshot(self, limit: int = 100, *, before_id: int | None = None) -> dict:
+    def snapshot(self, limit: int = 100, *, before_id: int | None = None, page: int = 1) -> dict:
         limit = max(1, min(int(limit), 500))
-        rows = self.store.page(limit + 1, before_id)
+        total = self.store.count()
+        page = min(page, max(1, (total + limit - 1) // limit))
+        rows = self.store.page(limit + 1, before_id, offset=(page - 1) * limit)
         tasks = rows[:limit]
         has_more = len(rows) > limit
         assets = self.store.display_assets(tasks)
@@ -815,8 +1038,30 @@ class DownloadService:
             **catalog,
             "tasks": payloads,
             "has_more": has_more,
+            "total": total,
+            "page": page,
             "next_before_id": tasks[-1].id if has_more else None,
+            "channel_alerts": [{**alert, "provider_label": labels.get(alert["provider"], alert["provider"])}
+                               for alert in self.channel_alerts()],
         }
+
+    def note_channel(self, provider: str, error: DownloadError | None, now: float) -> None:
+        """按一次提交的结果更新渠道告警：渠道级失败记下，提交成功撤掉，其他失败不动。"""
+        if error is None:
+            self._channel_alerts.pop(provider, None)
+        elif error.channel_wide:
+            self._channel_alerts[provider] = {
+                "provider": provider, "failure": "network" if error.channel_down else error.failure,
+                "message": error.detail, "message_code": error.code, "message_params": dict(error.params),
+                "since": iso(now)}
+
+    def channel_alert(self, provider: str) -> dict | None:
+        """这个渠道最近一次渠道级失败；之后成功提交过就是 None。"""
+        alert = self._channel_alerts.get(provider)
+        return dict(alert) if alert else None
+
+    def channel_alerts(self) -> list[dict]:
+        return [dict(alert) for alert in list(self._channel_alerts.values())]
 
     def channel_snapshot(self) -> dict:
         if self.channel_catalog is not None:
@@ -826,10 +1071,13 @@ class DownloadService:
     def retry_postprocess(self, task_id: int) -> DownloadTask:
         task = self.store.get(int(task_id))
         if task is None:
-            raise ValueError("没有这个下载任务")
+            raise UserValueError("errors.downloads.taskNotFound")
         if task.state != INGESTED or task.postprocess_state != POSTPROCESS_FAILED:
-            raise ValueError("这个任务没有失败的后处理可以重试")
-        self.store.postprocess(task.id, POSTPROCESS_PENDING, detail="等待重新处理")
+            raise UserValueError("errors.downloads.nothingToRetry")
+        task.postprocess_retries = 0
+        self.store.save(task)
+        self.store.postprocess(task.id, POSTPROCESS_PENDING,
+                               detail=Said("labels.downloads.postprocessRequeued"))
         task = self.store.get(task.id)
         self._dispatch_postprocess(task)
         return self.store.get(task.id)
@@ -848,11 +1096,11 @@ class DownloadService:
         if not self.available or self._thread is not None:
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="PeachDownloads", daemon=True)
+        self._thread = threading.Thread(target=in_background(self._loop), name="PeachDownloads", daemon=True)
         self._thread.start()
         if self.after_ingest is not None:
             try:
-                pending = self.store.pending_postprocess()
+                pending = self.store.pending_postprocess(self.clock())
             except sqlite3.Error:
                 # 未配置实例的 lifespan 也会装配服务；账本尚不存在时没有待恢复任务。
                 pending = []
@@ -874,10 +1122,10 @@ class DownloadService:
             self._wake.clear()
             try:
                 self.poll_once()
-                upcoming = self.store.next_due()
+                upcoming = self.store.next_due(self.clock())
             except Exception:
                 # 一轮里出什么错都不能让线程退出：退出之后所有任务都不再推进，界面上只是不动。
-                LOGGER.exception("云下载对账失败")
+                LOGGER.exception("Cloud download reconciliation failed")
                 upcoming = self.clock() + POLL_DELAYS[2]
             delay = POLL_DELAYS[-1] if upcoming is None else upcoming - self.clock()
             self._wake.wait(timeout=min(max(delay, 1.0), POLL_DELAYS[-1]))
@@ -889,12 +1137,22 @@ class DownloadService:
             try:
                 self.advance(task)
             except Exception:
-                LOGGER.exception("云下载任务 %s 对账失败", task.id)
-                self._reschedule(task, self.clock(), "对账时出现未预期的错误，稍后再试")
+                LOGGER.exception("Reconciliation failed for cloud download task %s", task.id)
+                self._reschedule(task, self.clock(),
+                                 Said("labels.downloads.reconcileUnexpected"))
         return len(due)
 
     def advance(self, task: DownloadTask) -> None:
         now = self.clock()
+        if task.state == INGESTED and task.postprocess_state == POSTPROCESS_PENDING:
+            self._dispatch_postprocess(task)
+            return
+        if task.state == STALLED:
+            self._recheck_stalled(task, now)
+            return
+        if task.state == SUBMIT_PENDING:
+            self._retry_submit(task, now)
+            return
         try:
             if task.state in {SUBMITTED, REMOTE_RUNNING}:
                 self._follow_remote(task, now)
@@ -908,8 +1166,30 @@ class DownloadService:
             return
         if task.state in {SUBMITTED, REMOTE_RUNNING} and self._overdue(task, now):
             self._fail(task, DownloadError(
-                "no_source", f"等了 {self.config.wait_hours} 小时远端还没完成，多半是没有人做种。"
-                "可以取消，或换一个磁力"), now, state=STALLED)
+                "no_source", "errors.downloads.noSeeders", {"hours": self.config.wait_hours}),
+                now, state=STALLED)
+
+    def _recheck_stalled(self, task: DownloadTask, now: float) -> None:
+        """停滞任务的低频复查：远端完成就回到落地流程，否则排下一次，超出期限就不再查。
+
+        这里不改失败原因与「长时间未完成」的状态：远端仍在跑、出错或不见了，都只是这次没等到。
+        """
+        try:
+            provider = self.providers(task.provider)
+            status = provider.status(task)
+            done = status.state == DONE or (status.state == MISSING and provider.landed(task))
+        except DownloadError:
+            done = False
+        if done:
+            task.finished_at = None
+            task.failure = None
+            self._remote_done(task, status, now)
+            return
+        stalled = parse_iso(task.finished_at) or now
+        task.next_check_at = (iso(now + STALL_RECHECK)
+                              if now + STALL_RECHECK - stalled <= STALL_RECHECK_HORIZON else None)
+        task.updated_at = iso(now)
+        self.store.save(task)
 
     def _overdue(self, task: DownloadTask, now: float) -> bool:
         started = parse_iso(task.submitted_at) or now
@@ -935,7 +1215,7 @@ class DownloadService:
             self._reschedule(task, now)
             return
         if status.state == ERROR:
-            raise classify_remote_message(status.message)
+            raise status.failure()
         if status.state == MISSING:
             if not provider.landed(task):
                 started = parse_iso(task.submitted_at) or now
@@ -946,8 +1226,11 @@ class DownloadService:
                     self._reschedule(task, now)
                     return
                 if unseen:
-                    raise DownloadError("not_accepted", "网盘没有收下这个任务：提交后离线列表里始终没有它，目标目录里也没有文件")
-                raise DownloadError("removed", "网盘里的这个任务不见了：离线列表里找不到它，目标目录里也没有文件")
+                    raise DownloadError("not_accepted", "errors.downloads.notAccepted")
+                raise DownloadError("removed", "errors.downloads.remoteRemoved")
+        self._remote_done(task, status, now)
+
+    def _remote_done(self, task: DownloadTask, status, now: float) -> None:
         task.remote_name = status.name or task.remote_name
         task.remote_id = status.remote_id or task.remote_id
         task.state = REMOTE_DONE
@@ -962,15 +1245,17 @@ class DownloadService:
     def _settle_landing(self, task: DownloadTask, now: float) -> None:
         mapped = self.landing.ledger_path(task, self.config)
         if mapped is None:
-            raise DownloadError(
-                "not_landed",
-                "目标目录对应不到媒体目录，请检查媒体库挂载和云端路径前缀关联")
+            raise DownloadError("not_landed", "errors.downloads.targetNotMapped")
         location, ledger_path = mapped
         task.ledger_path = ledger_path
         asset_id = self.store.asset_under(location, ledger_path, task.code)
         if asset_id is None and self.landing.ingest(location, ledger_path):
             task.state = LANDED
             asset_id = self.store.asset_under(location, ledger_path, task.code)
+        if asset_id is None and self.providers(task.provider).landed(task):
+            if self.landing.ingest(location, ledger_path):
+                task.state = LANDED
+                asset_id = self.store.asset_under(location, ledger_path, task.code)
         if asset_id is not None:
             task.state = INGESTED
             task.asset_id = asset_id
@@ -987,8 +1272,7 @@ class DownloadService:
             return
         done = parse_iso(task.remote_done_at) or now
         if now - done > LANDING_TIMEOUT:
-            raise DownloadError(
-                "not_landed", f"远端已完成，但挂载目录里一直没有出现 {ledger_path}")
+            raise DownloadError("not_landed", "errors.downloads.notLanded", {"path": ledger_path})
         task.updated_at = iso(now)
         task.next_check_at = iso(now + LANDING_GRACE)
         self.store.save(task)
@@ -999,9 +1283,9 @@ class DownloadService:
         try:
             self.after_ingest(task)
         except Exception as error:
-            LOGGER.exception("云下载任务 %s 后处理入队失败", task.id)
-            self.store.postprocess(task.id, POSTPROCESS_FAILED,
-                                   detail=f"{type(error).__name__}: {error}")
+            LOGGER.exception("Failed to queue post-processing for cloud download task %s", task.id)
+            if self.store.fail_postprocess(task.id, error, now=self.clock()):
+                self.wake()
 
     # -- 设置
 
@@ -1063,7 +1347,11 @@ class Landing:
 
     def ingest(self, location: str, ledger_path: str) -> bool:
         """定向登记。目录就逐个登记里面的文件；什么也没找到返回假。"""
-        from .scan import walk_root_for
+        from .discovery_rules import system_directory, system_path
+        from .push_discovery import ignored
+        from .scan import ScanRootUnreadable, _relative_directory, _walk, walk_root_for
+        if system_path(ledger_path):
+            return False
         parent = str(PureWindowsPath(ledger_path).parent)
         try:
             local_parent = walk_root_for(location, parent, declared_roots=self.declared_roots,
@@ -1071,21 +1359,28 @@ class Landing:
         except ValueError:
             return False
         local = local_parent / PureWindowsPath(ledger_path).name
+        # 判类型与列目录都交给可终止的读取子进程：对账线程不能卡在挂死的网盘挂载上，读超时按没找到算。
+        from . import media_io
         try:
-            if local.is_file():
+            mode = media_io.file_stat(local).st_mode
+            if stat.S_ISREG(mode):
                 return self.push_discovery.ingest_now(location, ledger_path)
-            if not local.is_dir():
+            if not stat.S_ISDIR(mode) or system_directory(local.name):
                 return False
             found = False
-            for index, item in enumerate(sorted(local.rglob("*"))):
-                if index >= MAX_LANDED_FILES:
-                    break
-                if item.is_file():
-                    relative = item.relative_to(local).parts
+            count = 0
+            for directory, entries in _walk(local, read_directory=media_io.directory_entries):
+                for item in entries:
+                    relative = (*_relative_directory(directory, local), item.name)
                     path = str(PureWindowsPath(ledger_path).joinpath(*relative))
+                    if ignored(path):
+                        continue
+                    if count >= MAX_LANDED_FILES:
+                        return found
                     found = self.push_discovery.ingest_now(location, path) or found
+                    count += 1
             return found
-        except OSError:
+        except (OSError, ScanRootUnreadable):
             return False
 
 

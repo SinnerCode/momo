@@ -4,26 +4,34 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import logging
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
-from . import __version__, remote_reporting
+from . import __version__, interface_text, remote_reporting
 from .fsutil import atomic_write_text
+from .user_messages import UserValueError
 
-SCHEMA = 4
+SCHEMA = 6
+CONSENT_SCHEMA = 5
 MAX_BYTES = 18 * 1024 * 1024
 MAX_RAW_BYTES = 100 * 1024 * 1024
 FILENAME = "peach-library-taste.json.gz"
-FIELDS = [
-    "去重后的作品编号，以及评分、喜欢、不喜欢、已看、稍后看、播放次数、观看比例与手动添加的标签",
-    "出演者、创作者、厂牌、系列、手动标签、年代与时长分组的收藏、喜欢、不喜欢、观看数量和评分分布（有编号作品与无编号条目分开），以及主动收藏的实体名称",
-    "馆藏文件数量、有编号作品数量与无编号条目数量",
-    "Peach 版本、字段版本与 UTC 自然周",
-]
-NOTICE = "匿名处理后上传馆藏与各类偏好明细。"
+#: 维护页「上传哪些字段」逐条说明的 code（ADR-0159）；文字在 `labels.librarySharing.field.<id>`。
+FIELD_CODES = (
+    "labels.librarySharing.field.works", "labels.librarySharing.field.preferences",
+    "labels.librarySharing.field.counts", "labels.librarySharing.field.capacity",
+    "labels.librarySharing.field.instance", "labels.librarySharing.field.participation",
+    "labels.librarySharing.field.version",
+)
+NOTICE_CODE = "labels.librarySharing.notice"
+
+
+def _text(code: str) -> str:
+    return interface_text.text(f"server:{code}")
 
 
 def _path(config):
@@ -52,21 +60,52 @@ def _used(value, period):
 
 def useful_payload(payload):
     """公共编号或任一偏好分组提供可分析内容。"""
-    return bool(payload["library"] or any(payload["preferences"].values()))
+    window = payload['capacity']['windows']['30d']
+    return bool(payload["library"] or any(payload["preferences"].values())
+                or window['observed_days'] or window['activity_observed_days'] or window['cleaned_bytes'] is not None)
+
+
+def valid_consent_version(value):
+    """同意范围版本独立于上传格式，兼容同一范围的历史记录。"""
+    version = value.get('consent_schema')
+    legacy = value.get('schema')
+    if 'consent_schema' not in value and type(legacy) is int and legacy in (5, 6):
+        version = 5
+    return type(version) is int and version == CONSENT_SCHEMA
 
 
 def consent(config):
+    from .research_participation import instance
     value = remote_reporting._read(_path(config))
-    return value if value.get("enabled") is True and value.get("schema") == SCHEMA else {}
+    return value if (value.get("enabled") is True and valid_consent_version(value)
+                     and instance(value.get('research_instance')) and instance(value.get('revision'))) else {}
+
+
+def consent_state(config):
+    value = remote_reporting._read(_path(config))
+    if value.get('enabled') is False:
+        return 'disabled'
+    if value.get('enabled') is True:
+        return 'enabled' if consent(config) else 'needs-consent'
+    return 'not-selected'
 
 
 def save_choice(config, enabled):
     """保存设置页或安装器的主动选择，不读取馆藏或初始化上传。"""
     if type(enabled) is not bool:
-        raise ValueError("馆藏与口味上传选项必须是布尔值")
-    value = {"enabled": enabled, "schema": SCHEMA, "revision": uuid.uuid4().hex,
+        raise UserValueError("errors.librarySharing.choiceNotBoolean")
+    value = {"enabled": enabled, "schema": SCHEMA, "consent_schema": CONSENT_SCHEMA, "revision": uuid.uuid4().hex,
              "selected_at": datetime.now(timezone.utc).isoformat()}
     with _state_lock(config):
+        previous = remote_reporting._read(_path(config))
+        granted = consent(config)
+        if enabled:
+            value['research_instance'] = uuid.uuid4().hex
+        elif previous.get('enabled') is False and valid_consent_version(previous):
+            value = previous
+        elif granted:
+            value['closing'] = {'research_instance': granted['research_instance'],
+                                'authorization': granted['revision'], 'event_id': uuid.uuid4().hex}
         atomic_write_text(_path(config), json.dumps(value))
         state = remote_reporting._read(_state_path(config))
         if state.get("status") == "queued":
@@ -85,25 +124,48 @@ def target():
 
 
 def snapshot(config):
+    from .research_participation import snapshot as participation_snapshot
     attempt = remote_reporting._read(config.directory("state") / "library-sharing-attempt.json")
-    if attempt.get("status") == "attempted":
-        attempt = {**attempt, "status": "unknown", "attempted": True}
-    return {"enabled": bool(consent(config)), "available": bool(target()),
-            "schema": SCHEMA, "fields": FIELDS, "notice": NOTICE,
-            "last_attempt": attempt if attempt.get("schema") == SCHEMA and attempt.get("period") == _period() else {}}
+    last_attempt = attempt_evidence(config)
+    if (attempt.get('status') == 'attempted' and attempt.get('schema') == SCHEMA
+            and attempt.get('period') == _period()):
+        last_attempt = {'period': attempt['period'], 'status': 'unknown', 'attempted': True}
+    return {"enabled": bool(consent(config)), 'consent_state': consent_state(config), "available": bool(target()),
+            "schema": SCHEMA, "fields": [_text(code) for code in FIELD_CODES], "field_codes": list(FIELD_CODES),
+            "notice": _text(NOTICE_CODE), "notice_code": NOTICE_CODE,
+            'participation': participation_snapshot(config),
+            'last_sent_at': attempt.get('last_sent_at'),
+            "last_attempt": last_attempt}
+
+
+def attempt_evidence(config):
+    """仅导出当前授权的快照回执字段，授权凭据留在本机。"""
+    current = consent(config)
+    value = remote_reporting._read(_state_path(config))
+    if (not current or value.get('revision') != current['revision'] or value.get('schema') != SCHEMA
+            or value.get('period') != _period()):
+        return {}
+    result = {key: value[key] for key in ('period', 'status', 'attempted', 'raw_bytes', 'compressed_bytes', 'reason')
+              if key in value}
+    result['snapshot_id'] = value.get('attempt_id')
+    if result.get('status') == 'queued' and result.get('attempted'):
+        result['status'] = 'unknown'
+    from .research_participation import valid_snapshot
+    return result if valid_snapshot(result) else {}
 
 
 def collect(contract):
     """在本机生成群体分析投影，不读取浏览历史或写入缓存。"""
     from .library_research import project
+    from .capacity_history import project as capacity_projection
     with contract.read_connection() as connection:
         connection.execute("BEGIN")
         projection = project(connection)
     payload = {"schema": SCHEMA, "peach": __version__, "period": datetime.now(timezone.utc).strftime("%G-W%V"),
-               **projection}
+               **projection, 'capacity': capacity_projection(getattr(contract, 'upgrade_config', None))}
     data = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
     if len(data) > MAX_RAW_BYTES:
-        raise ValueError("馆藏与口味明细超过 100 MiB，整份未发送")
+        raise UserValueError("errors.librarySharing.tooLarge")
     return payload, data
 
 
@@ -111,18 +173,19 @@ def compressed(data):
     """使用无文件名和时间戳的 gzip 附件，保持全部 JSON 字段。"""
     wire = gzip.compress(data, mtime=0)
     if len(wire) > MAX_BYTES:
-        raise ValueError("馆藏与口味明细压缩后超过 18 MiB，整份未发送")
+        raise UserValueError("errors.librarySharing.compressedTooLarge")
     return wire
 
 
 def valid_payload(payload):
     from .library_research import valid_projection
-    if (not isinstance(payload, dict) or set(payload) != {"schema", "peach", "period", "library", "preferences", "coverage"}
-            or payload["schema"] != SCHEMA or payload["peach"] != __version__
+    from .capacity_history import valid_projection as valid_capacity
+    if (not isinstance(payload, dict) or set(payload) != {"schema", "peach", "period", "library", "preferences", "coverage", "capacity"}
+            or type(payload["schema"]) is not int or payload["schema"] != SCHEMA or payload["peach"] != __version__
             or payload["period"] != datetime.now(timezone.utc).strftime("%G-W%V")
             or not isinstance(payload["library"], list) or not isinstance(payload["preferences"], dict)):
         return False
-    return valid_projection(payload)
+    return valid_projection(payload, controlled_tags=True) and valid_capacity(payload['capacity'])
 
 
 class Service:
@@ -133,6 +196,8 @@ class Service:
         self._thread = None
         self._preview = None
         self._lock = threading.RLock()
+        from .research_participation import Service as ParticipationService
+        self.participation = ParticipationService(config, target=target, stopping=self._stop)
 
     def preview(self):
         payload, data = collect(self.contract)
@@ -144,12 +209,12 @@ class Service:
 
     def save(self, body):
         if type(body.get("enabled")) is not bool:
-            raise ValueError("馆藏与口味上传选项必须是布尔值")
+            raise UserValueError("errors.librarySharing.choiceNotBoolean")
         with self._lock:
             if body["enabled"] and (not self._preview or body.get("preview_token") != self._preview[0]
                     or time.monotonic() > self._preview[1]
                     or body.get("consent") is not True or body.get("schema") != SCHEMA):
-                raise ValueError("请先查看字段与数据预览，再明确同意上传")
+                raise UserValueError("errors.librarySharing.previewFirst")
             save_choice(self.config, body["enabled"])
             self._preview = None
         self._wake.set()
@@ -184,6 +249,10 @@ class Service:
         metadata = remote_reporting.event_metadata("research")
         event.update(**metadata, message="Peach library and taste research", level="info")
         event["tags"].update(schema=str(SCHEMA), period=payload["period"])
+        event['tags']['research_instance'] = current['research_instance']
+        if attempt_id:
+            event['tags']['snapshot_id'] = attempt_id
+        event['tags'].update(raw_bytes=str(len(raw)), compressed_bytes=str(len(data)))
         for key in tuple(envelope.headers):
             if key not in {"event_id", "sent_at"}:
                 del envelope.headers[key]
@@ -217,6 +286,8 @@ class Service:
                 status = "failed"
             value = {key: value for key, value in state.items() if key not in {"reason", "status_code"}}
             value["status"] = status
+            if status == 'accepted':
+                value['last_sent_at'] = datetime.now(timezone.utc).isoformat()
             if type(result.get("status_code")) is int and 100 <= result["status_code"] <= 599:
                 value["status_code"] = result["status_code"]
             if result.get("reason") in {"network", "http_status", "rate_limit", "queue_full", "consent", "disabled", "unknown"}:
@@ -235,12 +306,16 @@ class Service:
                 return
         identity = {"schema": SCHEMA, "period": period, "revision": current["revision"], "attempt_id": uuid.uuid4().hex}
         value = {**identity, "attempted": False}
+        if previous.get('last_sent_at'):
+            value['last_sent_at'] = previous['last_sent_at']
         stage = "collection"
         try:
             payload, data = collect(self.contract)
+            value['raw_bytes'] = len(data)
             if useful_payload(payload):
                 stage = "compression"
                 data = compressed(data)
+                value['compressed_bytes'] = len(data)
                 value["status"] = "queued"
             else:
                 value["status"] = "waiting-data"
@@ -279,15 +354,48 @@ class Service:
         self._stop.clear()
         def run():
             while not self._stop.is_set():
+                self.sample_capacity()
                 try:
                     self.attempt()
                 except Exception:
                     # 分享失败不把数据或错误原文转交诊断通道。
                     pass
+                try:
+                    self.participation.attempt()
+                except Exception:
+                    # 每日联系携带本轮快照状态，失败与快照分别保留回执。
+                    pass
                 self._wake.wait(3600)
                 self._wake.clear()
         self._thread = threading.Thread(target=run, name="PeachLibrarySharing", daemon=True)
         self._thread.start()
+
+    def sample_capacity(self):
+        """研究日采样在分享后台运行，不让请求中的容量检查展开数据目录。"""
+        from . import storage_budget
+        current = consent(self.config)
+        if not current or self._stop.is_set() or not storage_budget._history_due(self.config):
+            return
+        next_check = 0.0
+        def active():
+            nonlocal next_check
+            if self._stop.is_set():
+                raise InterruptedError("research capacity sampling stopped")
+            now = time.monotonic()
+            if now >= next_check:
+                next_check = now + 2
+                if consent(self.config).get('revision') != current['revision']:
+                    raise InterruptedError("consent for research capacity sampling changed")
+        try:
+            data_bytes = storage_budget.data_usage(self.config, check=active)
+            cache = storage_budget.cache_usage(self.config, check=active)
+            if self._stop.is_set() or consent(self.config).get('revision') != current['revision']:
+                return
+            storage_budget.record_history(self.config, data_bytes=data_bytes, cache_bytes=cache['managed_cache_bytes'])
+        except InterruptedError:
+            return
+        except (OSError, ValueError) as error:
+            logging.getLogger(__name__).warning('Research capacity sample unavailable (%s)', type(error).__name__)
 
     def stop(self):
         self._stop.set()

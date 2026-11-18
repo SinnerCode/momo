@@ -261,8 +261,8 @@ body{background:var(--page)}
 /* Task entry cards and editing panels have different information density. */
 /* 管理区每一页的正文跟标题走同一条中线。标题由页头岛（`react/manage-header/`）钉在 1120 上，
    正文也得钉到同一个数：`.scraping-page` 和 `.ui-activitypage` 自己声明的 812 窄列比标题
-   每边窄 154px，读起来就是正文整块往右缩了一截。数据管理、活动页骨架与配置页的同一条在
-   frontend/src 的 management.css、board-skeleton.css 与 react/settings/configuration-page.css。 */
+   每边窄 154px，读起来就是正文整块往右缩了一截。数据管理与活动页骨架用 `max-w-board`，配置页的同一条在
+   frontend/src/react/settings/configuration-page.css。 */
 .scraping-page{width:100%;max-width:var(--board-content)}
 .cleanupfieldset{border:1px solid var(--line);border-radius:16px;box-shadow:0 1px 2px #00000003}
 .cleanupfieldset>.geist-fieldset-content{padding:20px 20px 16px;min-height:120px}
@@ -274,7 +274,7 @@ body{background:var(--page)}
    内边距 16，32px 的图标格里 20px 字形，标签 Body Medium 次文字色，读数 title-1-medium 24/34）。Peach 把整张卡做成
    按钮——它就是那一页的入口，读数下面那行 Caption 是同一份 payload 里的分项。五张在 1120 内一行摆下，窄了折两列、
    再折一列。上游的卡不可点也没有悬停；悬停抬主文字色 6% 底是 Peach 自己加的，告诉人这张卡按得下去。
-   骨架里那一排的网格、折行与卡头在 frontend/src/management.css 的 `.ui-cleanupstats`。 ── */
+   骨架里那一排与 React 共用 `react/components/stat-card.tsx` 的 `PLAIN_STAT_STRIP`。 ── */
 .board-plain-stat{display:flex;flex-direction:column;justify-content:space-between;gap:8px;min-width:0;min-height:132px;margin:0;padding:16px;border:0;border-radius:16px;background:var(--color-background-secondary-default);color:var(--color-text-primary);font:var(--board-body);text-align:left;cursor:pointer;transition:background-color .15s ease}
 .board-plain-stat:hover{background:color-mix(in srgb,var(--color-text-primary) 6%,var(--color-background-secondary-default))}
 .board-plain-stat:disabled{cursor:default}
@@ -298,7 +298,7 @@ body #stats [data-section-items]{gap:4px;border:0;overflow:visible}
 body #stats [data-section-items]>[aria-selected]{flex:none;min-height:var(--control-h);height:auto;padding:8px 12px;border:0;border-radius:var(--control-radius);background:none;box-shadow:none;text-align:left;font:var(--board-body-medium);color:var(--color-text-secondary)}
 body #stats [data-section-items]>[aria-selected]:hover{background:var(--color-background-primary-hover);color:var(--color-text-primary)}
 body #stats [data-section-items]>[aria-selected=true]{background:var(--color-background-tertiary-default);color:var(--color-text-primary)}
-body #stats :is([aria-label="配置分区"],[aria-labelledby="reviewcategories"])>[aria-selected=false]:hover{background:none;color:var(--color-text-primary)}
+body #stats :is([aria-label="配置分区"],[aria-label="复核分类"])>[aria-selected=false]:hover{background:none;color:var(--color-text-primary)}
 body #stats [data-section-items]>[aria-selected]:focus-visible{outline:2px solid var(--color-border-focus-ring);outline-offset:-2px}
 @media(max-width:900px){
  body #stats [data-section-items]{flex-direction:row;flex-wrap:nowrap;overflow-x:auto;overscroll-behavior-x:contain}
@@ -316,7 +316,6 @@ body #stats [data-section-items]>[aria-selected]:focus-visible{outline:2px solid
 .board-segments-ready>.board-segment-thumb{
   transition:width calc(var(--spring-pane-ms,200) * 1ms) ease,height calc(var(--spring-pane-ms,200) * 1ms) ease}
 @media(prefers-reduced-motion:reduce){.board-segments-ready>.board-segment-thumb{transition:none}}
-.followtask{border-color:var(--line);border-radius:16px}
 :root[data-theme="dark"]{--page:#111;--ground:#1c1c1c;--surface:#232323;--sunk:#171717;--ink:#fafafa;--ink-2:#d4d4d4;--muted:#a3a3a3;--line:#383838;--line-soft:#303030;--inset:#303030;--picked:#303030;--hover:rgba(255,255,255,.07);--tungsten:#60a5fa}
 /* 侧栏光晕由设置里的「侧栏光晕」一项决定开关：关掉时 --glow-strength 是 0，
    `.glowlayer::before` 的不透明度跟着算成 0。这里不能再压一条 display:none——那会让设置面板上的开关、强度、
@@ -428,7 +427,7 @@ body>.board-filter-frame{margin-inline:16px}
    带超调——徽标从零长到原大小，匀速收尾读成「被撑开的」，过一点再收住才读成「弹出来的」。
    缓动不同就不能借 `--motion-reveal`：那两档的缓动写在 token 里，动画里再写第二条
    缓动是无效声明，整条 `animation` 会被丢掉。 */
-:root{--motion-swap:.25s cubic-bezier(.4,0,.2,1);--motion-count:.25s cubic-bezier(.34,1.45,.64,1);--motion-reveal:.4s cubic-bezier(.4,0,.2,1);--motion-stagger:70ms;--motion-pop:.4s cubic-bezier(.34,1.36,.64,1)}
+:root{--motion-swap:.25s cubic-bezier(.4,0,.2,1);--motion-content:.15s cubic-bezier(.22,1,.36,1);--motion-count:.25s cubic-bezier(.34,1.45,.64,1);--motion-reveal:.4s cubic-bezier(.4,0,.2,1);--motion-stagger:70ms;--motion-pop:.4s cubic-bezier(.34,1.36,.64,1)}
 body{font-size:14px;line-height:20px}
 button,input,select,textarea{font-family:inherit}
 .index .ihead{padding:0;gap:12px;min-width:0;flex-wrap:wrap}
@@ -446,7 +445,7 @@ button,input,select,textarea{font-family:inherit}
   .index .ihead .geist-search{flex-basis:160px}
   .index .ihead .geist-search input,.geist-input{font-size:16px}
 }
-@media(prefers-reduced-motion:reduce){:root{--board-motion:0s;--board-dialog-motion:0s;--spring-pane-ms:0;--spring-press-ms:0;--motion-swap:0s;--motion-count:0s;--motion-reveal:0s;--motion-stagger:0ms;--motion-pop:0s}}
+@media(prefers-reduced-motion:reduce){:root{--board-motion:0s;--board-dialog-motion:0s;--spring-pane-ms:0;--spring-press-ms:0;--motion-swap:0s;--motion-content:0s;--motion-count:0s;--motion-reveal:0s;--motion-stagger:0ms;--motion-pop:0s}}
 /* Stat Cards 的内层读数与底栏；统计卡仍是可键盘切换的视图入口。 */
 .board-library-chevron{width:16px;height:16px;flex:none;fill:none;stroke:var(--muted);stroke-width:2}
 .board-library-menu{position:fixed;inset:auto;margin:0;box-sizing:border-box;width:265px;max-width:calc(100vw - 32px);padding:10px;border:1px solid var(--line);border-radius:16px;background:var(--ground);color:var(--ink);box-shadow:0 8px 24px light-dark(#0002,#0009);overflow-y:auto;scrollbar-width:none;transform-origin:top left}
@@ -610,30 +609,6 @@ body[data-density="dense"] .catalog-skeleton .skeletoncard{padding-top:7px}
 body[data-density="dense"] .postercard-skeleton .skeletoncard b{height:1.35em}
 body[data-density="dense"] .postercard-skeleton .skeletoncard em{height:1.35em}
 body[data-density="dense"] .postercard-skeleton .skeletoncard u{height:30px}
-body:is([data-surface="/junk-files"],[data-surface="/trash"]) .catalog-skeleton>div{grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr));gap:20px}
-body:is([data-surface="/junk-files"],[data-surface="/trash"]) .catalog-skeleton .skeletoncard{border:1px solid var(--line-soft);border-radius:var(--surface-radius);overflow:hidden;background:var(--ground);padding-bottom:20px}
-/* 回收站卡照 `media-card.css` 里回收站那几条排：面色同真卡，元信息区四周 10px 12px 12px，
-   头像列 38px 加左边距 12px，标题两行 2.7em、署名一行 20px，再预留标签和归入原因行。 */
-body[data-surface="/trash"] .catalog-skeleton .skeletoncard{grid-template-columns:50px minmax(0,1fr);gap:3px 10px;padding:0 0 12px;background:var(--color-background-primary-default)}
-body[data-surface="/trash"] .catalog-skeleton .skeletoncard s{grid-row:2/span 2;margin:9px 0 0 12px}
-body[data-surface="/trash"] .catalog-skeleton .skeletoncard b{width:auto;height:2.7em;margin:7px 12px 0 0}
-body[data-surface="/trash"] .catalog-skeleton .skeletoncard em{height:20px}
-body[data-surface="/trash"] .catalog-skeleton .skeletoncard u{display:block;position:relative;height:calc(1.45em + var(--tag-pad-y) * 2 + 2px + 23px);background:transparent}
-body[data-surface="/trash"] .catalog-skeleton .skeletoncard u::before,
-body[data-surface="/trash"] .catalog-skeleton .skeletoncard u::after{content:"";position:absolute;left:0;border-radius:var(--control-radius);background:var(--hover)}
-body[data-surface="/trash"] .catalog-skeleton .skeletoncard u::before{top:0;width:100%;height:calc(100% - 23px)}
-body[data-surface="/trash"] .catalog-skeleton .skeletoncard u::after{bottom:0;width:60%;height:20px}
-/* 垃圾卡照 `junk-queue.css` 排：面色同真卡，预览格贴边，元信息区四周 20px、文件名与事实两行各 20px、
-   行间 6px，键行是一条沉一档底色、顶上压一条发丝线的 61px 横条（12px 内边距夹一排 36px 的键）。 */
-body[data-surface="/junk-files"] .catalog-skeleton .skeletoncard{grid-template-columns:minmax(0,1fr);gap:0;padding:0;background:var(--color-background-primary-default)}
-body[data-surface="/junk-files"] .catalog-skeleton .skeletoncard s{display:none}
-body[data-surface="/junk-files"] .catalog-skeleton .skeletoncard :is(i,b,em,u){grid-column:1}
-body[data-surface="/junk-files"] .catalog-skeleton .skeletoncard b{width:62%;height:20px;margin:20px 20px 0}
-body[data-surface="/junk-files"] .catalog-skeleton .skeletoncard em{width:40%;height:20px;margin:6px 20px 20px}
-body[data-surface="/junk-files"] .catalog-skeleton .skeletoncard u{display:block;box-sizing:border-box;width:auto;height:61px;margin:0;border-radius:0;border-top:1px solid var(--line-soft);background:var(--color-background-secondary-default)}
-body[data-surface="/junk-files"] .catalog-skeleton .skeletoncard u::after{content:none}
-/* 手机上真卡的键升到 44px，键行跟着高 8px。 */
-@media(max-width:760px){body[data-surface="/junk-files"] .catalog-skeleton .skeletoncard u{height:69px}}
 .skeleton,.skeletoncard i,.skeletoncard b,.skeletoncard em,.skeletoncard s,.skeletoncard u{background:var(--color-background-tertiary-default);border-radius:8px}.skeletoncard i{border-radius:12px}.postercard-skeleton .skeletoncard{gap:6px 12px}.postercard-skeleton .skeletoncard s{border-radius:50%}.cleanup-skeleton .skeletoncard{border:0;border-radius:16px}.cleanup-skeleton .skeletoncard i,.review-skeleton .skeletoncard i{border-radius:8px}.index-skeleton .icell .ring{border-radius:50%}.entityskeletontext .skeleton{height:20px;border-radius:8px}.entityportrait.skeleton{border-radius:16px}.follow-content-skeleton .skeletoncard{padding-bottom:16px}
 
 /* Board secondary：实体细边框、轻阴影和统一的三档控件尺寸。
@@ -742,6 +717,8 @@ body .gselectmenu [role=option][aria-selected=true],body .popmenu [aria-checked=
 [data-split-button][data-variant=primary]{--split-seam:var(--color-accent-400);border:0;background:none;box-shadow:none}
 [data-split-button][data-variant=primary]>button:not(:disabled){background:var(--board-blue);color:#fff}
 [data-split-button][data-variant=primary]>button:not(:disabled,[aria-disabled=true]):active{background:var(--board-blue-active)}
+/* 只标 `aria-disabled` 的键（已有任务在跑，点了要说明原因）沿用忙碌键的淡出面，光标换成不可用。 */
+[data-split-button][data-variant=primary]>button[aria-disabled=true]:not([aria-busy=true]){cursor:not-allowed;opacity:.55;filter:saturate(.35)}
 [data-split-button][data-variant=primary]>button:last-child{width:36px;padding:8px}
 /* 骨架里等数据的键（`data-skeleton-action`，原生 `disabled`）不管哪一档都是同一副禁用面：
    `--surface` 底、一圈 `--border-15`、`--muted` 字，不靠 opacity。属性写两遍是为了压过
@@ -763,9 +740,8 @@ body [data-follow-status=seen],body [data-follow-status=ignored]{background:colo
    标准属性留在不经转换的共享样式表里，数值逐项对齐首页上下两块玻璃。 */
 body .peach-react :is([data-review-filter],[data-filter-glass]){backdrop-filter:var(--glass-optic,blur(22px)) saturate(160%) var(--glass-lume)}
 body .peach-react [data-selection-dock]{backdrop-filter:var(--glass-optic,blur(22px)) saturate(145%)}
-/* 浮层上提亮的那一小块不由滑动玻璃给的几处：动作键悬停（`GlassPill`），垃圾文件分类条上换视图那一枚
-   与首屏骨架里的当前分类（`junk-queue.css`）。提亮同 `[data-view-glide]`。 */
-body .peach-react :is([data-glass-pill]:hover:not([aria-busy]),:is([data-junk-view-link],[data-junk-count-skeleton] [data-junk-kind-link])[aria-current="page"]){backdrop-filter:var(--glass-pick)}
+/* 垃圾分类条的当前视图与首屏骨架分类使用 `[data-view-glide]` 的提亮。 */
+body .peach-react :is([data-junk-view-link],[data-junk-count-skeleton] [data-junk-kind-link])[aria-current="page"]{backdrop-filter:var(--glass-pick)}
 /* 设置面板左栏（`settings-panel.css`）与它那块滑动玻璃。高对比与减弱透明照全站玻璃一起退成实底；
    主题切换拍快照的那一帧不采样背后。 */
 body [data-settings-nav]{backdrop-filter:var(--glass-optic,blur(22px)) saturate(160%) var(--glass-lume)}
@@ -853,53 +829,6 @@ html.board-high-contrast :is(.card .badge,[data-glass-pane]){background:var(--gr
 :root[data-theme="dark"]{--color-border-checkbox-default:var(--color-neutral-600);--color-border-checkbox-hover:var(--color-neutral-500)}
 @media(prefers-color-scheme:dark){:root:not([data-theme]){--color-border-checkbox-default:var(--color-neutral-600);--color-border-checkbox-hover:var(--color-neutral-500)}}
 
-/* 安装后教程：BoardUI NotificationViewport 把教程固定在右下角，内部任务沿用 RareUI
-   Task List 的真实状态、完成项后移与打勾，不占当前页面正文的布局空间。
-   右下角还住着 Toast 栈和窄屏居中的批量选择条。教程贴着角落放，不为它们留白：层级
-   100 压在批量条（180）与 Toast（`--layer-popover`）之下，重叠时它们盖在教程上面。
-   Toast 几秒就消失，批量条只在选中时出现，为它们常年空出一截反倒让教程悬在半空。 */
-#postSetupTutorial{position:fixed;right:12px;bottom:12px;z-index:100;display:block;width:min(400px,calc(100vw - 24px));max-height:calc(100dvh - 24px);pointer-events:none}
-#postSetupTutorial[hidden]{display:none}
-.post-setup-notification{pointer-events:auto;display:flex;flex-direction:column;max-height:inherit;overflow:hidden;border:1px solid var(--color-border-button-default);border-radius:16px;background:var(--color-background-primary-default);box-shadow:var(--elevation-dropdown);animation:post-setup-notification-in .15s ease-out}
-.post-setup-notification-head{display:grid;grid-template-columns:40px minmax(0,1fr) 32px;align-items:center;gap:12px;padding:16px}
-.post-setup-notification-icon{display:grid;place-items:center;width:40px;height:40px;border-radius:50%;background:var(--color-notification-information-background);color:var(--color-notification-information-foreground)}
-.post-setup-notification-icon>svg,.post-setup-error>svg,.post-setup-loading>svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:2}
-.post-setup-notification h2{margin:0;color:var(--color-text-primary);font:var(--board-body-medium)}
-.post-setup-notification p{margin:4px 0 0;color:var(--color-text-secondary);font:var(--board-body-2-regular)}
-.post-setup-collapse{display:grid;place-items:center;width:32px;height:32px;margin:0 -4px 0 0;padding:0;border:0;border-radius:8px;background:transparent;color:var(--color-text-secondary)}
-.post-setup-collapse:hover{background:var(--color-background-primary-hover);color:var(--color-text-primary)}
-.post-setup-collapse>svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;transform:rotate(0deg);transition:transform var(--motion-swap)}
-.post-setup-collapse[aria-expanded=true]>svg{transform:rotate(180deg)}
-.post-setup-collapse-body{display:flex;flex-direction:column;min-height:0}
-.post-setup-collapse-body[hidden]{display:none}
-.post-setup-task-list{display:grid;gap:0;min-height:0;margin:0;padding:4px;border-block:1px solid var(--color-border-button-default);overflow-y:auto;list-style:none}
-.post-setup-task{position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center}
-.post-setup-task+.post-setup-task::before{content:"";position:absolute;inset:0 12px auto;height:1px;background:var(--color-border-button-default);pointer-events:none}
-.post-setup-task:has(>a:hover)::before,.post-setup-task:has(>a:hover)+.post-setup-task::before{opacity:0}
-.post-setup-task>a{position:relative;display:grid;grid-template-columns:24px minmax(0,1fr) 16px;align-items:center;gap:12px;min-width:0;min-height:62px;padding:10px 8px 10px 12px;border-radius:8px;color:var(--ink);text-decoration:none}
-.post-setup-task>a:hover{background:var(--hover)}
-.post-setup-task>a>svg{width:var(--icon-inline);height:var(--icon-inline);color:var(--color-text-secondary);fill:none;stroke:currentColor;stroke-width:2}
-.post-setup-task>a:hover>svg{color:var(--color-text-primary)}
-.post-setup-skip{position:relative;margin-right:8px;padding:6px 8px;border:0;border-radius:var(--control-radius);background:transparent;color:var(--color-text-secondary);font:var(--board-body-2-regular);transition:background-color .15s ease,color .15s ease}
-.post-setup-skip:hover{background:var(--color-background-primary-hover);color:var(--color-text-primary)}
-.post-setup-check{display:grid;place-items:center;width:24px;height:24px;border:1px solid var(--line);border-radius:50%;color:var(--muted)}
-.post-setup-check svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2}
-.post-setup-task b,.post-setup-task small{display:block}
-.post-setup-task b{font:var(--board-body-medium)}
-.post-setup-task small{margin-top:2px;color:var(--muted);font:var(--board-body-2-regular)}
-.post-setup-task[data-state=checked] .post-setup-check{border-color:var(--color-accent-500);background:var(--color-accent-500);color:#fff}
-.post-setup-task[data-state=checked] b{text-decoration:line-through;color:var(--muted)}
-.post-setup-task[data-state=checked]>a{opacity:.72}
-.post-setup-notification footer{flex:none;padding:12px}
-.post-setup-notification footer>.geist-button{width:100%}
-.post-setup-loading{display:flex;flex-direction:row;align-items:center;gap:10px;min-height:54px;padding:16px}
-.post-setup-loading p{margin:0}
-.post-setup-error{display:grid;grid-template-columns:20px minmax(0,1fr);gap:8px;padding:16px}
-.post-setup-error-actions{display:flex;gap:8px;margin-top:12px}
-@keyframes post-setup-notification-in{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:none}}
-@media(min-width:640px){#postSetupTutorial{right:24px;bottom:24px;max-height:calc(100dvh - 48px)}}
-@media(max-width:720px){.post-setup-task>a{min-height:58px;padding-left:10px}}
-@media(prefers-reduced-motion:reduce){.post-setup-notification{animation:none}.post-setup-task,.post-setup-task>a{transition:none}}
 /* ── Board 第三批：主按钮尺寸、配置页白底、通知与提醒、批量条、关注行图标 ── */
 /* 主按钮与旁边的 Board 按钮同一副盒子：36px、10px 圆角、Body Medium。 */
 body :is(.geist-button,.geist-fieldset-footer>a,.geist-fieldset-footer>button).primary{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:4px;height:36px;min-height:36px;padding:8px 12px;border-radius:10px;font:var(--board-body-medium);white-space:nowrap}

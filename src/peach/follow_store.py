@@ -4,7 +4,8 @@
 asset、标签或反馈。只有 `save_asset()` 会写出真相，而它要求显式 `confirm=True`，
 并且只 INSERT 一条 `location='online'` 的新 asset，绝不改写既有真相字段。
 
-原始响应按来源存进 `peach-data/sources/follow/`，一次写死；条件请求游标存在
+原始响应按来源存进 `peach-data/sources/follow/`，写下就不改；和上一份相同就不再写，
+每个来源只留最近几份和被条目引用的（`follow_evidence`）。条件请求游标存在
 `follow_source` 行上，因为它可替换、且要参与界面查询。
 """
 from __future__ import annotations
@@ -13,31 +14,52 @@ import hashlib
 import json
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import follow_providers
-from .follow import FollowSourceError, write_immutable
+from . import follow_evidence, follow_providers
+from .coded_text import Said, columns
+from .follow import FollowSourceError, internal_error, write_immutable
 from .follow_image_dims import positive_dims
 from .follow_sources import (
     Rule34VideoConnector, SourceFetch, canonical_source_ref,
     official_profile_handle, origin_group_key, profile_link_identity,
 )
 from .follow_variants import classify, group_duplicates, video_spec_markers
+from .user_messages import UserValueError
 
 
 def _now_text(moment: datetime | None = None) -> str:
     moment = moment or datetime.now(timezone.utc)
     if moment.tzinfo is None:
-        raise FollowSourceError("追更时间戳必须带时区")
+        raise internal_error("follow timestamps must be timezone-aware")
     return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _same_snapshot(raw: Path, fetch: SourceFetch, digest: str) -> bool:
+    """`raw` 那份快照的说明和这次抓取除时间外是否一致。说明读不了就当不一致，照常写新的。"""
+    try:
+        sidecar = json.loads(raw.with_suffix(".json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(sidecar, dict) and (
+        sidecar.get("sha256"), sidecar.get("provider"), sidecar.get("ref"),
+        sidecar.get("request_url"), sidecar.get("candidates"),
+    ) == (digest, fetch.provider, fetch.ref, fetch.request_url, len(fetch.candidates))
 
 
 #: 标签里跟在中点后面的服务名。`LazyProcrastinator · fanbox` 和 rule34video 上的
 #: `lazyprocrastinator` 是同一个人，中点后面那截只说明他在哪个平台连载。
 _LABEL_SERVICE_RE = re.compile(r"\s*[·|]\s*[A-Za-z0-9_\-]+\s*$")
-_AUTHOR_NOISE_RE = re.compile(r"[^0-9a-z一-鿿]+")
+#: 作者键只留数字、拉丁字母和汉字。别名表与来源记下的作者键都按它存，改了就对不上。
+_AUTHOR_NOISE_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+#: 上一条剥成空串的名字再按这条算：另留平假名与片假名（含长音 `ー` 和迭代符），
+#: 中点 `・`、单独的浊点之类仍是噪声。
+_AUTHOR_KANA_NOISE_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff\u3041-\u3096\u309d\u309e\u30a1-\u30fa\u30fc-\u30fe]+")
+#: 只由这些符号组成的键不是名字：长音 `ー` 与平假名、片假名的迭代符。
+_AUTHOR_MARKS = "\u30fc\u309d\u309e\u30fd\u30fe"
 _F95_TITLE_SUFFIX_RE = re.compile(r"\s+collections?\s*$", re.IGNORECASE)
 
 #: F95 线程标题里的每一个方括号段。站点的标题约定是
@@ -108,6 +130,7 @@ _OFFICIAL_IDENTITY_PROVIDERS = follow_providers.official_identity_providers()
 #: 资源的楼层各自成组；这条口径登记在 `follow_providers`，不在这里点名站点。
 _RELEASE_KEY_PER_POST = follow_providers.release_key_per_post()
 _SEQUENTIAL_UPLOADS = follow_providers.sequential_upload_providers()
+_SITE_WIDE_CHARACTERS = follow_providers.site_wide_character_providers()
 
 #: 完整候选（列表 + 详情都取到了）更新已有行时用的 SET 子句。
 _FULL_UPDATE = (
@@ -178,7 +201,7 @@ def _carry_image_dims(metadata: dict, previous_json: str | None) -> dict:
 #: published_at、group_hint 一概不动，metadata 用 `json_patch` 并进去而
 #: 不是整块替换——否则跳过第二阶段就等于把上一轮取到的细节抹掉，而抹掉之后
 #: 「详情本来就没有」和「这次没去问」在数据里长得一模一样。
-#: 时长只补空：rule34xxx 的时长读自原文件头，帖子页被限流挡回来时它照样取得到，
+#: 时长只补空：rule34xxx 的时长读自原文件头，上传时间被限流挡回来时它照样取得到，
 #: 这时候选仍是 partial，已有的时长不覆盖，空着的补上。
 _PARTIAL_UPDATE = (
     "  title=excluded.title, url=excluded.url, version=excluded.version,"
@@ -199,8 +222,8 @@ _ENRICHED_PREDICATES = {
     # kemono 系：详情页只用来判「这一帖交付了资源没有」，没有要补的列。判过保留的帖子
     # 才会落库，所以行在 ledger 里本身就是判定结果，库里有的帖子不必再探。
     "kept": "1",
-    # rule34xxx：分类只有帖子页给，时长只有原文件头给，两样都有才算补齐。只看分类的话，
-    # 时长功能上线前补过分类的行、文件头那次没读到的行，常规检查永远不会再问。
+    # rule34xxx：分类随 dapi 的 `tag_info` 到，时长只有原文件头给，两样都有才算补齐。
+    # 只看分类的话，时长功能上线前补过分类的行、文件头那次没读到的行，常规检查永远不会再问。
     "tag_types_duration": (
         "json_extract(metadata_json,'$.tag_types') IS NOT NULL"
         " AND (duration IS NOT NULL OR (lower(COALESCE(media_url,'')) NOT LIKE '%.mp4'"
@@ -213,19 +236,30 @@ _ENRICHED_PREDICATES = {
 def normalized_author_name(value: str, *, provider: str = "") -> str:
     """作者别名表的身份键。
 
-    去掉「· 服务名」后缀，再去掉大小写、空格、连字符这些不影响身份的噪声。
-    归一化只做到这一步，不做模糊匹配：把两个碰巧相似的名字并成一个人，比让用户
-    自己看到两行严重得多。
+    去掉「· 服务名」后缀，再去掉大小写、空格、连字符这些不影响身份的噪声，只留数字、
+    拉丁字母和汉字。这样剥成空串的名字（只含假名，或全角字母）再按 NFKC 规整一次，
+    连同平假名、片假名一起逐字保留，平假名和片假名不互折。归一化只做到这一步，不做
+    模糊匹配：把两个碰巧相似的名字并成一个人，比让用户自己看到两行严重得多。
 
-    这是**别名表的主键定义**，不是展示逻辑，所以它和别名读写放在同一层。
+    这是**别名表的主键定义**，不是展示逻辑，所以它和别名读写放在同一层。已存的别名键
+    和来源作者键都按第一步算，所以第一步算得出键的名字（包括假名混写）键一律不变。
     """
-    stripped = _LABEL_SERVICE_RE.sub("", str(value or "").strip())
+    key = _author_key(str(value or ""), provider, _AUTHOR_NOISE_RE)
+    if key:
+        return key
+    key = _author_key(unicodedata.normalize("NFKC", str(value or "")), provider,
+                      _AUTHOR_KANA_NOISE_RE)
+    return key if key.strip(_AUTHOR_MARKS) else ""
+
+
+def _author_key(value: str, provider: str, noise: re.Pattern) -> str:
+    stripped = _LABEL_SERVICE_RE.sub("", value.strip())
     if provider == "f95zone":
         # F95 的线程标题说的是一个容器而不是另一个作者：真实数据是
         # `Lazy Procrastinator Collection`，而每一条作者来源都是
         # `LazyProcrastinator`，留着这个通用后缀会凭空多出一个分组。
         stripped = f95_author_name(stripped) or stripped
-    return _AUTHOR_NOISE_RE.sub("", stripped.casefold())
+    return noise.sub("", stripped.casefold())
 
 
 def author_display_text(value: str, *, provider: str = "") -> str:
@@ -326,7 +360,7 @@ class FollowStore:
                  semantics: str = "work", entity_id: int | None = None,
                  metadata: dict | None = None, moment: datetime | None = None) -> int:
         if semantics not in ("work", "release"):
-            raise FollowSourceError("semantics 只能是 work 或 release")
+            raise internal_error("semantics must be work or release")
         ref = canonical_source_ref(provider, ref)
         stamp = _now_text(moment)
         payload = json.dumps(metadata or {}, ensure_ascii=False)
@@ -427,10 +461,12 @@ class FollowStore:
         if fetch.not_modified:
             connection.execute(
                 "UPDATE follow_source SET last_checked_at=?, last_status='not_modified',"
-                " last_error=NULL, updated_at=? WHERE id=?", (stamp, stamp, source_id))
+                " last_error=NULL, last_error_code=NULL, last_error_params=NULL, updated_at=?"
+                " WHERE id=?", (stamp, stamp, source_id))
             return RecordOutcome(source_id, not_modified=True)
 
-        evidence, evidence_error = self._persist_evidence(fetch, moment) if complete else (None, None)
+        evidence, evidence_error, fresh = (self._persist_evidence(fetch, moment) if complete
+                                           else (None, None, False))
         if complete:
             self._replace_candidate_profile_links(source_id, fetch, moment=moment, page=page)
         added = updated = 0
@@ -488,6 +524,16 @@ class FollowStore:
                 updated += 1
             else:
                 added += 1
+        if fresh:
+            # 新写了一份就在这个来源目录里删一份，抵消增长；条目都写完了再删，这一轮的新引用已算进去。
+            # 只删一份：这里在写事务里，升级前留下的存量等用户在「修复与迁移」里确认（`follow_evidence`）。
+            follow_evidence.prune(self._evidence_directory(fetch),
+                                  follow_evidence.referenced_names(connection, source_id), limit=1)
+        if fetch.provider in _SITE_WIDE_CHARACTERS:
+            self._promote_characters(fetch.provider, {
+                str(tag) for candidate in fetch.candidates if not candidate.partial
+                for tag, kind in (candidate.extra.get("tag_types") or {}).items()
+                if kind == "character"})
         if not complete:
             return RecordOutcome(source_id, len(fetch.candidates), added, updated)
         if page:
@@ -496,15 +542,52 @@ class FollowStore:
             # 站点回 304，新的更新从此再也进不来。只推进游标。
             connection.execute(
                 "UPDATE follow_source SET backfill_page=max(backfill_page,?),"
-                " last_checked_at=?, last_status='ok', last_error=NULL, updated_at=?"
-                " WHERE id=?", (page, stamp, stamp, source_id))
+                " last_checked_at=?, last_status='ok', last_error=NULL, last_error_code=NULL,"
+                " last_error_params=NULL, updated_at=? WHERE id=?", (page, stamp, stamp, source_id))
         else:
             connection.execute(
                 "UPDATE follow_source SET etag=?, last_modified=?, last_checked_at=?,"
-                " last_status='ok', last_error=NULL, updated_at=? WHERE id=?",
+                " last_status='ok', last_error=NULL, last_error_code=NULL, last_error_params=NULL,"
+                " updated_at=? WHERE id=?",
                 (fetch.etag, fetch.last_modified, stamp, stamp, source_id))
         return RecordOutcome(source_id, len(fetch.candidates), added, updated,
                              evidence_path=evidence, evidence_error=evidence_error)
+
+    def _promote_characters(self, provider: str, characters: set[str]) -> int:
+        """同站旧条目里记成 general 的同名标签改记 character，返回改了几行。
+
+        详情页探过的行不再重探，站方事后把标签改成角色时，只有新条目会记上。
+        这里只往 character 改、不往回改：一页没解析出角色分组时全是 general，
+        拿它去降级旧行，会把一次改版或一页残缺扩散到整站。跨来源也改：同一个角色
+        常出现在不同作者的作品里。
+        """
+        if not characters:
+            return 0
+        connection = self._connect()
+        rows = connection.execute(
+            "SELECT i.id, i.metadata_json FROM follow_item i"
+            " JOIN follow_source s ON s.id=i.source_id WHERE s.provider=?"
+            " AND json_extract(i.metadata_json,'$.tag_types') IS NOT NULL",
+            (provider,)).fetchall()
+        changed = 0
+        for item_id, raw in rows:
+            try:
+                metadata = json.loads(raw or "{}")
+            except ValueError:
+                continue
+            types = metadata.get("tag_types") if isinstance(metadata, dict) else None
+            if not isinstance(types, dict):
+                continue
+            promoted = {tag: "character" for tag in characters
+                        if types.get(tag) == "general"}
+            if not promoted:
+                continue
+            connection.execute(
+                "UPDATE follow_item SET metadata_json=? WHERE id=?",
+                (json.dumps({**metadata, "tag_types": {**types, **promoted}},
+                            ensure_ascii=False), item_id))
+            changed += 1
+        return changed
 
     def _replace_candidate_profile_links(
         self,
@@ -575,6 +658,16 @@ class FollowStore:
             links.append({"service": service, "handle": handle, "url": source})
         self.merge_source_metadata(source_id, {"official_links": links}, moment=moment)
 
+    def latest_item_stamps(self) -> list[tuple[int, str]]:
+        """每条来源最近一条条目的时间文本：发布时间，没有就用第一次见到的时间。
+
+        定时检查按它判来源活不活跃（`follow_check.check_interval`）。一条都没有的来源不在结果里。
+        """
+        return [(int(row[0]), str(row[1])) for row in self._connect().execute(
+            "SELECT source_id, max(COALESCE(NULLIF(published_at,''), first_seen_at))"
+            " FROM follow_item GROUP BY source_id HAVING max(COALESCE(NULLIF(published_at,''),"
+            " first_seen_at)) IS NOT NULL")]
+
     def enriched_external_ids(self, source_id: int, mark: str) -> frozenset[str]:
         """这条来源里细节已经补齐、不必再打详情页的条目 id。
 
@@ -585,7 +678,7 @@ class FollowStore:
         """
         predicate = _ENRICHED_PREDICATES.get(str(mark or ""))
         if predicate is None:
-            raise ValueError(f"未登记的补齐判据：{mark!r}")
+            raise ValueError(f"unregistered enrichment predicate: {mark!r}")
         rows = self._connect().execute(
             "SELECT external_id FROM follow_item WHERE source_id=?"
             f" AND {predicate}", (source_id,))
@@ -610,10 +703,12 @@ class FollowStore:
 
     def record_error(self, source_id: int, message: str,
                      moment: datetime | None = None, *, status: str = "error") -> None:
+        """记下这次失败；`message` 是 `Said` 时旁边一并存下 code 与参数，界面按当前语言显示。"""
         stamp = _now_text(moment)
         self._connect().execute(
             "UPDATE follow_source SET last_checked_at=?, last_status=?, last_error=?,"
-            " updated_at=? WHERE id=?", (stamp, status, message[:500], stamp, source_id))
+            " last_error_code=?, last_error_params=?, updated_at=? WHERE id=?",
+            (stamp, status, message[:500], *columns(message), stamp, source_id))
 
     def record_history_end(self, source_id: int,
                            moment: datetime | None = None) -> None:
@@ -621,11 +716,12 @@ class FollowStore:
         stamp = _now_text(moment)
         self._connect().execute(
             "UPDATE follow_source SET last_checked_at=?, last_status='not_modified',"
-            " last_error=NULL, updated_at=? WHERE id=?", (stamp, stamp, source_id))
+            " last_error=NULL, last_error_code=NULL, last_error_params=NULL, updated_at=?"
+            " WHERE id=?", (stamp, stamp, source_id))
 
     def _persist_evidence(self, fetch: SourceFetch,
-                          moment: datetime | None) -> tuple[str | None, str | None]:
-        """存原始响应。存不下来不算检查失败。
+                          moment: datetime | None) -> tuple[str | None, str | None, bool]:
+        """存原始响应，返回（相对路径，未取得的原因，是否新写了一份）。存不下来不算检查失败。
 
         Mac 上 `peach-data/sources` 是指向外置盘的符号链接，盘不在时它是一条**断链**——
         `mkdir(exist_ok=True)` 在断链上会抛 `FileExistsError`（链接在、目标不在），
@@ -633,13 +729,19 @@ class FollowStore:
         所以这里降级：候选照常入库，证据标成未取得，原因往上报。
 
         这和「脱盘模式」是同一条边界——脱的是盘不是账本，不该让整个功能挂掉。
+
+        最新一份的正文、请求地址和候选数都和这次相同时不再写，返回那一份：定时检查大多
+        抓回同一页，照写的话每个来源每天多几十份一模一样的快照。条目的 `evidence_path`
+        只记首次引用（`COALESCE`），返回旧路径不会改掉已有引用。
         """
         if self.sources_root is None or fetch.raw_body is None:
-            return None, None
+            return None, None, False
         reference = moment or datetime.now(timezone.utc)
         digest = hashlib.sha256(fetch.raw_body).hexdigest()
-        key = hashlib.sha256(f"{fetch.provider}\n{fetch.ref}".encode()).hexdigest()[:20]
-        directory = self.sources_root / fetch.provider / key
+        directory = self._evidence_directory(fetch)
+        latest = follow_evidence.latest_snapshot(directory)
+        if latest is not None and _same_snapshot(latest, fetch, digest):
+            return str(latest.relative_to(self.sources_root.parent)), None, False
         stamp = reference.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         sidecar = (json.dumps({
             "provider": fetch.provider, "ref": fetch.ref,
@@ -655,8 +757,14 @@ class FollowStore:
             write_immutable(path, fetch.raw_body)
             write_immutable(path.with_suffix(".json"), sidecar)
         except OSError as error:
-            return None, f"证据未取得（{self.sources_root} 不可写：{error.strerror or error}）"
-        return str(path.relative_to(self.sources_root.parent)), None
+            # 参数要能写进任务状态与检查点（JSON）：路径与异常都转成文字。
+            return None, Said("labels.followStore.evidenceUnwritable", path=str(self.sources_root),
+                              error=error.strerror or str(error)), False
+        return str(path.relative_to(self.sources_root.parent)), None, True
+
+    def _evidence_directory(self, fetch: SourceFetch) -> Path:
+        key = hashlib.sha256(f"{fetch.provider}\n{fetch.ref}".encode()).hexdigest()[:20]
+        return self.sources_root / fetch.provider / key
 
     # ---- 读取与分组 -----------------------------------------------------
 
@@ -782,9 +890,9 @@ class FollowStore:
 
     def set_status(self, item_id: int, status: str) -> None:
         if status not in ("new", "seen", "saved", "ignored"):
-            raise FollowSourceError(f"未知的追更状态：{status}")
+            raise internal_error(f"unknown follow status: {status}")
         if status == "saved":
-            raise FollowSourceError("`saved` 只能由 save_asset() 设置")
+            raise internal_error("`saved` can only be set by save_asset()")
         self._connect().execute(
             "UPDATE follow_item SET status=? WHERE id=?", (status, item_id))
 
@@ -799,7 +907,7 @@ class FollowStore:
             "SELECT hidden_media_json FROM follow_item WHERE id=?", (int(item_id),)
         ).fetchone()
         if row is None:
-            raise FollowSourceError(f"追更条目不存在：{item_id}")
+            raise FollowSourceError("errors.followStore.itemMissing", {"id": item_id})
         try:
             current = [key for key in json.loads(row[0] or "[]")
                        if isinstance(key, str) and key]
@@ -825,7 +933,7 @@ class FollowStore:
         """
         dims = positive_dims(width, height)
         if dims is None:
-            raise FollowSourceError(f"图片宽高必须是正整数：{width}×{height}")
+            raise internal_error(f"image dimensions must be positive integers: {width}x{height}")
         if media_index is None:
             prefix = "$"
             guard = ""
@@ -878,9 +986,9 @@ class FollowStore:
         canonical_key = normalized_author_name(canonical_name)
         alias_key = normalized_author_name(alias_name)
         if not canonical_key or not alias_key:
-            raise ValueError("规范创作者名和平台别名都不能为空")
+            raise UserValueError("errors.followStore.aliasNamesRequired")
         if canonical_key == alias_key:
-            raise ValueError("这两个名字归一化后相同，不需要维护别名")
+            raise UserValueError("errors.followStore.aliasSameAsName")
 
         connection = self._connect()
         stamp = _now_text(moment)
@@ -935,20 +1043,20 @@ class FollowStore:
         name = str(name).strip()
         next_key = normalized_author_name(name)
         if not next_key:
-            raise ValueError("统一名称不能为空")
+            raise UserValueError("errors.followStore.nameRequired")
         connection = self._connect()
         current = connection.execute(
             "SELECT canonical_name FROM follow_author_alias WHERE canonical_key=? LIMIT 1",
             (canonical_key,),
         ).fetchone()
         if current is None:
-            raise ValueError("这个创作者别名组不存在，请刷新列表")
+            raise UserValueError("errors.followStore.aliasGroupMissing")
         occupied = connection.execute(
             "SELECT canonical_key FROM follow_author_alias WHERE alias_key=? OR canonical_key=?",
             (next_key, next_key),
         ).fetchall()
         if any(str(row["canonical_key"]) != canonical_key for row in occupied):
-            raise ValueError("这个名称已属于另一位创作者，请先确认是否需要合并")
+            raise UserValueError("errors.followStore.nameTaken")
         stamp = _now_text()
         connection.execute(
             "UPDATE follow_author_alias SET canonical_key=?,canonical_name=?,updated_at=? "
@@ -966,16 +1074,16 @@ class FollowStore:
         """删掉一条别名。规范名本身不能当别名删掉，那会拆散整个组。"""
         alias_key = normalized_author_name(alias_name)
         if not alias_key:
-            raise ValueError("别名不能为空")
+            raise UserValueError("errors.followStore.aliasRequired")
         connection = self._connect()
         row = connection.execute(
             "SELECT canonical_key FROM follow_author_alias WHERE alias_key=?",
             (alias_key,),
         ).fetchone()
         if row is None:
-            raise ValueError("这个创作者别名不存在")
+            raise UserValueError("errors.followStore.aliasMissing")
         if str(row["canonical_key"]) == alias_key:
-            raise ValueError("规范名不能作为别名移除")
+            raise UserValueError("errors.followStore.canonicalNotRemovable")
         connection.execute(
             "DELETE FROM follow_author_alias WHERE alias_key=?", (alias_key,))
 
@@ -1069,17 +1177,17 @@ class FollowStore:
         不改写任何既有 asset 的真相字段，也不下载媒体。
         """
         if not confirm:
-            raise FollowSourceError("写 ledger 需要显式 confirm=True")
+            raise internal_error("writing the ledger requires explicit confirm=True")
         connection = self._connect()
         row = connection.execute(
             self._SELECT + " WHERE i.id=?", (item_id,)).fetchone()
         if row is None:
-            raise FollowSourceError(f"追更条目 {item_id} 不存在")
+            raise FollowSourceError("errors.followStore.itemNotFound", {"id": item_id})
         item = self._row(row)
         if item.asset_id:
             return item.asset_id
         if not item.url:
-            raise FollowSourceError("候选没有作品页 URL，无法作为在线作品保存")
+            raise FollowSourceError("errors.followStore.noWorkUrl")
         stamp = _now_text(moment)
         existing = connection.execute(
             "SELECT id FROM asset WHERE location='online' AND path=?", (item.url,)
@@ -1145,7 +1253,7 @@ class FollowStore:
         `ON DELETE CASCADE` 会留下认不出主人的孤儿行。
         """
         if not confirm:
-            raise FollowSourceError("删 ledger 行需要显式 confirm=True")
+            raise internal_error("deleting ledger rows requires explicit confirm=True")
         connection = self._connect()
         removed = 0
         for row in rows:

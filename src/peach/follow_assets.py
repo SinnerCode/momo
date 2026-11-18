@@ -18,6 +18,7 @@ import hashlib
 import math
 import os
 import time
+from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 from typing import Callable
 
@@ -113,6 +114,26 @@ def cache_path(root: Path, kind: str, key: str) -> Path:
     return root / kind / f"{digest}.img"
 
 
+def avatar_cache_key(*, provider='', ref='', service='', id='') -> str:
+    return f'mirror:{provider}:{ref}' if provider else f'official:{service}:{id}'
+
+
+def cached_avatar_urls(root: Path, urls) -> list[str]:
+    """固定本机头像代理地址中，已经有缓存的候选保持原顺序。"""
+    cached = []
+    for url in dict.fromkeys(filter(None, urls)):
+        params = {key: values[0] for key, values in parse_qs(urlsplit(url).query).items()}
+        if cache_path(root, 'avatars', avatar_cache_key(**params)).is_file():
+            cached.append(url)
+    return cached
+
+
+def prioritize_avatar_urls(root: Path, urls) -> list[str]:
+    urls = list(dict.fromkeys(filter(None, urls)))
+    cached = cached_avatar_urls(root, urls)
+    return cached + [url for url in urls if url not in cached]
+
+
 def is_fresh(path: Path, ttl: int | None, now: float | None = None) -> bool:
     """`ttl` 为 None 表示从不重取：文件在就算新鲜。"""
     try:
@@ -153,6 +174,21 @@ def fetch_image(client: httpx.Client, url: str) -> bytes | None:
     if response.status_code != 200 or not body or len(body) > MAX_BYTES:
         return None
     return body if sniff(body) else None
+
+
+def legible_icon(body: bytes | None) -> bytes | None:
+    """来源图标落盘前的最后一道：透明底纯白或纯黑字形换成外链圆标同款的圆底白字。
+
+    Iwara 只声明一枚透明底白字形，原样发给页面在浅色主题下看不见。其余图标原样保留。
+    """
+    if not body:
+        return body
+    from . import link_marks
+
+    image = link_marks.decode(body)
+    if image is None or not link_marks.bare_single_tone(image):
+        return body
+    return link_marks.glyph_mark(image) or body
 
 
 #: 圆标落盘时的长边。定这个数的不是圆标有多大，是圆标里那张脸能放大到多少：页面按

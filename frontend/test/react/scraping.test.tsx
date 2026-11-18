@@ -9,7 +9,9 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { queryClient } from '../../src/react/query';
 import { linkHost, networkOptions, ScrapingPage } from '../../src/react/scraping/scraping-page';
 import { prefetchScraping } from '../../src/react/scraping/scraping';
-import type { AmaneBridge, Check, CoverJob, Source } from '../../src/react/scraping/scraping';
+import type {
+  AmaneBridge, Check, CheckAllJob, CoverJob, ReportedCheck, Source,
+} from '../../src/react/scraping/scraping';
 
 import {
   buttonNamed, click, mount, mountRoot, section, settle, submit, type,
@@ -56,8 +58,8 @@ function serve(handlers: Record<string, (body: never) => Reply | Promise<Reply>>
   return { calls, fetcher };
 }
 
-/** 依次回这几份任务快照，最后一份之后一直回它。 */
-function coverStates(...states: CoverJob[]) {
+/** 依次回这几份任务快照，最后一份之后一直回它。抓封面与全部检查两种任务共用。 */
+function coverStates<T extends CoverJob | CheckAllJob>(...states: T[]) {
   let at = 0;
   return () => {
     const state = states[Math.min(at, states.length - 1)]!;
@@ -92,11 +94,18 @@ const BRIDGE: AmaneBridge = {
 const quiet = (overrides: Partial<Source> = {}) => ({
   'GET /api/scraping': () => ({ body: { sources: [source(overrides)] } }),
   'GET /api/scraping/cover': () => ({ body: { status: 'idle' } }),
+  'GET /api/scraping/check-all': () => ({ body: { status: 'idle' } }),
   'GET /api/scraping/amane-bridge': () => ({ body: BRIDGE }),
   'GET /api/custom-metadata': () => ({ body: { items: [] } }),
 });
-/** 首屏来源与任务数据的请求顺序，和 `prefetchScraping` 一致。 */
-const FIRST_SCREEN = ['/api/scraping', '/api/scraping/cover', '/api/scraping/amane-bridge', '/api/custom-metadata'];
+/** 首屏独立读取的来源与任务数据；各读取仅发一次。 */
+const FIRST_SCREEN = ['/api/scraping', '/api/scraping/cover', '/api/scraping/check-all',
+  '/api/scraping/amane-bridge', '/api/custom-metadata'];
+
+/** 全部检查里的一项结果：口径与中文名同 `source_preflight.OUTCOMES`。 */
+const reported = (outcome: ReportedCheck['outcome'], outcome_label: string, message = ''): ReportedCheck => ({
+  label: '来源页面', ok: outcome === 'ok', outcome, outcome_label, ...(message ? { message } : {}),
+});
 
 const password = (root: ParentNode) => root.querySelector<HTMLInputElement>('input[type=password]');
 const radio = (value: string) => document.querySelector<HTMLInputElement>(`input[type=radio][value="${value}"]`);
@@ -105,7 +114,7 @@ const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync
 
 it('首屏用 prefetch 缓存画出来源与任务，挂载时不重复请求', async () => {
   const { calls, host } = await open(quiet());
-  expect(calls.map((call) => call.path)).toEqual(FIRST_SCREEN);
+  expect(calls.map((call) => call.path).sort()).toEqual([...FIRST_SCREEN].sort());
   expect(section(host, 'JavBus')).not.toBeNull();
   expect(section(host, '高清封面')).not.toBeNull();
   const bridge = section(host, 'amane');
@@ -126,8 +135,8 @@ it('首屏用 prefetch 缓存画出来源与任务，挂载时不重复请求', 
 it('走本机浏览器的来源只说明验证怎么过，不画 Cookie 输入', async () => {
   const { host } = await open(quiet({ source: 'fc2ppvdb', label: 'FC2PPV-DB', browser: true }));
   const card = section(host, 'FC2PPV-DB');
-  expect(card?.textContent).toContain('人机验证由本机浏览器自动完成');
-  expect(card?.textContent).toContain('这台机器上不需要 Cookie');
+  expect(card?.textContent).toContain('运行 Peach 的电脑上的浏览器会自动完成人机验证');
+  expect(card?.textContent).toContain('不需要 Cookie');
   expect(password(host), '浏览器自己带 Cookie，这一格不该出现').toBeNull();
   expect(card?.textContent).not.toContain('任选一种方式提供 Cookie');
   expect(host.querySelector('[aria-haspopup=listbox]'), '连接方式仍由用户选，浏览器按它换出口').not.toBeNull();
@@ -186,8 +195,8 @@ it('保存失败时原因留在卡内，列表和刚填的内容都不动', asyn
 
 it('连接结果按来源名称与这一跳查的是什么说成一句话', async () => {
   const results: Check[] = [
-    { label: '来源页面', ok: true, width: 800, height: 538 },
-    { label: '高清图片 CDN', ok: false, status: 403, message: '需要登录' },
+    { target: 'page', label: '来源页面', ok: true, width: 800, height: 538 },
+    { target: 'cdn', label: '图片 CDN', ok: false, status: 403, message: '需要登录' },
   ];
   const { host } = await open({
     ...quiet(),
@@ -199,7 +208,25 @@ it('连接结果按来源名称与这一跳查的是什么说成一句话', asyn
   expect(host.querySelector('[role=status] [data-connection-tone="success"]')?.textContent).toBe('可访问');
   expect(host.querySelector('[role=status]')?.textContent).toContain('JavBus：可连接 · 800 × 538');
   expect(host.querySelector('[role=alert] [data-connection-tone="error"]')?.textContent).toBe('连接失败');
-  expect(host.querySelector('[role=alert]')?.textContent).toContain('JavBus 高清图片：不能连接。需要登录');
+  expect(host.querySelector('[role=alert]')?.textContent).toContain('JavBus 图片：不能连接。需要登录');
+});
+
+it('没有固定图片主机的来源，图片那一跳标未检查，不显示成连接失败', async () => {
+  const results: Check[] = [
+    { target: 'page', label: '来源页面', ok: true },
+    { target: 'cdn', label: '图片 CDN', ok: false, kind: 'unchecked', message: '这个来源没有固定的图片主机，图片这一跳未检查。' },
+  ];
+  const { host } = await open({
+    ...quiet(),
+    'POST /api/scraping/check': () => ({ body: { results } }),
+  });
+  await click(buttonNamed('检查连接', host));
+  await settle();
+
+  const unchecked = host.querySelector('[data-connection-tone="neutral"]');
+  expect(unchecked?.textContent).toBe('未检查');
+  expect(host.querySelector('[data-connection-tone="error"]')).toBeNull();
+  expect(host.textContent).toContain('JavBus 图片：未检查');
 });
 
 it('Cookie 二选一：切过去的那一种才交，另一种连输入都不留', async () => {
@@ -291,6 +318,66 @@ it('卸载之后不再敲后台：轮询跟着这棵根一起走', async () => {
   await mounted.unmount();
   await tick(60_000);
   expect(calls.length, '卸载之后还在轮询').toBe(asked);
+});
+
+it('全部检查按已检查来源数推进，跑完按口径成组列出问题、回执一次并重读来源', async () => {
+  vi.useFakeTimers();
+  const toast = vi.fn();
+  const done: CheckAllJob = {
+    status: 'complete', checked: 3, total: 3, failed: 1, elapsed_s: 4.2, completed_at: 1_793_790_000,
+    results: [
+      { source: 'javbus', label: 'JavBus', results: [reported('ok', '可连接')] },
+      { source: 'makers', label: '片商官网', results: [reported('skipped', '未检查', '片商官网按番号选择')] },
+      { source: 'javdb', label: 'JavDB', results: [reported('auth', '登录或人机验证', '来源返回人机验证页')] },
+    ],
+  };
+  const { calls } = serve({
+    ...quiet(),
+    'GET /api/scraping/check-all': coverStates(
+      { status: 'idle' },
+      { status: 'running', checked: 1, total: 3,
+        results: [{ source: 'javbus', label: 'JavBus', results: [reported('ok', '可连接')] }] },
+      done),
+    'POST /api/scraping/check-all': () => ({ body: { status: 'running', checked: 0, total: 3, results: [] } }),
+  });
+  await prefetchScraping(new AbortController().signal);
+  const host = await mount(page(toast));
+  const card = () => section(host, '连接检查')!;
+
+  await click(buttonNamed('全部检查', card()));
+  await settle();
+  expect(calls[FIRST_SCREEN.length]).toMatchObject({ path: '/api/scraping/check-all', method: 'POST' });
+  expect(card().textContent).toContain('已检查 1 / 3 个来源');
+  expect(card().querySelector('[role=progressbar]')?.getAttribute('aria-valuenow')).toBe('1');
+
+  await tick(2000);
+  expect(card().querySelector('[role=progressbar]')).toBeNull();
+  const problems = [...card().querySelectorAll('li')].map((row) => row.textContent);
+  expect(problems, '要人去登录的排在不在这里查的片商官网前面').toEqual([
+    expect.stringContaining('JavDB'), expect.stringContaining('片商官网'),
+  ]);
+  expect(problems[0]).toContain('来源返回人机验证页');
+  expect(card().textContent).toContain('可连接的 1 项');
+  expect(card().textContent).toContain('用时 4.2 秒');
+  expect(toast).toHaveBeenCalledTimes(1);
+  expect(toast).toHaveBeenCalledWith('检查完成，1 项未通过');
+  expect(calls.filter((call) => call.path === '/api/scraping' && call.method === 'GET'),
+    '冷却会变，跑完重读来源列表').toHaveLength(2);
+});
+
+it('离开页面再回来，全部检查的上一次结果仍在，但不发回执', async () => {
+  const { host, toast } = await open({
+    ...quiet(),
+    'GET /api/scraping/check-all': () => ({ body: {
+      status: 'complete', checked: 1, total: 1, failed: 1, completed_at: 1_793_790_000,
+      results: [{ source: 'javdb', label: 'JavDB', results: [reported('cooldown', '冷却', '来源正在冷却')] }],
+    } }),
+  });
+  const card = section(host, '连接检查')!;
+  expect(card.textContent).toContain('冷却');
+  expect(card.textContent).toContain('来源正在冷却');
+  expect(card.textContent).toContain('上次检查');
+  expect(toast).not.toHaveBeenCalled();
 });
 
 it('amane 桥：检查上游只填「上游最新版本」那一行，重建跟到终态并发一次回执', async () => {

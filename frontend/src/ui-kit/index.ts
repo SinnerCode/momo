@@ -7,17 +7,18 @@ export { closeAnchoredMenu, dismissMenu, presentMenu, scrollMovesAnchor, wireAnc
 export { selectFieldHtml, selectOptionIconHtml, wireSelectField } from './select-field';
 export { MEDIA_SOURCE_ICONS } from './media-source-icons';
 export {
-  badgeHtml, boardTabsHtml, checkboxHtml, collectionHeaderHtml, emptyStateHtml, gaugeHtml, LOAD_MORE_STATUS,
-  loadingDotsHtml, noteHtml, progressHtml, projectBannerHtml, searchInputHtml, spinnerHtml,
+  badgeHtml, boardTabsHtml, checkboxHtml, collectionHeaderHtml, emptyStateHtml, LOAD_MORE_STATUS, noteHtml,
+  searchInputHtml, spinnerHtml,
 } from './markup';
-export { dissolveValue, iconSwapHtml, popBadges, popCount, revealTexts, setIconSwap, swapText } from './motion';
+export { activityMotionHtml, activityStatusHtml, type ActivityKind, type ActivitySize } from './activity-motion';
+export { dissolveValue, iconSwapHtml, popBadges, popCount, revealTexts, rollPlaceholder, setIconSwap, swapText } from './motion';
 export {
   configurationSkeletonHtml, fillSkeletonTier, fitSkeleton, indexSkeletonHtml, revealSkeleton, SKELETON_REVEAL_DELAY,
   skeletonHtml,
 } from './skeleton';
 export { gateSweep, releaseSweep } from './sweep-gate';
 export {
-  cancelGlide, glideEase, moveGlidePane, rubberBand, scrollerHtml, stopAutoScroll, wireAutoScroll, wireHorizontalScroller,
+  afterGlide, cancelGlide, glideEase, moveGlidePane, rubberBand, scrollerHtml, stopAutoScroll, wireAutoScroll, wireHorizontalScroller,
   observeScrollRegions, wireOverlayScrollbars, wireScrollers,
 } from './scroll';
 export {
@@ -25,10 +26,4 @@ export {
   wireIconSwitch,
 } from './controls';
 export { confirmModal, formModal } from './modal';
-export {
-  isCurrentPostSetupTutorialRequest, nextPostSetupTutorialRequest, POST_SETUP_TUTORIAL_COLLAPSED_KEY,
-  POST_SETUP_TUTORIAL_KEY, POST_SETUP_TUTORIAL_SKIPPED_KEY, postSetupTutorialCollapsed, postSetupTutorialMarker,
-  postSetupTutorialErrorHtml, postSetupTutorialSignature, postSetupTutorialSkipped, resetPostSetupTutorialState,
-  setPostSetupTutorialCollapsed,
-  setPostSetupTutorialMarker, setPostSetupTutorialSkipped,
-} from '../onboarding/post-setup-tutorial';
+export { attachHoldToConfirm } from './hold-to-confirm';

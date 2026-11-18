@@ -40,6 +40,16 @@ it('无效的已保存地址保留在表单中，修正保存后清除配置提�
   expect(host.textContent).not.toContain('云下载配置需要检查');
 });
 
+it('设置块的问题带 code 时按 code 取当前语言的文字，没有 code 的照原文', async () => {
+  const host = await mount(<DownloadSettings initial={{
+    ...state(), problems: ['旧版服务端的原句', '只有原文的一句'],
+    problem_codes: [{ code: 'labels.downloadsChannels.clouddriveTokenUnreadable', params: {} }, { code: '', params: {} }],
+  } as DownloadSettingsState} receipt={vi.fn()} />);
+  expect(host.textContent).toContain('CloudDrive2 令牌无法读取，请重新填写。');
+  expect(host.textContent).not.toContain('旧版服务端的原句');
+  expect(host.textContent).toContain('只有原文的一句');
+});
+
 const unfilled = () => state({
   config: { clouddrive_address: 'http://127.0.0.1:19798', targets: {}, pikpak_root: '', wait_hours: 168 },
   pikpak_roots: ['A:\\'],
@@ -56,13 +66,13 @@ it('空检查报告不保留分隔区，只有错误时直接显示原因', asyn
   const form = section(host, '云下载')!;
   await click(buttonNamed('检查连接', host));
   await settle();
-  expect(form.querySelector('dl')).toBeNull();
+  expect(form.querySelectorAll('dl')).toHaveLength(0);
   expect(form.querySelectorAll('.border-t')).toHaveLength(1);
   fetcher.mockImplementation(async () => ({ ok: true, status: 200, json: async () => report({ problems: ['无法连接 CloudDrive2'] }) }));
   await click(buttonNamed('检查连接', host));
   await settle();
   expect(form.querySelector('[role="alert"]')?.textContent).toBe('无法连接 CloudDrive2');
-  expect(form.querySelector('dl')).toBeNull();
+  expect(form.querySelectorAll('dl')).toHaveLength(0);
 });
 
 it('未添加 PikPak 时隐藏账号和专属字段，并保留已有配置', async () => {
@@ -72,7 +82,8 @@ it('未添加 PikPak 时隐藏账号和专属字段，并保留已有配置', as
     logged_in: true, username: 'test-only-account', remember: true, method: 'browser',
   } });
   const host = await mount(<DownloadSettings initial={initial} receipt={vi.fn()} />);
-  expect(host.textContent).not.toContain('PikPak');
+  expect(section(host, 'PikPak')).toBeNull();
+  expect(field(host, '账号')).toBeNull();
   expect(field(host, '115 目标目录')).not.toBeNull();
   expect(initial.pikpak.logged_in).toBe(true);
   await submit(section(host, '云下载'));
@@ -84,8 +95,8 @@ it('光鸭媒体库不显示 115 与 PikPak 专属字段，本地媒体库不显
   vi.stubGlobal('fetch', fetchMock(200, state({ media_sources: ['guangya'] })));
   const cloud = await mount(<DownloadSettings initial={state({ media_sources: ['guangya'] })} receipt={vi.fn()} />);
   expect(field(cloud, 'CloudDrive2 地址')).not.toBeNull();
-  expect(cloud.textContent).not.toContain('115 目标目录');
-  expect(cloud.textContent).not.toContain('PikPak');
+  expect(field(cloud, '115 目标目录')).toBeNull();
+  expect(field(cloud, '账号')).toBeNull();
   const local = await mount(<DownloadSettings initial={state({ media_sources: ['local'] })} receipt={vi.fn()} />);
   expect(field(local, 'CloudDrive2 地址')).toBeNull();
   expect(local.textContent).not.toContain('PikPak');
@@ -127,7 +138,7 @@ it('检查报出缺的权限、目标目录与剩余配额，保存与账号密�
   await settle();
   expect(host.textContent).toContain('缺 取消离线任务');
   expect(host.textContent).toContain('/115/云下载 可以离线下载');
-  expect(host.textContent).toContain('本月还剩 1497 条，共 1500 条');
+  expect(host.textContent).toContain('本月还剩 1,497 条，共 1,500 条');
   expect(host.textContent).not.toContain('探测到');
 });
 
@@ -200,6 +211,20 @@ it('在账号框里填了 PikPak 账号或已登录时，检查才问 PikPak 根
   expect(sentBody(fetcher, 1)).toMatchObject({ pikpak_account: true });
 });
 
+it('PikPak 没登录、也没填账号时根目录变灰，填了账号或已登录就能选；目标目录始终可填', async () => {
+  vi.stubGlobal('fetch', fetchMock(200, report()));
+  const root = (host: HTMLElement) => host.querySelector<HTMLButtonElement>('button[aria-haspopup="listbox"][aria-label*="PikPak"]');
+  const disabled = (button: HTMLButtonElement | null) => !!button && (button.disabled || button.hasAttribute('data-disabled'));
+  const host = await mount(<DownloadSettings initial={state()} receipt={vi.fn()} />);
+  expect(disabled(root(host))).toBe(true);
+  expect(field(host, 'PikPak 目标目录')?.disabled).toBe(false);
+  await type(field(host, '账号'), 'me@example.com');
+  expect(disabled(root(host))).toBe(false);
+  const signedIn = await mount(<DownloadSettings receipt={vi.fn()}
+    initial={state({ pikpak: { logged_in: true, username: 'me@example.com', remember: false, method: 'password' } })} />);
+  expect(disabled(root(signedIn))).toBe(false);
+});
+
 it('推出的目录不存在时标成无效，点了「新建这个目录」才去建，建好后解除', async () => {
   const fetcher = fetchMock(200, report({ suggested_target: { path: '/115open/云下载', exists: false } }));
   vi.stubGlobal('fetch', fetcher);
@@ -252,7 +277,7 @@ it('地址和令牌都已保存时一打开就按已保存的配置检查，检�
   await settle();
   expect(host.textContent).not.toContain('正在检查 CloudDrive2');
   expect(host.textContent).toContain('/115/云下载 可以离线下载');
-  expect(host.textContent).toContain('本月还剩 1497 条，共 1500 条');
+  expect(host.textContent).toContain('本月还剩 1,497 条，共 1,500 条');
 });
 
 it('没有保存令牌或地址时打开不检查', async () => {
@@ -288,7 +313,7 @@ it('目标目录留空保存后直接渲染响应里的检查报告，服务端�
   expect(host.textContent).toContain('已根据媒体库目录填入 /115open/云下载');
   expect(host.textContent).not.toContain('/115open/云下载，保存配置后生效');
   expect(host.textContent).toContain('/115open/云下载 可以离线下载');
-  expect(host.textContent).toContain('本月还剩 1497 条，共 1500 条');
+  expect(host.textContent).toContain('本月还剩 1,497 条，共 1,500 条');
 });
 
 it('保存时推出的目录不存在，照常保存其他字段，目录填回表单标成无效并给出新建键', async () => {
@@ -386,7 +411,7 @@ const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync
 
 it('账号密码表单直接显示，两种登录方式共用底栏', async () => {
   const host = await mount(<DownloadSettings initial={state()} receipt={vi.fn()} />);
-  expect(host.querySelector('details')).toBeNull();
+  expect(field(host, '账号')?.closest('details')).toBeNull();
   expect(field(host, '账号')).not.toBeNull();
   expect(buttonNamed('登录', host)?.parentElement).toBe(buttonNamed('用浏览器登录', host)?.parentElement);
   expect(buttonNamed('用浏览器登录', host)?.type).toBe('button');
@@ -397,7 +422,7 @@ it('这台电脑没有浏览器时只剩账号密码登录，直接摊开', asyn
   const host = await mount(<DownloadSettings receipt={vi.fn()}
     initial={state({ pikpak_browser: { available: false, state: 'idle', message: '' } })} />);
   expect(buttonNamed('用浏览器登录', host)).toBeNull();
-  expect(host.querySelector('details')).toBeNull();
+  expect(field(host, '账号')?.closest('details')).toBeNull();
   expect(field(host, '账号')).not.toBeNull();
   expect(buttonNamed('登录', host)?.className).toContain('bg-button-primary');
 });

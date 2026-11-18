@@ -13,10 +13,12 @@ import { fmtSize } from '@peach/legacy/core';
 
 import { EvilRadialChart } from '@/registry/charts/recharts-radial-chart';
 
+import { type CountUnit } from '../charts/bar-card';
 import { CHART_CARD, ChartEmpty, sliceConfig, sliceKey } from '../charts/chart-card';
 import { ChartTip } from '../charts/chart-tip';
 import { SourceMark } from '../settings/section';
 import { radialArc, radialBarSize, radialCeiling, radialSlices, type RadialSlice } from './stats';
+import { t } from '../../i18n';
 
 /** 六档图表色循环。类名写成整串，Tailwind 扫得到。 */
 const TILE_SWATCH = [
@@ -35,7 +37,7 @@ const TILE_PINNED = [
 ];
 
 export function RadialCard(
-  { title, rows, empty, unit = '个视频' }: { title: string; rows: RadialSlice[]; empty: string; unit?: string },
+  { title, rows, empty, unit = (count) => t('manage:radialCard.videoUnit', { count }) }: { title: string; rows: RadialSlice[]; empty: string; unit?: CountUnit },
 ) {
   /* 钉住的那一段和指针扫过的那一段分开记：扫过去要能回到钉住的那一段，合成一个状态的话
      鼠标一离开就把用户点下的选择也擦了。 */
@@ -49,8 +51,10 @@ export function RadialCard(
   const shown = slices[focus];
   const toggle = (index: number) => setPinned((at) => (at === index ? -1 : index));
   const ceiling = radialCeiling(slices.map((row) => row.value));
+  /* 原始数放 `count` 列，不叫 `value`：Recharts 算扇区时把这一行展开后又写一遍 `value`，填的是
+     画图那一列（`arc`），浮层读到的就成了垫高的弧长。 */
   const data = slices.map((row, index) => (
-    { slice: sliceKey(index), value: row.value, arc: radialArc(row.value, ceiling) }));
+    { slice: sliceKey(index), count: row.value, arc: radialArc(row.value, ceiling) }));
 
   return (
     <section className={CHART_CARD}>
@@ -63,7 +67,7 @@ export function RadialCard(
             {(shown ? shown.value : total).toLocaleString()}
           </b>
         </span>
-        <small className="text-caption-1-regular text-text-secondary">{unit}</small>
+        <small className="text-caption-1-regular text-text-secondary">{unit(shown ? shown.value : total)}</small>
       </header>
       <div role="img" aria-label={title} onPointerLeave={() => setHovered(-1)}>
         <EvilRadialChart data={data} nameKey="slice" config={sliceConfig(slices.map((row) => row.name))}
@@ -78,7 +82,7 @@ export function RadialCard(
             onClick: (_entry: unknown, index: number) => toggle(index),
             onMouseEnter: (_entry: unknown, index: number) => setHovered(index),
           }} />
-          <ChartTip nameKey="slice" valueKey="value" hideLabel />
+          <ChartTip nameKey="slice" valueKey="count" hideLabel />
         </EvilRadialChart>
       </div>
       <div className="inline-grid w-full grid-cols-3 gap-2 max-sm:grid-cols-2">

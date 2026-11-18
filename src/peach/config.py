@@ -88,12 +88,17 @@ class PeachSettings:
     #: 打包带走整个 `web/`，这份第三方工具不能跟着进独立包（docs/FRONTEND.md「界面标注」）。
     agentation_path: Path = PROJECT_ROOT / "build" / "agentation" / "peach-agentation.js"
     token: str = ""
+    #: 口令取自口令文件时是那份文件；被 `--token`、`PEACH_TOKEN` 覆盖或没有口令时是 None，
+    #: 配置页据此决定能不能在运行中换口令。
+    token_file: Path | None = None
     access_path: Path | None = None
     docs_enabled: bool = False
     mdns_enabled: bool = False
     mdns_name: str = "peach"
     mdns_port: int = 80
     mdns_address: str | None = None
+    #: 服务的监听套接字收不收 IPv6 连接；收的时候 mDNS 才发布 AAAA 记录。
+    mdns_ipv6: bool = False
     tls_enabled: bool = False
     #: Quick Tunnel 由应用进程管理，公网入口不能从默认值打开：这两项只由 `cli._serve`
     #: 从设置文件读出后注入，`create_app()` 自己构造的设置一律是关闭加空路径。

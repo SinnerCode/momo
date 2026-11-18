@@ -16,12 +16,21 @@ from unittest import mock
 
 from peach import scan, subtitles
 from support.ledger import fresh_ledger
+from support.stalls import elapsed, stalled_mount
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "migrations"
 
 
 class PairingTests(unittest.TestCase):
+    def test_compound_chinese_language_tags_pair_and_keep_their_script(self):
+        for token, language in (("zh-CN", "zh-Hans"), ("zh-TW", "zh-Hant"),
+                                ("zh-HK", "zh-Hant"), ("zh-Hans", "zh-Hans"), ("zh-Hant", "zh-Hant")):
+            name = f"ABP-758.{token}.srt"
+            with self.subTest(token=token):
+                self.assertEqual(subtitles.language_of(name), language)
+                self.assertEqual(subtitles.pair(name, ["ABP-758.mp4"]), ("ABP-758.mp4", subtitles.SUFFIX))
+
     """同目录配对：三条判据按先后取第一个成立的，配不上就是孤立字幕。"""
 
     VIDEOS = ("ABP-758.mp4", "SSIS-001-4K.mp4")
@@ -79,6 +88,16 @@ class PairingTests(unittest.TestCase):
                          "简体中文")
         self.assertEqual(subtitles.track_label("ABP-758.director.srt", "", "ABP-758.mp4"),
                          "director")
+
+    def test_every_recognised_language_has_a_label_in_both_interface_languages(self):
+        """界面按语言码用 `Intl.DisplayNames` 显示语言名；`track_label` 的兜底原文来自资源，两种语言都要有。"""
+        from peach import interface_text
+        self.assertEqual(set(subtitles.LANGUAGE_TOKENS.values()), set(subtitles.LANGUAGE_LABEL_CODES))
+        for language, code in subtitles.LANGUAGE_LABEL_CODES.items():
+            with self.subTest(language=language):
+                self.assertTrue(interface_text.has(f"server:{code}", "en"))
+        self.assertEqual(interface_text.text(f"server:{subtitles.LANGUAGE_LABEL_CODES['ja']}", language="en"), "Japanese")
+        self.assertEqual(subtitles.language_of("ABP-758.日本語.srt"), "ja")
 
     def test_a_subtitle_named_exactly_like_the_video_is_labelled_by_format(self):
         """完全同名时文件名一个字也没多说，菜单里写 `SRT` 比复述正片标题好读。
@@ -138,7 +157,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(rows, (1, "2026-09-02 10:00:00", "2026-09-03 10:00:00"))
 
     def test_deleting_the_asset_takes_its_subtitle_rows_with_it(self):
-        from peach.web_batch import ASSET_REFERENCE_TABLES
+        from peach.personal_records import ASSET_REFERENCE_TABLES
         self.assertIn("asset_subtitle", ASSET_REFERENCE_TABLES)
         subtitles.record(self.connection, "local", [self._sidecar("ABP-758.srt")],
                          "2026-09-02 10:00:00")
@@ -214,6 +233,32 @@ class ScanTests(unittest.TestCase):
         self._scan()
         self._scan()
         self.assertEqual(len(self._rows()), 3)
+
+
+class SmbDiscoveryTests(unittest.TestCase):
+    """SMB 共享上的作品不是操作系统路径，同目录字幕经 SMB 列目录发现。"""
+
+    def _video(self):
+        from peach.smb_media import SmbResource
+        from peach.smb_transport import SmbConnection
+        return SmbResource("nas", r"R:\Media", "smb://files.invalid/media", ("ABP-758", "ABP-758.mp4"),
+                           SmbConnection("files.invalid", "media"))
+
+    def test_sidecars_next_to_an_smb_video_are_listed_through_the_share(self):
+        from peach.smb_media import SmbResource
+        from peach.smb_transport import SmbEntry
+        listing = [SmbEntry(9, 1, 1, False, "ABP-758.mp4"), SmbEntry(3, 1, 1, False, "ABP-758.chs.srt"),
+                   SmbEntry(3, 1, 1, False, "OTHER-1.srt"), SmbEntry(0, 1, 1, True, "ABP-758.srt"),
+                   SmbEntry(3, 1, 1, False, "ABP-758.ass", True)]
+        with mock.patch.object(SmbResource, "scandir", return_value=listing):
+            found = subtitles.discover_sidecars(self._video(), scan.VIDEO)
+        self.assertEqual([(row["name"], row["path"], row["language"]) for row in found],
+                         [("ABP-758.chs.srt", r"R:\Media\ABP-758\ABP-758.chs.srt", "zh-Hans")])
+
+    def test_an_unreachable_share_yields_no_sidecars(self):
+        from peach.smb_media import SmbResource
+        with mock.patch.object(SmbResource, "scandir", side_effect=OSError(113, "SMB 连接不可用")):
+            self.assertEqual(subtitles.discover_sidecars(self._video(), scan.VIDEO), [])
 
 
 class DecodeTests(unittest.TestCase):
@@ -352,6 +397,8 @@ class SubtitleApiTests(unittest.TestCase):
         self.assertTrue(tracks[0]["playable"])
         self.assertEqual(tracks[1]["note"], "不在正片所在目录")
         self.assertEqual(tracks[2]["note"], "编码未识别")
+        self.assertEqual([track["note_code"] for track in tracks],
+                         ["", "labels.routesMedia.subtitle.outsideFolder", "labels.routesMedia.subtitle.encodingUnknown"])
         self.assertFalse(tracks[1]["playable"] or tracks[2]["playable"])
 
     def test_a_track_comes_back_as_webvtt(self):
@@ -393,14 +440,45 @@ class SubtitleApiTests(unittest.TestCase):
             (self.media / "ABP-758.srt").unlink()
             self.assertEqual(client.get(original["src"]).status_code, 404)
 
+    def test_a_stuck_media_folder_answers_with_ledger_tracks_within_the_deadline(self):
+        """网盘目录答不上：列表只回账本登记的字幕，正文按读不到回；都不把请求挂住，也不缓存这次结果。"""
+        from peach.web_subtitle_tracks import _subtitle_bytes, _subtitle_rows
+        with self._client() as client:
+            state = client.app.state
+            self.assertTrue(state.media_engine.filesystem.allowed_roots)
+            with stalled_mount(self.media):
+                seconds, result = elapsed(_subtitle_rows, state, 1)
+                self.assertLess(seconds, 3)
+                asset, rows = result
+                self.assertEqual(sorted(row["name"] for row in rows),
+                                 ["ABP-758.chs.srt", "ABP-758.en.srt", "ABP-758.jp.srt"])
+                row = next(row for row in rows if row["name"] == "ABP-758.chs.srt")
+                seconds, (data, note) = elapsed(_subtitle_bytes, state, asset, row)
+                self.assertLess(seconds, 3)
+                self.assertEqual((data, note), (None, "notFound"))
+            (self.media / "ABP-758.srt").write_text("1\n00:00:00,000 --> 00:00:05,000\n旁挂\n", encoding="utf-8")
+            names = [row["name"] for row in _subtitle_rows(state, 1)[1]]
+            self.assertIn("ABP-758.srt", names)
+
     def test_discovery_stays_inside_authorized_media_roots(self):
-        from peach.routes_media import _subtitle_rows
+        from peach.web_subtitle_tracks import _subtitle_rows
         with self._client() as client:
             state = client.app.state
             state.media_engine.filesystem.allowed_roots = (self.outside,)
-            with mock.patch("peach.routes_media.subtitles.discover_sidecars") as discover:
+            with mock.patch("peach.web_subtitle_tracks.subtitles.discover_sidecars") as discover:
                 _subtitle_rows(state, 1)
             discover.assert_not_called()
+
+    def test_opening_a_video_lists_its_directory_once(self):
+        """字幕列表一次、每条轨各一次：正片目录在网盘上时，每次列目录都是一趟网络往返。"""
+        (self.media / "ABP-758.srt").write_text("1\n00:00:00,000 --> 00:00:05,000\n旁挂\n", encoding="utf-8")
+        with self._client() as client, mock.patch(
+                "peach.web_subtitle_tracks.subtitles.discover_sidecars", wraps=subtitles.discover_sidecars) as discover:
+            tracks = client.get("/api/assets/1/subtitles").json()["subtitles"]
+            for track in tracks:
+                client.get(track["src"])
+        self.assertEqual(len(tracks), 4)
+        self.assertEqual(discover.call_count, 1)
 
     def test_discovered_identity_is_stable_when_the_file_is_registered(self):
         path = self.media / "ABP-758.srt"

@@ -1,6 +1,8 @@
 import threading
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -17,6 +19,23 @@ from peach.http import HttpResponse
 
 
 class FollowMediaResolverTests(unittest.TestCase):
+    def test_source_cooldown_survives_resolver_restart_and_expires(self):
+        moment, wall = [1000.0], [11000.0]
+        transport = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            options = {'state_root': Path(temporary), 'clock': lambda: moment[0],
+                       'wall_clock': lambda: wall[0]}
+            first = FollowMediaResolver(transport, **options)
+            first.pause('iwara', 120)
+            wall[0] += 30
+            moment[0] = 5
+            second = FollowMediaResolver(transport, **options)
+            self.assertEqual(second.cooling('iwara'), 90)
+            moment[0] += 91
+            wall[0] += 91
+            self.assertEqual(FollowMediaResolver(transport, **options).cooling('iwara'), 0)
+            transport.assert_not_called()
+
     def test_iwara_transport_cleanup_preserves_the_callers_transport(self):
         owned = mock.Mock()
         upstream = peach_http.HttpxTransport()
@@ -204,6 +223,21 @@ class FollowMediaResolverTests(unittest.TestCase):
         self.assertEqual(target.url,
                          "https://attachments.f95zone.to/2026/08/one.jpg")
         self.assertEqual(target.referer, item.url)
+
+    def test_a_simpcity_post_with_several_images_resolves_each_in_order(self):
+        """SimpCity 一层楼的几张图按正文顺序逐张取，图床是公网主机；回环地址照旧拒收。"""
+        item = SimpleNamespace(
+            id=16, provider="simpcity", url="https://simpcity.cr/threads/x.1/post-16",
+            media_url="https://jpg6.su/img/one.jpg", metadata={"images": [
+                "https://jpg6.su/img/one.jpg", "https://img.kiwi/two.png", "https://127.0.0.1/three.jpg",
+            ]},
+        )
+        resolver = FollowMediaResolver(lambda *_args: None)
+        self.assertEqual([resolver.resolve(item, index).url for index in (0, 1)],
+                         ["https://jpg6.su/img/one.jpg", "https://img.kiwi/two.png"])
+        self.assertEqual(resolver.resolve(item, 1).referer, item.url)
+        with self.assertRaises(FollowMediaUnavailable):
+            resolver.resolve(item, 2)
 
     def test_f95_attachment_stays_available_while_other_links_need_a_session(self):
         item = SimpleNamespace(

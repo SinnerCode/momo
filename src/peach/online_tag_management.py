@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 
 from .profiles import DEFAULT_PROFILE_ID, read_settings
+from .user_messages import UserValueError
 
 SETTINGS_KEY = 'online_tag_management'
 ITEM_TAGS_KEY = 'online_item_tags'
@@ -85,35 +86,38 @@ class OnlineTagPolicy:
 def _validate_rename(connection, rows, ids, name):
     """在线名称须可用于筛选，并避开可见词表与已保存的归类。"""
     if len(ids) != 1 or not 0 < len(name) <= 80 or any(ord(char) < 32 for char in name) or ',' in name:
-        raise ValueError('标签名须为 1 至 80 个字符，不含逗号或控制字符')
+        raise UserValueError('errors.onlineTagManagement.nameInvalid')
     for row in rows:
         if row['id'] != ids[0] and tag_key(name) in {tag_key(word) for word in [row['k'], *row['aliases']]}:
-            raise ValueError(f'「{name}」已属于标签「{row["k"]}」，请使用合并标签')
+            raise UserValueError('errors.onlineTagManagement.nameTaken', {'name': name, 'tag': row['k']})
     for group_id, group in OnlineTagPolicy(connection).groups.items():
         if group_id != ids[0] and tag_key(name) in {tag_key(word) for word in [group['name'], *group['aliases'], *group['members']]}:
-            raise ValueError(f'「{name}」已属于标签「{group["name"]}」，请使用合并标签')
+            raise UserValueError('errors.onlineTagManagement.nameTaken', {'name': name, 'tag': group['name']})
 
 
 def preview(connection, body, rows):
     operation = body.get('operation')
     if operation not in {'rename', 'merge', 'hide', 'restore', 'block', 'unblock'}:
-        raise ValueError('未知的在线标签操作')
+        raise ValueError('unknown online tag operation')
+    if operation == 'block' and 'name' in body and not body.get('ids'):
+        rows, group_id = _with_named_row(connection, rows, body.get('name'))
+        body = {**body, 'ids': [group_id]}
     ids = body.get('ids')
     if not isinstance(ids, list) or not 0 < len(ids) <= 2000 or any(not isinstance(value, str) or not value for value in ids):
-        raise ValueError('请选择有效的在线标签，单次最多 2000 个')
+        raise UserValueError('errors.onlineTagManagement.selectionInvalid')
     ids = sorted(set(ids))
     selected = [row for row in rows if row['id'] in ids]
     if len(selected) != len(ids):
-        raise ValueError('标签已变化，请刷新后重试')
+        raise UserValueError('errors.onlineTagManagement.tagsChanged')
     name = unicodedata.normalize('NFKC', str(body.get('name', ''))).strip()
     target = body.get('target_id')
     if operation == 'rename':
         _validate_rename(connection, rows, ids, name)
     if operation == 'merge':
         if len(ids) < 2 or target not in ids:
-            raise ValueError('请选择至少两个标签，并从中选择保留的标签')
+            raise UserValueError('errors.onlineTagManagement.mergeSelection')
         if len({row['cat'] for row in selected}) > 1:
-            raise ValueError('请选择相同来源类型的标签合并')
+            raise UserValueError('errors.onlineTagManagement.mergeSameType')
     releases = {key for row in selected for key in row['_releases']}
     state = read_settings(connection).get(SETTINGS_KEY, {})
     token = hashlib.sha256(json.dumps([operation, ids, name, target, selected, state], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -122,15 +126,29 @@ def preview(connection, body, rows):
             'assets': len(releases), 'overlap': sum(row['n'] for row in selected) - len(releases), 'token': token}
 
 
+def _with_named_row(connection, rows, raw):
+    """按名字屏蔽：词表里已有的就是那一条，没有的（还没抓到过）先记一条空的，以后抓到同名标签
+    就落进这一组。返回补过的词表和要屏蔽的那一条的 id。"""
+    name = unicodedata.normalize('NFKC', str(raw or '')).strip()
+    if not 0 < len(name) <= 80 or ',' in name or any(ord(char) < 32 for char in name):
+        raise UserValueError('errors.onlineTagManagement.nameInvalid')
+    group_id = OnlineTagPolicy(connection).identity(name)[0]
+    if any(row['id'] == group_id for row in rows):
+        return rows, group_id
+    return [*rows, {'id': group_id, 'k': name, 'n': 0, 'cat': 'general', 'hidden': False, 'blocked': False,
+                    'aliases': [], 'members': [tag_key(name)], '_releases': [], 'named': True}], group_id
+
+
 def apply_plan(connection, body, rows):
     plan = preview(connection, body, rows)
     if plan['token'] != body.get('token'):
-        raise ValueError('标签已变化，请重新预览操作范围')
+        raise UserValueError('errors.onlineTagManagement.previewStale')
     settings = read_settings(connection)
     groups = settings.setdefault(SETTINGS_KEY, {})
     rows = {row['id']: row for row in plan['tags']}
     for group_id, row in rows.items():
-        groups.setdefault(group_id, {'name': row['k'], 'hidden': row['hidden'], 'members': row['members'], 'aliases': row['aliases'], 'cat': row['cat'], 'blocked': row.get('blocked', False)})
+        groups.setdefault(group_id, {'name': row['k'], 'hidden': row['hidden'], 'members': row['members'], 'aliases': row['aliases'], 'cat': row['cat'], 'blocked': row.get('blocked', False),
+                                     **({'named': True} if row.get('named') else {})})
     if plan['operation'] == 'rename':
         group = groups[plan['ids'][0]]
         group['aliases'] = sorted(set([*group['aliases'], group['name']]))
@@ -147,6 +165,10 @@ def apply_plan(connection, body, rows):
     elif plan['operation'] in {'block', 'unblock'}:
         for group_id in plan['ids']:
             groups[group_id]['blocked'] = plan['operation'] == 'block'
+            # 按名字记下、一条内容都还没抓到的那一组，解除屏蔽后不再留一条空标签。
+            group = groups[group_id]
+            if plan['operation'] == 'unblock' and group.get('named') and not group['hidden'] and not rows[group_id]['n']:
+                groups.pop(group_id)
     else:
         for group_id in plan['ids']:
             groups[group_id]['hidden'] = plan['operation'] == 'hide'
@@ -158,7 +180,7 @@ def _save_settings(connection, settings):
     changed = connection.execute('UPDATE profile SET settings_json=?,updated_at=? WHERE id=?',
         (json.dumps(settings, ensure_ascii=False), datetime.now(timezone.utc).isoformat(), DEFAULT_PROFILE_ID)).rowcount
     if not changed:
-        raise ValueError('当前用户设置不存在')
+        raise ValueError('current profile settings do not exist')
 
 
 def write_item_tag(connection, item, body):
@@ -166,9 +188,9 @@ def write_item_tag(connection, item, body):
     operation = body.get('operation')
     name = unicodedata.normalize('NFKC', str(body.get('tag') or '')).strip()
     if operation not in {'add', 'remove', 'restore'}:
-        raise ValueError('未知的手动标签操作')
+        raise ValueError('unknown manual tag operation')
     if not 0 < len(name) <= 80 or ',' in name or any(ord(char) < 32 for char in name):
-        raise ValueError('标签名须为 1 至 80 个字符，不含逗号或控制字符')
+        raise UserValueError('errors.onlineTagManagement.nameInvalid')
     settings = read_settings(connection)
     policy = OnlineTagPolicy(connection)
     canonical = policy.query_name(name)
@@ -180,7 +202,7 @@ def write_item_tag(connection, item, body):
     tags = [tag for tag in tags if policy.identity(tag)[0] != key]
     if operation == 'add':
         if len(tags) >= 100:
-            raise ValueError('每条内容最多添加 100 个手动标签')
+            raise UserValueError('errors.onlineTagManagement.itemTagLimit')
         tags.append(canonical)
     elif operation == 'remove':
         hidden.append(canonical)

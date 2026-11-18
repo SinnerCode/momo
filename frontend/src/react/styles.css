@@ -21,6 +21,7 @@
 @import "./components/surface-motion.css";
 @import "./junk-queue/junk-queue.css";
 @import "./entity-hero/entity-hero.css";
+@import "./entity-page/name-contribution-dialog.css";
 @import "./entity-filter/entity-filter.css";
 @import "./catalog-filter/catalog-filter.css";
 @import "./catalog-folders/catalog-folders.css";
@@ -30,6 +31,7 @@
 @import "./jav/jav.css";
 @import "./follow-detail/follow-detail.css";
 @import "./item-detail/item-detail.css";
+@import "./item-detail/item-edit.css";
 @import "./jav-detail/jav-detail.css";
 @import "./photo-lightbox/photo-lightbox.css";
 @import "./index/index-people.css";
@@ -39,17 +41,18 @@
 @import "./settings-panel/settings-panel.css";
 @import "./immerse/immerse.css";
 @import "./sidebar/sidebar.css";
+@import "./onboarding/tutorial.css";
 @import "./base.css";
 @import "../ui-kit/motion.css";
 @import "../core/core.css";
 @import "../ui-kit/markup.css";
+@import "../ui-kit/activity-motion.css";
 @import "../ui-kit/controls.css";
 @import "../ui-kit/select-field.css";
 @import "../ui-kit/scroll.css";
 @import "../ui-kit/overlay-scrollbar.css";
 @import "../ui-kit/modal.css";
 @import "../board-skeleton.css";
-@import "../management.css";
 @import "../ui-kit/skeleton.css";
 @import "../entity-skeleton.css";
 @import "../ui-kit/collapse.css";
@@ -58,10 +61,18 @@
 @import "../board-controls.css";
 @import "./settings/configuration-page.css";
 @import "./library-processing/processing-effort.css";
-@import "../jobs.css";
 @import "../pagination.css";
 
 @source "./";
+
+@utility async-text-skeleton {
+  height: .65em;
+}
+[data-async-text-value][aria-hidden="true"] { opacity: 0; }
+[data-async-text-skeleton] { opacity: 0; }
+[data-async-text][aria-busy="true"] > [data-async-text-skeleton] { opacity: 1; }
+/* 不忙时骨架只是透明，微光不扫：WebKit 对透明元素的动画照样逐帧重绘，满屏卡片的文字骨架会让手机持续发热。 */
+[data-async-text]:not([aria-busy="true"]) > [data-async-text-skeleton]::after { animation: none; }
 /* 独立页面包（`pages/`）有自己的产物 `peach-pages.css`，它用到的工具类不进这一份。 */
 @source not "./pages";
 @source "../management-skeletons.ts";
@@ -134,7 +145,7 @@
   /* 统计与口味两页的折行断点，旧 `05-insights.css` 的媒体查询统一钉在 1000px，
    * 不落在 Tailwind 的 sm/md/lg 上。写成断点 token，`board:` 变体照常生成。 */
   --breakpoint-board: 1000px;
-  /* 数据管理那一排五张读数卡的两档折行，遗留骨架的 `.ui-cleanupstats`（`management.css`）同样钉在 1119px 与 559px。 */
+  /* 数据管理那一排五张读数卡的两档折行：两张一排、一张一排分别从 1119px 与 559px 起。 */
   --breakpoint-plain-stat-pair: 1120px;
   --breakpoint-plain-stat-single: 560px;
   /* 数据管理页的卡片间距与整理卡内边距在 760px 以下收一档，旧 `board.css` 那条窄屏媒体查询。 */
@@ -246,18 +257,6 @@
   }
 }
 
-/* 后台任务仍在推进、又说不出总量时的 Loading Dots。工具类里没有 animation-delay 这一档，
- * 三颗点的错相写成一个函数式 utility：类名照常由 Tailwind 生成，也就不必写任意值。
- * 减少动效由 `web/css/01-base.css` 的全局规则统一关掉。 */
-@keyframes peach-dot-wave {
-  0%, 80%, 100% { opacity: .25; transform: translateY(0); }
-  40% { opacity: 1; transform: translateY(-2px); }
-}
-@utility dot-wave-* {
-  animation: peach-dot-wave 1.2s ease-in-out infinite;
-  animation-delay: calc(--value(integer) * 150ms);
-}
-
 /* Skeleton 的微光，与遗留层 `web/css/09-skeleton.css` 同一套实测值（Geist Skeleton，
  * `docs/reference-snapshots/vercel-geist-skeleton.md`）：宿主不改自己的不透明度，
  * `::after` 铺一条三倍宽的渐变左右扫。全局的减少动效规则只选得中元素、选不中伪元素，
@@ -265,6 +264,17 @@
  * 同一个元素上时谁生效只看生成顺序。 */
 @keyframes peach-skeleton-sweep {
   to { transform: translateX(-50%); }
+}
+
+/* 自动测量仅用于有限的只读读数，沿用 Peach 色彩和微光，不覆盖卡片布局。 */
+.peach-react [data-measured-reading] {
+  --skullet-base: var(--color-background-tertiary-default);
+  --skullet-highlight: var(--skeleton-sheen);
+  --skullet-animation: none;
+}
+/* 测量不依赖可见性，旧版 Safari 不支持上游的 @scope 时也不露出样本。 */
+.peach-react [data-measured-reading] :is([skullet-ghost], [skullet-snapshot]) {
+  visibility: hidden;
 }
 @utility skeleton-sheen {
   position: relative;
@@ -288,6 +298,18 @@
 /* 占位换成真内容，与 `src/ui-kit/motion.css` 的 `.skelreveal` 同一形态：骨架淡出
  * 并糊掉，内容从 2px 模糊里清晰起来，两层叠在同一处坐标。元素带上 `data-revealed`
  * 就是揭开之后那一态。时长读 board.css 的 `--motion-reveal`，减少动效时它是 0s。 */
+.peach-react [data-content-transition] { display: grid; position: relative; min-width: 0; }
+.peach-react [data-content-transition] > :is([data-content-current], [data-content-skeleton]) {
+  grid-area: 1 / 1; min-width: 0; transition: opacity var(--motion-content), visibility var(--motion-content);
+}
+.peach-react [data-content-current] { opacity: 1; }
+.peach-react [data-content-skeleton] { position: absolute; inset: 0; opacity: 0; visibility: hidden; pointer-events: none; }
+.peach-react [data-content-transition][data-pending] > [data-content-current] { opacity: 0; }
+.peach-react [data-content-transition][data-pending] > [data-content-skeleton] { position: relative; opacity: 1; visibility: visible; }
+.peach-react :is([data-async-text-value], [data-async-text-skeleton]) { transition: opacity var(--motion-content); }
+@starting-style {
+  .peach-react [data-content-transition][data-pending] > [data-content-skeleton] { opacity: 0; }
+}
 @utility reveal-skeleton {
   transition: opacity var(--motion-reveal), filter var(--motion-reveal);
   &[data-revealed] { opacity: 0; filter: blur(2px); }
@@ -382,6 +404,12 @@ html:has([data-selection-dock]) { scroll-padding-bottom: var(--selection-dock-sp
   background: linear-gradient(180deg, var(--glass-sheen), transparent 62%), var(--glass-pick-fill);
   box-shadow: inset 0 0 0 1px var(--glass-rim), var(--glass-pick-shadow);
 }
+/* 带滑动玻璃的那一组（`components/glass-segments.tsx`）：选中面由滑过来的那块玻璃给，格子自己不铺底。 */
+.peach-react [data-glide-segments] [data-glass-segment][data-selected][data-selected] {
+  background: none;
+  box-shadow: none;
+  backdrop-filter: none;
+}
 
 /* BoardUI 带字按键与链接键的字形和文字同行，画框取 `--icon-inline`，随所在文字字号缩放；纯图标键
  * 没有文字那一格，仍按档位取 20、18、14px。`button-press-motion` 只在 Button 与 ButtonLink 上，
@@ -411,15 +439,6 @@ html:has([data-selection-dock]) { scroll-padding-bottom: var(--selection-dock-sp
   border-radius: var(--control-radius);
 }
 .peach-react button[data-tag-mode] svg { width: 16px; height: 16px; }
-
-/* 浮层上动作键（`components/filter-glass.tsx` 的 `GlassPill`）指上去的那一下：同一副料，
- * 细线让给整圈 rim，落影把它从浮层上托起来，跟首页筛选条上滑到指针下的那块一样。那一档
- * `backdrop-filter` 提亮写在 `web/board.css`：构建会把标准属性折成 Chromium 不认的前缀写法。 */
-.peach-react [data-glass-pill]:hover:not([aria-busy]) {
-  border-color: transparent;
-  background: linear-gradient(180deg, var(--glass-sheen), transparent 62%), var(--glass-pick-fill);
-  box-shadow: inset 0 0 0 1px var(--glass-rim), var(--glass-pick-shadow);
-}
 
 /* 索引页的过滤框与播放列表的新建框在窄屏把字号提到 16px：小于这一档，手机浏览器聚焦时
  * 会把整页放大。 */

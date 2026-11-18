@@ -19,12 +19,20 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from . import link_status, studio_sites
+from . import interface_text, link_status, studio_sites
+from .coded_text import coded
 from .jobs import BackgroundJob
 
 from .user_agent import USER_AGENT
+from .user_messages import UserInterruptedError, UserValueError, error_fields, message_fields
 #: 「这个页面没了」——只有上游明确这么说，才够格作为删除依据。
 GONE_STATUSES = frozenset({404, 410})
+#: 「暂时打不开」：连不上或超时（状态 0）、限流与临时服务故障。过一会儿多半就好，一趟检查里自动再问几轮；
+#: 站点拒绝爬虫（403 之类）不在此列，再问也是同一个答案，留给人勾选重试。
+TEMPORARY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+#: 一趟检查跑完后，暂时打不开的链接再验几轮；每轮之前等多少个检查间隔（默认约 30 秒）。
+RECHECK_ROUNDS = 2
+RECHECK_PAUSE_INTERVALS = 120
 CHECK_TIMEOUT = 12.0
 CHECK_INTERVAL = 0.25
 
@@ -89,11 +97,37 @@ def link_verdict(status: int, note: str) -> str:
     return "unclear"
 
 
-def _note(status: int, note: str) -> str:
-    """面板上那一格说明。停放页只写状态码就看不出为什么判了没了。"""
+def temporary_failure(status: int, note: str) -> bool:
+    """取不到、但看起来是暂时的：连不上、超时、限流或临时服务故障。确证没了（`link_verdict` 的 gone）不算。"""
+    return link_verdict(status, note) == "unclear" and (status == 0 or status in TEMPORARY_STATUSES)
+
+
+def _unclear_row(row: dict, status: int, note: str, attempts: int) -> dict:
+    """「取不到」那一行：带上是不是暂时的、问过几次，界面据此区分「临时故障，已重查」与「站点拒绝」。"""
+    return {"id": row["id"], "entity": row["entity"], "link_kind": row["link_kind"], "label": row["label"],
+            "url": row["url"], **_note(status, note),
+            "temporary": temporary_failure(status, note), "attempts": attempts}
+
+
+def _note(status: int, note: str) -> dict:
+    """面板上那一格说明：`note`，取不到时另带 `note_code` 与 `note_params` 给界面取译文。
+    停放页只写状态码就看不出为什么判了没了。"""
     if status == 200 or note.startswith(studio_sites.PARKED_NOTE):
-        return note
-    return f"HTTP {status}" if status else f"取不到：{note}"
+        # 停放页那句是 `studio_sites` 给的 `Said`，身上带 code；200 的说明为空或原文。
+        return coded("note", note)
+    if status:
+        return {"note": f"HTTP {status}"}
+    params = {"reason": note}
+    return {"note": interface_text.text("server:labels.webLinks.unreachable", params),
+            "note_code": "labels.webLinks.unreachable", "note_params": params}
+
+
+def _job_result(result: dict) -> dict:
+    """接口回执写进任务状态：失败那句的 code 改放 `error_code`，`message_code` 留给进度说明。"""
+    if result.get("ok", True) or "message_code" not in result:
+        return result
+    out = dict(result)
+    return {**out, "error_code": out.pop("message_code"), "error_params": out.pop("message_params", {})}
 
 
 def w_links(contract: LinkContract, args=None):
@@ -137,7 +171,8 @@ def _check_public(state: dict, contract: LinkContract) -> dict:
         "gone": [dict(item) for item in state["gone"]],
         "unclear": [dict(item) for item in state["unclear"]],
         "scope": state.get("scope", "all"),
-        **({"error": state["error"]} if state["status"] == "failed" else {}),
+        **({key: state[key] for key in ("error", "error_code", "error_params") if key in state}
+           if state["status"] == "failed" else {}),
     }
     items = result['gone'] + result['unclear']
     if items:
@@ -185,12 +220,12 @@ def _run_link_check(contract: LinkContract, check_id: str,
             return
         state["total"] = len(rows)
     if not job.checkpoint(check_id, link_ids=[row['id'] for row in rows]):
-        raise InterruptedError('链接检查已停止')
+        raise UserInterruptedError("errors.webLinks.checkStopped")
     for row in rows:
         if row['id'] in completed:
             continue
         if job.snapshot() is None:
-            raise InterruptedError('链接检查已停止')
+            raise UserInterruptedError("errors.webLinks.checkStopped")
         status, note = _probe(row["url"])
         verdict = link_verdict(status, note)
         with job.editing(check_id) as state:
@@ -201,19 +236,57 @@ def _run_link_check(contract: LinkContract, check_id: str,
             if verdict != 'unclear':
                 completed.add(row['id'])
             state["checked"] = len(completed)
-            if verdict != "ok":
-                state["gone" if verdict == "gone" else "unclear"].append({
-                    "id": row["id"], "entity": row["entity"],
-                    "link_kind": row["link_kind"], "label": row["label"],
-                    "url": row["url"],
-                    "note": _note(status, note),
-                })
+            if verdict == "gone":
+                state["gone"].append({"id": row["id"], "entity": row["entity"], "link_kind": row["link_kind"],
+                                      "label": row["label"], "url": row["url"], **_note(status, note)})
+            elif verdict == "unclear":
+                state["unclear"].append(_unclear_row(row, status, note, 1))
         snapshot = job.snapshot() or {}
         if not job.checkpoint(check_id, completed_links=sorted(completed), checked=len(completed),
                               total=len(rows), gone=snapshot.get('gone', []), unclear=snapshot.get('unclear', [])):
-            raise InterruptedError('链接检查已停止')
+            raise UserInterruptedError("errors.webLinks.checkStopped")
         time.sleep(CHECK_INTERVAL)
+    _recheck_temporary(job, check_id, completed, {row['id'] for row in rows}, len(rows),
+                       int(previous.get('recheck_round') or 0))
     job.update(check_id, checked=len(rows), status="complete", completed_at=time.time())
+
+
+def _recheck_temporary(job, check_id: str, completed: set, probed: set, total: int, done_rounds: int) -> None:
+    """这一趟验过（`probed`）、暂时打不开的链接隔一会儿自动再验，最多 `RECHECK_ROUNDS` 轮；好了就从结果里
+    摘掉，确证没了才进 gone，还是打不开的留在 unclear 并记下问过几次。只重验了几条时，别的结论原样不动。
+    续跑从上次做完的那一轮之后接着。"""
+    for round_index in range(done_rounds, RECHECK_ROUNDS):
+        pending = [dict(item) for item in (job.snapshot() or {}).get('unclear', [])
+                   if item.get('temporary') and item['id'] in probed]
+        if not pending:
+            return
+        for _ in range(RECHECK_PAUSE_INTERVALS):
+            if job.snapshot() is None:
+                raise UserInterruptedError("errors.webLinks.checkStopped")
+            time.sleep(CHECK_INTERVAL)
+        for item in pending:
+            if job.snapshot() is None:
+                raise UserInterruptedError("errors.webLinks.checkStopped")
+            status, note = _probe(item["url"])
+            verdict = link_verdict(status, note)
+            with job.editing(check_id) as state:
+                if state is None:
+                    return
+                state['unclear'] = [row for row in state['unclear'] if row['id'] != item['id']]
+                if verdict == "gone":
+                    state['gone'].append({key: item[key] for key in ("id", "entity", "link_kind", "label", "url")}
+                                         | _note(status, note))
+                elif verdict == "unclear":
+                    state['unclear'].append(_unclear_row(item, status, note, int(item.get('attempts') or 1) + 1))
+                if verdict != "unclear":
+                    completed.add(item['id'])
+                state["checked"] = len(completed)
+            time.sleep(CHECK_INTERVAL)
+        snapshot = job.snapshot() or {}
+        if not job.checkpoint(check_id, completed_links=sorted(completed), checked=len(completed), total=total,
+                              gone=snapshot.get('gone', []), unclear=snapshot.get('unclear', []),
+                              recheck_round=round_index + 1):
+            raise UserInterruptedError("errors.webLinks.checkStopped")
 
 
 def _retry_state(state: dict, link_ids: list[int]) -> dict:
@@ -255,9 +328,9 @@ def w_links_check(contract: LinkContract, body=None):
     if body.get("retry") is not None:
         state = contract.link_check.snapshot()
         if state is None or state["status"] != "complete":
-            return {"ok": False, "error": "没有已完成的检查结果"}
+            return {"ok": False, **message_fields("api.links.noCompletedCheck", key="error")}
         if body.get("check_id") != state["check_id"]:
-            return {"ok": False, "error": "检查结果已过期，请重新检查"}
+            return {"ok": False, **message_fields("api.links.checkExpired", key="error")}
         # 只认这次结果里真有的那些行。前端传来的 id 决定要删哪几条结论，放行库里
         # 别的链接等于让一个请求把没检查过的东西也标成「已通过」。
         known = {int(item["id"]) for item in state["gone"]}
@@ -265,7 +338,7 @@ def w_links_check(contract: LinkContract, body=None):
         link_ids = [int(value) for value in body["retry"]
                     if str(value).lstrip("-").isdigit() and int(value) in known]
         if not link_ids:
-            return {"ok": False, "error": "没有可重试的链接"}
+            return {"ok": False, **message_fields("api.links.nothingToRetry", key="error")}
         return _check_public(contract.link_check.start(
             lambda check_id: _run_link_check(contract, check_id, link_ids),
             initial=_retry_state(state, link_ids), restart=True,
@@ -286,10 +359,10 @@ def _prune_selection(planned: list[dict], body: dict) -> list[dict]:
         return planned
     ids = body["ids"]
     if not isinstance(ids, list) or not ids or any(type(item) is not int for item in ids):
-        raise ValueError("请选择失效链接")
+        raise UserValueError("api.links.selectionRequired")
     requested = set(ids)
     if not requested.issubset({item["id"] for item in planned}):
-        raise ValueError("所选链接不在本次失效清单中")
+        raise UserValueError("api.links.selectionOutsideCheck")
     return [item for item in planned if item["id"] in requested]
 
 
@@ -303,21 +376,21 @@ def _recheck_prune_links(planned, progress, checkpoint, resume_state):
         if item['id'] in completed:
             continue
         if progress:
-            progress(checked=index, total=len(planned),
-                     message=f"重验失效链接：已检查 {index} / {len(planned)} 条")
+            progress(checked=index, total=len(planned), **message_fields(
+                "jobMessage.webLinks.recheckProgress", {"checked": index, "total": len(planned)}))
         status, note = _probe(item['url'])
         verdict = link_verdict(status, note)
         confirmed[:] = [row for row in confirmed if row['id'] != item['id']]
         recovered[:] = [row for row in recovered if row['id'] != item['id']]
         if verdict == 'gone':
-            confirmed.append({**item, 'note': _note(status, note)})
+            confirmed.append({**item, **_note(status, note)})
         else:
             recovered.append(item)
         if verdict != 'unclear':
             completed.add(item['id'])
         if checkpoint and not checkpoint(prune_checks=dict(confirmed=confirmed, recovered=recovered,
                 completed=sorted(completed)), checked=index + 1, total=len(planned)):
-            raise InterruptedError('链接清理已停止')
+            raise UserInterruptedError("errors.webLinks.pruneStopped")
     return confirmed, recovered
 
 
@@ -329,32 +402,35 @@ def w_links_prune(contract: LinkContract, body, *, progress=None, checkpoint=Non
     """
     body = body or {}
     if body.get("confirm") is not True:
-        return {"ok": False, "error": "需要 confirm"}
+        return {"ok": False, **message_fields("api.links.confirmRequired", key="error")}
     if body.get("background"):
         job = contract.link_prune_job
         def work(job_id):
             result = w_links_prune(contract, {**body, "background": False},
                 progress=lambda **fields: job.update(job_id, **fields),
                 checkpoint=lambda **fields: job.checkpoint(job_id, **fields), resume_state=job.snapshot())
-            job.update(job_id, **result, status="complete" if result.get("ok") else "failed", completed_at=time.time())
-        return job.start(work, restart=True, initial={"message": "正在核对失效链接清单"}, recovery=body)
+            job.update(job_id, **_job_result(result), status="complete" if result.get("ok") else "failed",
+                       completed_at=time.time())
+        return job.start(work, restart=True, initial=message_fields("jobMessage.webLinks.prunePreparing"),
+                         recovery=body)
     if (resume_state or {}).get('prune_receipt'):
         return resume_state['prune_receipt']
     state = contract.link_check.snapshot()
     if state is None or state["status"] != "complete":
-        return {"ok": False, "error": "没有已完成的检查结果"}
+        return {"ok": False, **message_fields("api.links.noCompletedCheck", key="error")}
     if body.get("check_id") != state["check_id"]:
-        return {"ok": False, "error": "检查结果已过期，请重新检查"}
+        return {"ok": False, **message_fields("api.links.checkExpired", key="error")}
     try:
         planned = _prune_selection([dict(item) for item in state["gone"]], body)
     except ValueError as error:
-        return {"ok": False, "error": str(error)}
+        return {"ok": False, **error_fields(error)}
 
     confirmed, recovered = _recheck_prune_links(planned, progress, checkpoint, resume_state)
 
     removed = marked = 0
     if progress:
-        progress(checked=len(planned), total=len(planned), message=f"重验结束：准备处理 {len(confirmed)} 条，保留 {len(recovered)} 条")
+        progress(checked=len(planned), total=len(planned), **message_fields(
+            "jobMessage.webLinks.recheckDone", {"confirmed": len(confirmed), "recovered": len(recovered)}))
     if confirmed:
         # 整批走同一个写事务：要么这一次判定的 gone 全部落库，要么一条都不落。
         # 已隐退女优的留成失效标记，其余删除，取舍见 `link_status`。

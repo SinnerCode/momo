@@ -18,6 +18,7 @@ describe('首页加载结构',()=>{
      (window as any).__catalogSkeletons=0;
      (window as any).__catalogRatios=[];
      new MutationObserver(()=>{document.querySelectorAll('#grid .catalog-skeleton').forEach(node=>{
+      if(node.closest('[data-content-skeleton][aria-hidden="true"]')||getComputedStyle(node).visibility==='hidden')return;
       if(!seen.has(node)){seen.add(node);(window as any).__catalogSkeletons++;
        (window as any).__catalogRatios.push(Number((node.querySelector('[style]') as HTMLElement)?.style.getPropertyValue('--skeleton-card-ratio')))}
      });
@@ -74,7 +75,7 @@ describe('首页加载结构',()=>{
      });
      assert.equal(colors.actual,colors.expected,'骨架圆角底色与占位层一致');
     }
-    assert.equal(await page.evaluate(()=>(window as any).__catalogSkeletons),1,'目录骨架只能创建一次');
+    assert.equal(await page.evaluate(()=>(window as any).__catalogSkeletons),1,'目录骨架只展示一轮');
     assert.deepEqual(await page.evaluate(()=>(window as any).__catalogRatios),[hasFeed?3/4:16/9]);
     release();
     if(hasFeed)await page.locator('#feedNew [data-feed-id]').first().waitFor({state:'visible'});

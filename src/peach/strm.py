@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .user_messages import UserValueError
+
 MAX_BYTES = 64 * 1024
 POINTER_SUFFIX = '.strm'
 DISC_SUFFIXES = frozenset({'.iso'})
@@ -30,20 +32,25 @@ def validate_url(url: str) -> str:
     except ValueError:
         valid = False
     if not valid or any(ord(char) < 33 or ord(char) == 127 for char in url) or '\\' in url:
-        raise ValueError('STRM 需要不含账号密码的 HTTP 或 HTTPS 播放地址')
+        raise UserValueError('errors.strm.urlInvalid')
     return url
 
 
 def read_target(path: Path) -> str:
-    try:
+    """读出指针里的地址。播放请求里调这里，读取带期限：网盘答不上按读不出处理。"""
+    from . import media_io
+
+    def read() -> bytes:
         with path.open('rb') as handle:
-            content = handle.read(MAX_BYTES + 1)
+            return handle.read(MAX_BYTES + 1)
+    try:
+        content = media_io.bounded(media_io.mount_key(path), read)
         if len(content) > MAX_BYTES:
-            raise ValueError('STRM 文件超过 64 KiB')
+            raise UserValueError('errors.strm.fileTooLarge')
         lines = [line.strip() for line in content.decode('utf-8-sig').splitlines()
                  if line.strip() and not line.lstrip().startswith('#')]
     except (OSError, UnicodeError) as error:
-        raise ValueError('STRM 文件未取得或不是 UTF-8 文本') from error
+        raise UserValueError('errors.strm.fileUnreadable') from error
     if len(lines) != 1:
-        raise ValueError('STRM 文件需要且只能包含一个播放地址')
+        raise UserValueError('errors.strm.singleUrlRequired')
     return validate_url(lines[0])

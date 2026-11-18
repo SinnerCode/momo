@@ -1,11 +1,13 @@
 import { act } from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { CONFIGURATION_URL, PICK_FOLDER_URL } from '../../src/configuration-endpoints';
 import type { ConfigurationData } from '../../src/react/bundle';
 import { CloudDriveGuide } from '../../src/react/settings/clouddrive-guide';
 import { MEDIA_SOURCE_ICONS } from '../../src/ui-kit/media-source-icons';
 import { MediaSettings } from '../../src/react/settings/media-settings';
+import { MEDIA_PROCESSING_KEY } from '../../src/react/settings-panel/settings-data';
+import { queryClient } from '../../src/react/query';
 import { buttonNamed, choose, click, fetchMock, mount, section, sentBody, settle, submit, type } from './render';
 
 vi.mock('../../src/react/settings/service-preferences', () => ({ VideoThumbnailRow: () => null }));
@@ -13,7 +15,15 @@ vi.mock('../../src/react/settings/cloud-proxy-settings', () => ({ CloudProxySett
 vi.mock('@peach/legacy/ui', async (original) => ({
   ...await original<Record<string, unknown>>(),
   MEDIA_SOURCE_ICONS: (await import('../../src/ui-kit/media-source-icons')).MEDIA_SOURCE_ICONS,
+  confirmModal: (await import('../../src/ui-kit/modal')).confirmModal,
 }));
+/* 保存前先读一次扫描与采集的状态。单独接住它，各用例的 `fetch` 桩只数配置请求。 */
+const processing = vi.hoisted(() => ({ read: vi.fn(async (): Promise<{ status: string; trigger?: string }> => ({ status: 'idle' })) }));
+vi.mock('../../src/react/library-processing/library-processing', async (original) => ({
+  ...await original<Record<string, unknown>>(),
+  fetchLibraryProcessing: () => processing.read(),
+}));
+afterEach(() => { processing.read.mockReset(); processing.read.mockResolvedValue({ status: 'idle' }) });
 
 const data = (over: Partial<ConfigurationData> = {}): ConfigurationData => ({
   editable: true, notice: '', revision: 'rev-1', media_dirs: ['D:\\Media'], library_count: 1, port: 9123, facts: [], ...over,
@@ -54,7 +64,8 @@ it('局域网 HTTP 页面没有 randomUUID 时，旧目录补上媒体库身份�
     const host = await open({ media_sources: [{ location: 'local', root: '/media', path: '/media', cost: 'free' }] });
     expect(host.querySelector('form')).not.toBeNull();
     await submit(host.querySelector('form'));
-    expect(sentBody(fetcher).media_sources[0].library_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    const save = fetcher.mock.calls.findIndex(([, init]) => (init as RequestInit | undefined)?.method === 'POST');
+    expect(sentBody(fetcher, save).media_sources[0].library_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   } finally {
     vi.unstubAllGlobals();
   }
@@ -80,6 +91,35 @@ describe('媒体目录', () => {
     expect(host.querySelector('[aria-label="SMB 账号 1"]')).not.toBeNull();
     await choose(source(), '本地磁盘');
     expect(host.querySelector('[aria-label="SMB 账号 1"]')).toBeNull();
+  });
+
+  it('勾了「移除账号」时账号、密码与加密一起禁用，取消后恢复', async () => {
+    const host = await open({ media_sources: [{ location: 'local', root: 'D:\\Media', path: 'D:\\Media' }] });
+    await choose(host.querySelector('[aria-label="媒体来源 1"]'), 'SMB 共享');
+    const fields = () => [host.querySelector<HTMLInputElement>('input[aria-label="SMB 账号 1"]')!.disabled,
+      host.querySelector<HTMLInputElement>('input[aria-label="SMB 密码 1"]')!.disabled,
+      [...host.querySelectorAll<HTMLLabelElement>('label')].find((label) => label.textContent?.includes('要求 SMB 加密'))!
+        .querySelector<HTMLInputElement>('input')!.disabled];
+    const remove = () => [...host.querySelectorAll<HTMLLabelElement>('label')].find((label) => label.textContent?.includes('移除已保存的 SMB 账号'))!;
+    expect(fields()).toEqual([false, false, false]);
+    await click(remove());
+    expect(fields()).toEqual([true, true, true]);
+    await click(remove());
+    expect(fields()).toEqual([false, false, false]);
+  });
+
+  it('关掉视频预览生成时，自定义步骤里的九宫格变灰并说明，其他步骤照常', async () => {
+    const before = queryClient.getQueryData(MEDIA_PROCESSING_KEY);
+    queryClient.setQueryData(MEDIA_PROCESSING_KEY, { metadata_only: true });
+    try {
+      const host = await open({ media_sources: [{ location: 'local', root: 'D:\\Media', path: 'D:\\Media', library_policy: 'custom', library_stages: 'probe,preview' }] });
+      const step = (text: string) => [...host.querySelectorAll<HTMLLabelElement>('label')]
+        .find((label) => label.textContent === text)!.querySelector<HTMLInputElement>('input')!;
+      expect([step('生成九宫格预览').disabled, step('生成九宫格预览').checked, step('读取视频信息').disabled]).toEqual([true, true, false]);
+      expect(host.textContent).toContain('九宫格这一步不会执行');
+    } finally {
+      queryClient.setQueryData(MEDIA_PROCESSING_KEY, before);
+    }
   });
 
   it('保存 SMB 来源保留目录身份，密码输入保持为空', async () => {
@@ -212,14 +252,14 @@ describe('媒体目录', () => {
     ]);
   });
 
-  it('已保存的目录回填代理保护，用户可改为正常读取', async () => {
+  it('已保存的目录回填流量保护，用户可改为正常读取', async () => {
     const fetcher = fetchMock(200, { saved: true, url: '/', revision: 'rev-2' });
     vi.stubGlobal('fetch', fetcher);
     const host = await open({ windows: true, media_sources: [
       { location: 'onedrive', root: 'O:\\Movies', path: 'O:\\Movies', cost: 'metered' },
     ] });
     const policy = rows(host)[0]?.querySelector('[data-media-read-policy] [aria-haspopup="listbox"]');
-    expect(policy?.textContent).toContain('代理保护');
+    expect(policy?.textContent).toContain('流量保护');
     await choose(policy, '正常读取');
     await submit(host.querySelector('form'));
     expect(sentBody(fetcher).media_sources).toMatchObject([
@@ -273,7 +313,7 @@ describe('选择文件夹', () => {
     const [url, init] = fetcher.mock.calls[0] ?? [];
     expect(url).toBe(PICK_FOLDER_URL);
     expect(init?.method).toBe('POST');
-    expect(sentBody(fetcher)).toEqual({ initial: 'D:\\Media' });
+    expect(sentBody(fetcher)).toEqual({ initial: 'D:\\Media', purpose: 'media', start: true });
     expect(paths(host)[0]?.value).toBe('E:\\Movies');
     expect(pick.getAttribute('aria-busy'), '对话框关了忙态要撤掉').toBeNull();
   });
@@ -294,6 +334,28 @@ describe('选择文件夹', () => {
 });
 
 describe('保存', () => {
+  it('扫描与采集在跑时先确认重启的影响，取消就不保存；读不到任务状态时照常保存', async () => {
+    const fetcher = fetchMock(200, { saved: true, url: '/', revision: 'rev-2' });
+    vi.stubGlobal('fetch', fetcher);
+    try {
+      processing.read.mockResolvedValue({ status: 'running', trigger: 'cli' });
+      const host = await open();
+      await submit(host.querySelector('form'));
+      await settle();
+      const dialog = document.querySelector('dialog');
+      expect(dialog?.textContent).toContain('这个任务由命令行或托盘发起，不受重启影响');
+      await click(dialog!.querySelector('[data-modal-cancel]'));
+      await settle();
+      expect(fetcher).not.toHaveBeenCalled();
+      processing.read.mockRejectedValue(new Error('连接中断'));
+      await submit(host.querySelector('form'));
+      await settle();
+      expect(fetcher.mock.calls[0]?.[0]).toBe(CONFIGURATION_URL);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('提交带上指纹、全部文件夹、端口与是否扫描，成功后回执并留下新地址', async () => {
     const fetcher = fetchMock(200, { saved: true, url: 'http://127.0.0.1:9124/', revision: 'rev-2' });
     vi.stubGlobal('fetch', fetcher);

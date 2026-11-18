@@ -36,6 +36,8 @@ if str(SRC_DIR) not in sys.path:
 
 from peach.appid import LEGACY_MACOS_LAUNCH_AGENT_LABELS, MACOS_LAUNCH_AGENT_LABEL
 from peach.config import LOG_DIR, PROJECT_ROOT
+from peach.desktop_startup import launch_agent_supervision
+from peach.interface_text import dev as t
 
 
 LABEL = MACOS_LAUNCH_AGENT_LABEL
@@ -57,8 +59,8 @@ def build_plist(tray: Path) -> dict:
         # 直接跑目标程序，中间不能有 exec 跳板，否则菜单栏项注册不上。
         "ProgramArguments": [str(tray)],
         "RunAtLoad": True,
-        # 菜单栏项是用户主动退出的，不要自动拉回来。
-        "KeepAlive": False,
+        # 从菜单退出不拉回来，崩溃才拉回来；与设置页写的登录启动项同一份设置。
+        **launch_agent_supervision(True),
         "ProcessType": "Interactive",
         # launchd 给的 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，找不到 Homebrew 的
         # ffmpeg/ffprobe，转码和抽帧会静默变成「不可用」。
@@ -97,7 +99,7 @@ def remove_legacy_agents(domain: str) -> list[str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="注册 / 注销 Peach 菜单栏项的 LaunchAgent")
+    parser = argparse.ArgumentParser(description=t("install_macos_agent.description"))
     parser.add_argument("action", choices=("install", "uninstall", "status"),
                         nargs="?", default="install")
     parser.add_argument("--tray", type=Path,
@@ -111,21 +113,21 @@ def run(args: argparse.Namespace) -> int:
 
     if args.action == "status":
         result = launchctl("print", f"{domain}/{LABEL}")
-        print(f"plist：{target}（{'存在' if target.is_file() else '不存在'}）")
-        print("已加载" if result.returncode == 0 else "未加载")
+        print(t("install_macos_agent.plistState", target=target, state=t("install_macos_agent.exists") if target.is_file() else t("install_macos_agent.missing")))
+        print(t("install_macos_agent.loaded") if result.returncode == 0 else t("install_macos_agent.notLoaded"))
         return 0
 
     if args.action == "uninstall":
         launchctl("bootout", f"{domain}/{LABEL}")
         if target.is_file():
             target.unlink()
-        print(f"已注销 {LABEL}")
+        print(t("install_macos_agent.uninstalled", label=LABEL))
         return 0
 
     if not args.tray.is_file():
-        raise SystemExit(f"找不到 peach-tray：{args.tray}（先 pip install -e .）")
+        raise SystemExit(t("install_macos_agent.trayMissing", tray=args.tray))
     for label in remove_legacy_agents(domain):
-        print(f"已清理遗留 LaunchAgent {label}")
+        print(t("install_macos_agent.legacyRemoved", label=label))
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(plistlib.dumps(build_plist(args.tray)))
@@ -139,12 +141,12 @@ def run(args: argparse.Namespace) -> int:
         time.sleep(0.2)
     result = launchctl("bootstrap", domain, str(target))
     if result.returncode != 0:
-        raise SystemExit(f"launchctl bootstrap 失败：{result.stderr.strip()}")
+        raise SystemExit(t("install_macos_agent.bootstrapFailed", stderr=result.stderr.strip()))
     launchctl("kickstart", "-k", f"{domain}/{LABEL}")
-    print(f"已注册并启动 {LABEL}（用户 {getpass.getuser()}）")
-    print(f"  plist：{target}")
-    print(f"  日志：{LOG_DIR / 'macos-tray.log'}")
-    print(f"  停止：launchctl bootout {domain}/{LABEL}")
+    print(t("install_macos_agent.installed", label=LABEL, user=getpass.getuser()))
+    print(t("install_macos_agent.plistPath", target=target))
+    print(t("install_macos_agent.logPath", log=LOG_DIR / 'macos-tray.log'))
+    print(t("install_macos_agent.stopHint", domain=domain, label=LABEL))
     return 0
 
 

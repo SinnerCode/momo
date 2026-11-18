@@ -58,12 +58,30 @@ class OfficialPreviewTests(unittest.TestCase):
             200, {}, json.dumps({'data': {'ppvContent': {**item, 'sample2DMovie': None}}}).encode()))), '')
 
     def test_dmm_media_boundary_rejects_credentials_fragments_and_other_hosts(self):
-        self.assertEqual(dmm_preview_url(DMM_VIDEO), DMM_VIDEO)
+        # DMM 换过预告主机（cc3001 → tencc3001）：DMM 自己域名下的主机都认。
+        for url in [DMM_VIDEO, DMM_VIDEO.replace('cc3001.', 'tencc3001.'),
+                    'https://tencc3001.dmm.co.jp/pv/TXIzJDkq45zQjNREbc2UuietOP16/sqte738hhb.mp4']:
+            with self.subTest(url=url):
+                self.assertEqual(dmm_preview_url(url), url)
         for url in [DMM_VIDEO.replace('https:', 'http:'), DMM_VIDEO + '#fragment',
-                    DMM_VIDEO.replace('cc3001.', 'cc3001.evil.'), DMM_VIDEO.replace('https://', 'https://user:pass@'),
-                    DMM_VIDEO.replace('/pv/', '/private/'), DMM_VIDEO.replace('.mp4', '.jpg')]:
+                    DMM_VIDEO.replace('dmm.co.jp', 'dmm.co.jp.evil.test'), DMM_VIDEO.replace('cc3001.dmm', 'evildmm'),
+                    DMM_VIDEO.replace('cc3001.dmm.co.jp', 'dmm.co.jp'), DMM_VIDEO.replace('https://', 'https://user:pass@'),
+                    DMM_VIDEO.replace('/pv/', '/pv/../'), DMM_VIDEO.replace('.mp4', '.jpg')]:
             with self.subTest(url=url):
                 self.assertEqual(dmm_preview_url(url), '')
+
+    def test_an_unrecognised_dmm_address_says_so_instead_of_asking_to_retry(self):
+        """DMM 声明了预告、地址却不认时，原因不是网络：界面写出主机，日志留下原地址。"""
+        item = {'id': 'rctd00764', 'makerContentId': 'RCTD-764',
+                'sample2DMovie': {'highestMovieUrl': 'https://private.invalid/sample.mp4'}}
+        transport = Mock(return_value=HttpResponse(200, {}, json.dumps({'data': {'ppvContent': item}}).encode()))
+        with self.assertLogs('peach.jav_official_preview', 'WARNING') as logs, \
+                self.assertRaises(PublicSourceUnavailable) as raised:
+            dmm_preview('RCTD-764', Path('unused'), transport=transport)
+        self.assertEqual((raised.exception.code, raised.exception.params),
+                         ('errors.javOfficialPreview.dmmUnrecognized', {'host': 'private.invalid'}))
+        self.assertIn('private.invalid', str(raised.exception))
+        self.assertIn('https://private.invalid/sample.mp4', logs.output[0])
 
     def test_dmm_response_without_product_field_is_unavailable(self):
         with self.assertRaises(PublicSourceUnavailable):
@@ -86,10 +104,33 @@ class OfficialPreviewTests(unittest.TestCase):
         self.assertEqual(javdb_preview('RCTD-764', None, Path('unused'), transport=transport), DMM_VIDEO)
         self.assertEqual(transport.call_count, 2)
 
+    def test_javdb_detail_page_waits_on_the_process_wide_javdb_interval(self):
+        """资料处理刚问过 javdb.com，点开预告这一页排在同一条 3 秒队里，不另起一份间隔。"""
+        from peach import library_processing
+        from peach.scripting import HostLimiter
+
+        now, slept = [50.0], []
+
+        def sleep(delay):
+            slept.append(delay)
+            now[0] += delay
+
+        shared = HostLimiter(library_processing.SOURCE_INTERVALS, default_interval=2.0,
+                             clock=lambda: now[0], sleeper=sleep)
+        html = ('<div class="panel-block"><strong>番號:</strong><span class="value">RCTD-764</span></div>'
+                f'<video><source src="{DMM_VIDEO}"></video>')
+        inner = Mock(return_value=HttpResponse(200, {}, html.encode()))
+        with patch.object(library_processing, 'SOURCE_LIMITER', shared), \
+                patch('peach.jav_official_preview.SourceTransport', return_value=inner):
+            shared.wait('https://javdb.com/v/Other')
+            self.assertEqual(javdb_preview('RCTD-764', 'ZN9Ad6', Path('unused')), DMM_VIDEO)
+        self.assertEqual(slept, [3.0])
+        inner.close.assert_called_once()
+
     def test_preview_source_order_and_webui_fallback(self):
         mirror = 'https://jdforrepam.com/api/v1/movies/ttm3u8/preview/sample/720p.m3u8'
         for dmm, javdb, expected in [(DMM_VIDEO, '', DMM_VIDEO), ('', DMM_VIDEO, DMM_VIDEO), ('', '', mirror),
-                                     (PublicSourceUnavailable('DMM 未取得'), '', mirror)]:
+                                     (PublicSourceUnavailable('errors.javOfficialPreview.dmmUnavailable'), '', mirror)]:
             with self.subTest(dmm=dmm, javdb=javdb), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 contract = WebContract(fresh_ledger(root), cover_root=root / 'covers')
@@ -126,7 +167,7 @@ class OfficialPreviewTests(unittest.TestCase):
             contract = WebContract(fresh_ledger(root), cover_root=root / 'covers')
             self.addCleanup(contract.stop_background_jobs)
             api = PublicAPI()
-            api.movie = Mock(side_effect=PublicSourceUnavailable('WebUI 未取得'))
+            api.movie = Mock(side_effect=PublicSourceUnavailable('errors.javdbPublic.unavailable'))
             with patch('peach.web_jav_detail.PUBLIC_API', api), \
                     patch('peach.jav_official_preview.dmm_preview', return_value=DMM_VIDEO):
                 payload = q_jav_detail(contract, {'code': 'RCTD-764'})
@@ -231,8 +272,85 @@ class OfficialPreviewTests(unittest.TestCase):
             api = PublicAPI()
             api.movie = Mock(return_value={'number': 'EXM-001', 'id': 'Exact', 'maker_name': 'Prestige'})
             with patch('peach.web_jav_detail.PUBLIC_API', api), \
-                    patch('peach.jav_official_preview.prestige_preview', side_effect=PublicSourceUnavailable('预告连接未取得')):
+                    patch('peach.jav_official_preview.prestige_preview', side_effect=PublicSourceUnavailable('errors.javOfficialPreview.officialUnavailable')):
                 payload = q_jav_detail(contract, {'code': 'EXM-001'})
             self.assertEqual(payload['state'], 'ready')
             self.assertEqual(payload['preview_state'], 'unavailable')
-            self.assertIn('预告连接未取得', payload['message'])
+            # 预告的原因单独给，页面写在预告本来的位置；资料那句只说资料。
+            self.assertIn('官方视频预览未取得', payload['preview_message'])
+            self.assertEqual(payload['message'], '')
+
+    def test_a_preview_kept_from_an_earlier_fetch_and_a_missing_cover_say_only_what_is_missing(self):
+        """预告这次没问到、沿用上次的地址时照样能播，资料那句不提它；没有封面时带上取图记录里的原因。"""
+        from types import SimpleNamespace
+        from peach import javdb_public
+
+        def preview(contract, code, source, *, refresh=False):
+            javdb_public._record_read('preview:dmm:EXM-001', SimpleNamespace(saved=0.0),
+                                      PublicSourceUnavailable('errors.javOfficialPreview.dmmUnavailable'))
+            return {'preview_video_url': '/jav-preview/EXM-001/ref', 'preview_state': 'ready'}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            contract = WebContract(fresh_ledger(root), cover_root=root / 'covers')
+            self.addCleanup(contract.stop_background_jobs)
+            attempts = root / 'feed-cover-attempts'
+            attempts.mkdir()
+            (attempts / 'EXM-001.json').write_text(json.dumps(
+                {'code': 'EXM-001', 'ok': False, 'reason_code': 'errors.javCoverFetch.noCandidates', 'reason_params': {}}),
+                encoding='utf-8')
+            api = PublicAPI()
+            api.movie = Mock(return_value={'number': 'EXM-001', 'id': 'Exact'})
+            with patch('peach.web_jav_detail.PUBLIC_API', api), patch('peach.web_jav_detail._preview_fields', preview):
+                payload = q_jav_detail(contract, {'code': 'EXM-001'})
+        self.assertEqual((payload['message'], payload.get('cache_stale')), ('', None))
+        self.assertEqual(payload['preview_state'], 'ready')
+        self.assertEqual(payload['cover_message_code'], 'errors.javCoverFetch.noCandidates')
+
+    def test_an_official_placeholder_is_not_shown_as_the_cover(self):
+        """取图记录认出官方地址只有「准备中」占位图：详情不拿新作行上的那个地址当封面，改说原因。"""
+        from peach import feeds
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            contract = WebContract(fresh_ledger(root), cover_root=root / 'covers')
+            self.addCleanup(contract.stop_background_jobs)
+            with contract.database.write_transaction() as connection:
+                shell = feeds.create_shell(connection, 'EXM-001', source_id=None, title='示例作品')
+                connection.execute("UPDATE feed_discovery SET cover_url=? WHERE id=?",
+                                   ('https://pics.dmm.co.jp/digital/video/exm00001/exm00001pl.jpg', shell))
+            attempts = root / 'feed-cover-attempts'
+            attempts.mkdir()
+            (attempts / 'EXM-001.json').write_text(json.dumps(
+                {'code': 'EXM-001', 'ok': False, 'reason_code': 'errors.javCoverFetch.officialPlaceholderOnly',
+                 'reason_params': {}}), encoding='utf-8')
+            api = PublicAPI()
+            api.movie = Mock(return_value={'number': 'EXM-001', 'id': 'Exact'})
+            with patch('peach.web_jav_detail.PUBLIC_API', api), \
+                    patch('peach.web_jav_detail._preview_fields', return_value={'preview_video_url': '', 'preview_state': 'missing'}):
+                payload = q_jav_detail(contract, {'code': 'EXM-001'})
+        self.assertEqual((payload['has_cover'], payload['cover_url']), (False, ''))
+        self.assertEqual(payload['cover_message_code'], 'errors.javCoverFetch.officialPlaceholderOnly')
+
+    def test_a_cooling_source_still_opens_the_detail_from_the_local_feed_row(self):
+        """JavDB 在冷却：详情照样打开，片名、演员取本机新作行，资料那句说来源暂停，不是整页失败。"""
+        from contextlib import nullcontext
+        from peach import feeds
+        from peach.scraping_access import SourcePaused
+
+        def cooling(path):
+            raise SourcePaused('errors.scrapingAccess.coolingDown')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            contract = WebContract(fresh_ledger(root), cover_root=root / 'covers')
+            self.addCleanup(contract.stop_background_jobs)
+            with contract.database.write_transaction() as connection:
+                shell = feeds.create_shell(connection, 'EXM-001', source_id=None, title='示例作品')
+                connection.execute("UPDATE feed_discovery SET performers=? WHERE id=?", ('示例演员', shell))
+            api = PublicAPI()
+            api.login_until = api.clock() + 3600
+            with patch('peach.web_jav_detail.PUBLIC_API', api), \
+                    patch('peach.web_jav_detail._jav_pages', return_value=nullcontext(cooling)), \
+                    patch('peach.web_jav_detail._preview_fields', return_value={'preview_video_url': '', 'preview_state': 'missing'}):
+                payload = q_jav_detail(contract, {'code': 'EXM-001'})
+        self.assertEqual((payload['ok'], payload['state'], payload['title']), (True, 'partial', '示例作品'))
+        self.assertEqual(payload['performers'], '示例演员')
+        self.assertTrue(payload['message'])

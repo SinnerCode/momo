@@ -4,7 +4,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 
 import { appSettingsStore } from '../../src/appearance/settings';
 import { queryClient } from '../../src/react/query';
-import { FollowPreferenceRows, VideoThumbnailRow } from '../../src/react/settings/service-preferences';
+import { FollowPreferenceRows, VideoThumbnailRow, TaskSpeedSettings } from '../../src/react/settings/service-preferences';
 import { configurationContentSkeleton } from '../../src/configuration-skeleton';
 import { buttonNamed, choose, click, mount, mountRoot, pending, settle, type } from './render';
 
@@ -37,18 +37,68 @@ function server() {
   return { posts, settings, schedule, feedSchedule, thumbnails };
 }
 
+it('每趟采集上限三项默认显示现有档位，改了按设置保存', async () => {
+  const { posts } = server();
+  const receipt = vi.fn();
+  const host = await mount(<QueryClientProvider client={queryClient}><TaskSpeedSettings receipt={receipt} /></QueryClientProvider>);
+  await settle();
+  expect(host.querySelector('#sourceBudgetRequestsSetting button')?.textContent).toContain('6,000 次');
+  expect(host.querySelector('#sourceBudgetHoursSetting button')?.textContent).toContain('4 小时');
+  expect(host.querySelector('#sourceBudgetGigabytesSetting button')?.textContent).toContain('1 GB');
+  await choose(host.querySelector('#sourceBudgetHoursSetting button'), '12 小时');
+  await settle();
+  expect(posts).toEqual([{ url: '/api/settings', body: { sourceBudgetHours: 12 } }]);
+  expect(receipt).toHaveBeenCalledWith('已保存每趟采集上限');
+});
+
 const mountFollowRows = async () => {
   const host = await mount(<QueryClientProvider client={queryClient}><FollowPreferenceRows receipt={vi.fn()} /></QueryClientProvider>);
   await settle();
   return host;
 };
 
+it('默认任务档位通过共享设置保存，并显示保存回执', async () => {
+  const { posts } = server();
+  const receipt = vi.fn();
+  const host = await mount(<QueryClientProvider client={queryClient}><TaskSpeedSettings receipt={receipt} /></QueryClientProvider>);
+  await settle();
+  await click(buttonNamed('标准', host));
+  const slider = document.querySelector('input[type="range"]')!;
+  await act(async () => {
+    slider.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true }));
+    slider.dispatchEvent(new KeyboardEvent('keyup', { key: 'Home', bubbles: true }));
+  });
+  await vi.waitFor(() => expect(buttonNamed('低占用', host)).not.toBeNull());
+  expect(posts).toEqual([{ url: '/api/settings', body: { taskSpeedMode: 'low' } }]);
+  expect(receipt).toHaveBeenCalledWith('已保存默认处理速度');
+});
+
 it('订阅源拉取读出间隔，没有失败时两个调度都不出提示', async () => {
   server();
   const host = await mountFollowRows();
   expect(host.textContent).toContain('订阅源拉取');
-  expect(host.textContent).toContain('每 6 小时');
+  expect(host.querySelector<HTMLInputElement>('input[aria-label="订阅源拉取间隔"]')?.value).toBe('360');
   expect(host.querySelector('[role="alert"]')).toBeNull();
+});
+
+it('订阅源拉取可以改间隔、关掉再打开，关掉时记住原来的间隔', async () => {
+  const { posts } = server();
+  const host = await mountFollowRows();
+  const input = host.querySelector<HTMLInputElement>('input[aria-label="订阅源拉取间隔"]')!;
+  await type(input, '720');
+  await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+  await settle();
+  await click(host.querySelector('#feedScheduleSetting input[role="switch"]'));
+  await settle();
+  expect(host.querySelector('input[aria-label="订阅源拉取间隔"]')).toBeNull();
+  await click(host.querySelector('#feedScheduleSetting input[role="switch"]'));
+  await settle();
+  expect(posts).toEqual([
+    { url: '/api/feeds/schedule', body: { enabled: true, interval_minutes: 720 } },
+    { url: '/api/feeds/schedule', body: { enabled: false, interval_minutes: 360 } },
+    { url: '/api/feeds/schedule', body: { enabled: true, interval_minutes: 720 } },
+  ]);
+  localStorage.removeItem('peach.number.feedScheduleSetting');
 });
 
 it('关注检查失败时在它那一行下面写出原因与连续失败次数', async () => {
@@ -77,12 +127,12 @@ it('订阅源拉取失败时写出原因；正在跑的一轮与关闭的调度�
   Object.assign(feedSchedule, { enabled: false });
   const quiet = await mountFollowRows();
   expect(quiet.querySelector('[role="alert"]')).toBeNull();
-  expect(quiet.textContent).toContain('已关闭');
+  expect(quiet.querySelector<HTMLInputElement>('#feedScheduleSetting input[role="switch"]')?.checked).toBe(false);
 });
 
 it.each([
-  ['follow', '/api/follow/schedule/run', '正在检查来源更新…'],
-  ['feed', '/api/feeds/schedule/run', '正在拉取订阅源…'],
+  ['follow', '/api/follow/schedule/run', '正在检查来源更新'],
+  ['feed', '/api/feeds/schedule/run', '正在拉取订阅源'],
 ] as const)('%s 调度失败后立即重试走调度自己的重跑接口，跑起来后原因收起', async (kind, url, running) => {
   const { posts, schedule, feedSchedule } = server();
   Object.assign(kind === 'follow' ? schedule : feedSchedule, { last_error: '上游断了', consecutive_failures: 1 });
@@ -173,7 +223,7 @@ it('首次读取时「关注采集」就是五行，与配置页整页骨架同�
   const waiting = labels(host);
   expect(waiting).toEqual(['自动检查更新', '订阅源拉取', '首次采集范围', '头像刷新', 'favicon 刷新']);
   expect(labels(page), '整页骨架画的也是这五行').toEqual(waiting);
-  expect(host.querySelector('[data-skeleton][aria-label="正在读取订阅源拉取间隔"]')).not.toBeNull();
+  expect(host.querySelector<HTMLInputElement>('#feedScheduleSetting input[role="switch"]')?.disabled).toBe(true);
   server();
   await hold.release({ ok: true, status: 200, json: async () => ({ available: true, enabled: true, interval_minutes: 360 }) });
   await settle();

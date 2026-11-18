@@ -5,7 +5,7 @@
 联网问 `BATCH` 部；推进了又还有要补的，就原地接一条（ADR-0084），存量不必等几十次处理。
 
 每部先读本机来源快照，处理链问过的站已经把样张地址带回来了（DMM 的 `sample_images`、
-amane 桥的 `screenshot_urls`）；快照里没有才按番号分档问一站：有码问 DMM，素人问 MGS。
+amane 桥的 `screenshot_urls`）；快照里没有才按番号分档问官方站：有码先问 DMM、没有再问 r18.dev，素人问 MGS。
 写入按 ADR-0052 直接落，`source` 记 `auto:sample-images@<任务行 id>`，
 `scripts/revert_auto_landing.py --source auto:sample-images` 整批撤回。
 
@@ -18,10 +18,12 @@ import time
 from pathlib import Path
 
 from . import sample_images
-from .followups import FollowupType, register
+from .followups import Followup, FollowupType, register
+from .task_outcomes import joined, part, said
+from .task_runs import item_progress, task_label
 
 TASK_KEY = "code-samples"
-TASK_LABEL = "补番号样张"
+TASK_LABEL = task_label(TASK_KEY)
 
 #: 一轮只派一条，key 固定：同一件事同时只会有一条在排队或在跑。
 FOLLOWUP_KEY = f"{TASK_KEY}:stock"
@@ -53,7 +55,7 @@ def plan(database, config, cover_root) -> list[dict]:
                 connection, lambda key: (covers / f"{key}.jpg").is_file(), misses, snapshots, limit=1)
     except (OSError, sqlite3.Error):
         return []
-    return [{"key": FOLLOWUP_KEY, "task_key": TASK_KEY, "label": TASK_LABEL}] if found else []
+    return [Followup.item(FOLLOWUP_KEY, TASK_KEY).declared()] if found else []
 
 
 def _missing(error: Exception) -> bool:
@@ -85,10 +87,49 @@ class _SampleCheckpoint:
             self.handle.checkpoint(completed_codes=sorted(self.completed), landed=landed, images=images)
 
 
+def _ask_sites(transport, code: str, sites, *, misses, paused: set, room: int, deadline: float):
+    """按顺序问几站的样张：前一站说没有、出错或冷却就问下一站。
+
+    返回 `(站, 地址, 结局, 联网次数)`；有地址时结局为空，否则是 `paused`、`recent_miss`、`deferred`（名额或预算用完）、
+    `absent`（说没有，已记进失败记忆）或 `failed`，一部只记一个结局。冷却的站加进 `paused`，同批后面的番号不再问它。
+    """
+    from .jav_cover_fetch import DeadlineExceeded
+    from .scraping_access import SourcePaused
+    outcome, spent, site = "", 0, ""
+    for site in sites:
+        if site in paused or misses.fresh(site, code):
+            outcome = outcome or ("paused" if site in paused else "recent_miss")
+            continue
+        if spent >= room:
+            return site, [], "deferred", spent
+        spent += 1
+        try:
+            urls = sample_images.usable(sample_images.FETCHERS[site](transport, code, deadline=deadline))
+        except SourcePaused:
+            # 冷却或本趟预算用完：不记「没有」。
+            paused.add(site)
+            outcome = "paused"
+            continue
+        except DeadlineExceeded:
+            return site, [], "deferred", spent
+        except Exception as error:  # noqa: BLE001 - 一部取不到不影响同批其余几部
+            if _missing(error):
+                misses.record(site, code)
+                outcome = "absent"
+            else:
+                outcome = "failed"
+            continue
+        if urls:
+            return site, urls, "", spent
+        misses.record(site, code)
+        outcome = "absent"
+    return site, [], outcome, spent
+
+
 def run(contract, key: str, handle, *, transport=None, clock=time.monotonic) -> dict:
     """跑一条补样张后继，返回活动页上那一行的摘要。"""
-    from .jav_cover_fetch import DeadlineExceeded, HostLimitedTransport
-    from .scraping_access import SourcePaused, SourceTransport
+    from .jav_cover_fetch import HostLimitedTransport
+    from .scraping_access import SourceTransport
 
     generated = Path(contract.candidate_root)
     misses = sample_images.Misses(sample_images.misses_path(generated))
@@ -96,7 +137,7 @@ def run(contract, key: str, handle, *, transport=None, clock=time.monotonic) -> 
     checkpoint = _SampleCheckpoint(contract, handle, misses, snapshots)
     codes = checkpoint.codes
     if not codes:
-        return {"outcome": "没有要补的番号", "codes": 0}
+        return {**said("noCodes"), "codes": 0}
     batch = sample_images.batch_for(getattr(handle, "run_id", None))
     owned = transport is None
     if owned:
@@ -116,7 +157,7 @@ def run(contract, key: str, handle, *, transport=None, clock=time.monotonic) -> 
             if code in checkpoint.completed:
                 continue
             if handle is not None:
-                handle.progress(current=max(index, len(checkpoint.completed)), total=len(codes), label=f"{TASK_LABEL}：{code}")
+                handle.progress(current=max(index, len(checkpoint.completed)), total=len(codes), **item_progress(TASK_KEY, code))
             site, urls = "", []
             snapshot = sample_images.snapshot_samples(snapshots.get(code, ()))
             if snapshot:
@@ -126,42 +167,23 @@ def run(contract, key: str, handle, *, transport=None, clock=time.monotonic) -> 
                 misses.record("snapshot", code)
                 probed += 1
             if not urls:
-                site = sample_images.site_for(code) or ""
-                if not site:
+                sites = sample_images.sites_for(code)
+                if not sites:
                     skipped["no_site"] += 1
                     continue
-                if site in paused:
-                    skipped["paused"] += 1
-                    continue
-                if misses.fresh(site, code):
-                    skipped["recent_miss"] += 1
-                    continue
-                # 联网名额或预算用完：这一部留到下一轮，后面快照里现成的照样落
-                if asked >= BATCH or clock() >= deadline:
-                    deferred += 1
-                    continue
-                asked += 1
-                try:
-                    urls = sample_images.usable(
-                        sample_images.FETCHERS[site](transport, code, deadline=deadline))
-                except SourcePaused:
-                    # 冷却或本趟预算用完：这一站后面的都不问，也不记「没有」。
-                    paused.add(site)
-                    skipped["paused"] += 1
-                    continue
-                except DeadlineExceeded:
-                    deferred += 1
-                    continue
-                except Exception as error:  # noqa: BLE001 - 一部取不到不影响同批其余几部
-                    if _missing(error):
-                        misses.record(site, code)
+                site, urls, outcome, spent = _ask_sites(
+                    transport, code, sites, misses=misses, paused=paused,
+                    room=BATCH - asked if clock() < deadline else 0, deadline=deadline)
+                asked += spent
+                if not urls:
+                    if outcome in skipped:
+                        skipped[outcome] += 1
+                    elif outcome == "deferred":
+                        deferred += 1
+                    elif outcome == "absent":
                         absent += 1
                     else:
                         failed += 1
-                    continue
-                if not urls:
-                    misses.record(site, code)
-                    absent += 1
                     continue
             with contract.database.write_transaction() as connection:
                 count = sample_images.land(connection, code, site, urls, source=batch)
@@ -176,7 +198,7 @@ def run(contract, key: str, handle, *, transport=None, clock=time.monotonic) -> 
     if landed:
         contract.cache_bust()
     if handle is not None:
-        handle.progress(current=len(codes), total=len(codes), label=TASK_LABEL, throttle=0)
+        handle.progress(current=len(codes), total=len(codes), **item_progress(TASK_KEY), throttle=0)
     with contract.database.read_connection() as connection:
         remaining = len(sample_images.pending(connection, contract.has_cover, misses, snapshots, limit=10 ** 6))
     summary = {"codes": len(codes), "landed": landed, "images": images, "absent": absent, "failed": failed,
@@ -186,22 +208,19 @@ def run(contract, key: str, handle, *, transport=None, clock=time.monotonic) -> 
                "continue": remaining > 0 and landed + absent + probed > 0}
     if paused:
         summary["paused"] = sorted(paused)
-    return {"outcome": _outcome(summary), **summary}
+    return {**said(_outcome(summary)), **summary}
 
 
-def _outcome(summary: dict) -> str:
-    """活动页上那一行：补上几部、跳过几部各为什么、还剩几部、接不接着跑。"""
+def _outcome(summary: dict) -> list[dict]:
+    """活动页上那一行的段落：补上几部、跳过几部各为什么、还剩几部、接不接着跑。"""
     skipped, deferred, remaining = summary["skipped"], summary["deferred"], summary["remaining"]
-    text = f"补上 {summary['landed']} 部的样张（{summary['images']} 张）" if summary["landed"] else "这一轮没有补上样张"
-    reasons = [line for count, line in ((skipped["no_site"], f"{skipped['no_site']} 部没有可问的官方站"),
-                                        (skipped["recent_miss"], f"{skipped['recent_miss']} 部那一站近期说过没有"),
-                                        (skipped["paused"], f"{skipped['paused']} 部因来源冷却"),
-                                        (deferred, f"{deferred} 部联网名额用完留到下一轮")) if count]
-    if reasons:
-        text += "；跳过 " + "、".join(reasons)
-    if remaining:
-        text += f"；还有 {remaining} 部待补，" + ("接着排下一轮" if summary["continue"] else "等下一次处理")
-    return text
+    landed = (part("samplesLanded", landed=summary["landed"], images=summary["images"]) if summary["landed"]
+              else part("noSamples"))
+    reasons = [part(code, count=count) for code, count in (
+        ("skipNoSite", skipped["no_site"]), ("skipRecentMiss", skipped["recent_miss"]),
+        ("skipPaused", skipped["paused"]), ("skipDeferred", deferred)) if count]
+    rest = part("remainingNext" if summary["continue"] else "remainingLater", count=remaining) if remaining else []
+    return joined([landed, [part("skipped"), *joined(reasons, "listComma")] if reasons else [], rest])
 
 
 #: 写账本：样张地址写在 `code_sample_image`。联网在事务外做，每部写一次，很短；

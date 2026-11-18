@@ -43,7 +43,7 @@ describe('切换主题', () => {
   });
 
   it('切换瞬间带颜色过渡的控件没有动画，明暗键滑块照常位移，下一帧过渡恢复', { timeout: 60_000 }, async () => {
-    const opened = await visit(browser, '/data-cleanup', desktop);
+    const opened = await visit(browser, '/data-cleanup/media-repair', desktop);
     try {
       const { page } = opened;
       await page.emulateMedia({ reducedMotion: 'no-preference' });

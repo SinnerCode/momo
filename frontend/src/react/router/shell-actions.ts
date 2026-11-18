@@ -115,7 +115,7 @@ export interface ShellActions {
 export interface FollowFeedShell {
   /** 按地址读一遍筛选。关注页还画在 `#stats` 里（资料页压过来时只藏起来）就铺开它，把筛选、取样种子与一个新的
    *  刷新代次推过去，照片墙跟上、回到顶上，回 true；没画着回 false，由元素整页打开。 */
-  refresh(): boolean;
+  refresh(restored?: Pick<FollowFeedProps, 'view' | 'seed' | 'revision'>): boolean;
   /** 进页骨架。 */
   skeleton(): string;
   /** 整页打开交给页面的 props：筛选、取样种子与刷新代次、选择集、照片墙偏好，以及壳里那一份助手与动作。 */
@@ -132,9 +132,9 @@ export interface CatalogShell {
   /** 按刚写好的 `state` 打开这一页：从别处回到首页（`entering`）先作废顶部三层的缓存；回收站清空搜索框并铺开首页
    *  那一侧，其余页把搜索框对齐 `state.q`；再同步侧栏与顶栏、重画顶部三层、取目录。`retitle`：地址刚由元素改写，
    *  标题与教程状态跟着重读。 */
-  open(path: string, options?: { entering?: boolean; retitle?: boolean }): void;
+  open(path: string, options?: { entering?: boolean; retitle?: boolean }): void | Promise<void>;
   /** 筛选与地址已经由壳写好：按它们重取目录。 */
-  load(): void;
+  load(): void | Promise<void>;
   /** 没有背景的作品详情与队列地址（深链、刷新）下面补画目录网格：网格没被占着、又是启动那一条或还铺着目录骨架时，
    *  按当前地址取一次（不是首页口径，不写筛选）。 */
   fill(): void;
@@ -162,7 +162,8 @@ export type SurfaceKind = 'management' | 'index' | 'entity' | 'catalog' | 'follo
 
 /** 管理区那几页每次打开时交给页面的值，由页面元素从地址、偏好与壳的状态算（`pages/managed.tsx`），按页面分。
  *  管理区那几页画进 `#stats`。 */
-export interface ManagedOpenProps extends Record<ConfigurationPath, { section?: string }> {
+export interface ManagedOpenProps extends Record<ConfigurationPath, { section?: string }>,
+  Record<import('../../cleanup-tools').CleanupToolPath, Record<string, never>> {
   '/jav': { tab: string; readOnly: boolean };
   '/stats': Record<string, never>;
   '/taste': { onboarding: boolean };
@@ -173,6 +174,7 @@ export interface ManagedOpenProps extends Record<ConfigurationPath, { section?: 
   '/sources': Record<string, never>;
   /** `section`：首帧选中的那一组页签名，取走壳里 `configurationRequestedSection` 记下的那一次（地址带 `#peachProxy` 时是「网络与访问」）。 */
   '/settings/library': { section?: string };
+  '/settings/maintenance/repairs': Record<string, never>;
   '/tasks': Record<string, never>;
   '/subscriptions': {
     tab: string; page: number; sort: string; dir: string; pageSize: number; layout: string;

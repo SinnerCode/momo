@@ -6,20 +6,23 @@
 """
 import json
 import os
+import re
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from peach import taste_history, taste_preferences, web_follow, web_state, web_stats
+from peach import taste_history, taste_preferences, web_batch, web_follow, web_state, web_stats
 from peach.follow_sources import FollowCandidate, SourceFetch
 from peach.follow_store import FollowStore
 from peach.previews import entity_image_key, logo_key
-from peach.repository import LedgerDatabase
-from peach.web_catalog import FACETS_TABLES, GROUP_TABLES, TOPS_TABLES
+from peach.repository import LedgerDatabase, in_background
+from peach.web_catalog import CATALOG_TOTAL_TABLES, FACETS_TABLES, GROUP_TABLES, TOPS_TABLES
 from peach.web_contract import dispatch_api_get
 from peach.web_entity import INDEX_TABLES
 from peach.web_state import WebContract
@@ -27,6 +30,8 @@ from support.ledger import fresh_ledger
 
 #: 不挂触发器的表，理由见 `migrations/0038_ledger_revision.sql` 开头。
 EXEMPT = {"ledger_revision", "schema_migration", "task_run"}
+#: 播放心跳写的观看进度列，不推 asset 的版本（migration 0054）。
+PLAYBACK_PROGRESS = {"play_seconds", "leave_ratio", "max_reached", "seek_count", "last_played"}
 
 
 def insert_asset(db_path: Path, asset_id: int) -> None:
@@ -42,6 +47,7 @@ class LedgerRevisionTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.db_path = fresh_ledger(self.directory.name)
         self.contract = WebContract(self.db_path)
+        self.addCleanup(self.contract.stop_background_jobs)
         self.calls = 0
 
     def compute(self):
@@ -67,12 +73,128 @@ class LedgerRevisionTests(unittest.TestCase):
         self.assertEqual(missing, [], "新表要在同一个迁移里补上版本号触发器和 ledger_revision 预置行")
         self.assertEqual(sorted(tracked - rows), [])
 
+    def test_asset_revision_follows_every_column_except_playback_progress(self):
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(asset)")}
+            sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name='rev_asset_update'").fetchone()[0]
+        listed = {name.strip() for name in re.search(r"\bOF\b(.*?)\bON\s+asset\b", sql, re.S)[1].split(",")}
+        self.assertEqual(listed, columns - PLAYBACK_PROGRESS,
+                         "给 asset 加列要同步改 rev_asset_update 的列名单（migration 0054）")
+
+    def test_playback_heartbeats_keep_versions_and_caches_while_starts_refresh_them(self):
+        from peach import web_activity
+        insert_asset(self.db_path, 1)
+        tables = ("asset",)
+        self.contract.cached_until_changed("tops", self.compute, tables=tables)
+        self.contract.cached("plain", self.compute)
+        before = self.contract.ledger_revision(tables)
+        web_activity.w_activity(self.contract, {"id": 1, "position": 30, "duration": 60, "delta": 10, "seeks": 1})
+        self.assertEqual(self.contract.ledger_revision(tables), before)
+        self.assertEqual(self.contract.cached_until_changed("tops", self.compute, tables=tables), 1)
+        self.assertEqual(self.contract.cached("plain", self.compute), 2)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT play_seconds,max_reached,seek_count FROM asset WHERE id=1").fetchone(), (10.0, 0.5, 1))
+        web_activity.w_play(self.contract, {"id": 1})
+        self.assertGreater(self.contract.ledger_revision(tables), before)
+
+    def test_catalog_revision_preserves_cached_content_after_play_and_refreshes_after_edits(self):
+        from peach import web_activity
+        insert_asset(self.db_path, 1)
+        tables = ('asset_catalog',)
+        before = self.contract.ledger_revision(tables)
+        self.assertEqual(self.contract.cached_until_changed('content', self.compute, tables=tables), 1)
+        web_activity.w_play(self.contract, {'id': 1})
+        self.assertEqual(self.contract.ledger_revision(tables), before)
+        self.assertEqual(self.contract.cached_until_changed('content', self.compute, tables=tables), 1)
+        with self.contract.write_transaction() as connection:
+            connection.execute("UPDATE asset SET catalog_title='Edited' WHERE id=1")
+        self.assertEqual(self.contract.cached_until_changed('content', self.compute, tables=tables), 2)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            columns = {row[1] for row in connection.execute('PRAGMA table_info(asset)')}
+            sql = connection.execute("SELECT sql FROM sqlite_schema WHERE name='rev_asset_catalog_update'").fetchone()[0]
+        listed = {name.strip() for name in re.search(r"\bOF\b(.*?)\bON\s+asset\b", sql, re.S)[1].split(',')}
+        self.assertEqual(listed, columns - PLAYBACK_PROGRESS - {'play_count'})
+
     def test_a_write_from_another_connection_recomputes_and_nothing_else_does(self):
         self.assertEqual(self.contract.cached_until_changed("taste", self.compute), 1)
         self.assertEqual(self.contract.cached_until_changed("taste", self.compute), 1)
         insert_asset(self.db_path, 1)
         self.assertEqual(self.contract.cached_until_changed("taste", self.compute), 2)
         self.assertEqual(self.contract.cached_until_changed("taste", self.compute), 2)
+
+    def test_one_request_reads_the_revisions_once_until_this_process_commits(self):
+        connect = self.contract.database.connect
+        opened = []
+
+        def counted(*args, **kwargs):
+            opened.append(1)
+            return connect(*args, **kwargs)
+
+        with mock.patch.object(self.contract.database, "connect", counted), \
+                web_state.revision_snapshot():
+            whole = self.contract.ledger_revision()
+            self.assertEqual(self.contract.ledger_revision(("asset",)) + self.contract.ledger_revision(
+                tuple(table for table in self.contract.ledger_tables_except(("asset",)))), whole)
+            self.assertEqual(len(opened), 1)
+            # 请求里自己写过：提交通知让快照作废，后面的缓存认得出这次写入。
+            with self.contract.database.write_transaction() as connection:
+                connection.execute(
+                    "INSERT INTO asset(id,location,path,name,medium,size) VALUES(?,?,?,?,?,?)",
+                    (90, "local", "R:\\media\\90.mp4", "90.mp4", "video", 1))
+            self.assertEqual(self.contract.ledger_revision(("asset",)), self.contract.ledger_revision(("asset",)))
+            self.assertGreater(self.contract.ledger_revision(), whole)
+        # 请求之外每次现读：进程外的写马上看得到。
+        before = self.contract.ledger_revision()
+        insert_asset(self.db_path, 91)
+        self.assertGreater(self.contract.ledger_revision(), before)
+
+    def test_catalog_totals_are_shared_across_sort_seeds_and_refresh_after_writes(self):
+        from peach import web_catalog
+        insert_asset(self.db_path, 1)
+        insert_asset(self.db_path, 2)
+        with mock.patch.object(web_catalog, 'video_work_key', wraps=web_catalog.video_work_key) as work_key:
+            first = dispatch_api_get(self.contract, '/api/items', {'sort': 'seed', 'seed': '1', 'limit': '1'})
+            second = dispatch_api_get(self.contract, '/api/items', {'sort': 'seed', 'seed': '2', 'limit': '1'})
+            self.assertEqual((first['total'], second['total']), (2, 2))
+            self.assertEqual(work_key.call_count, 1)
+            with self.contract.database.write_transaction() as connection:
+                connection.execute("UPDATE asset SET size=3 WHERE id=1")
+            refreshed = dispatch_api_get(self.contract, '/api/items', {'sort': 'seed', 'seed': '2', 'limit': '1'})
+            self.assertEqual(refreshed['bytes'], 4)
+            self.assertEqual(work_key.call_count, 2)
+
+    def test_background_insert_does_not_pair_fresh_rows_with_stale_totals(self):
+        insert_asset(self.db_path, 1)
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE asset SET code='ABC-001',name='ABC-001-CD1.mp4' WHERE id=1")
+        self.assertEqual(dispatch_api_get(self.contract, '/api/items', {})['total'], 1)
+
+        @in_background
+        def add():
+            with self.contract.database.write_transaction() as connection:
+                connection.execute("INSERT INTO asset(location,path,name,medium,size,code) VALUES(?,?,?,?,?,?)",
+                                   ('local', r'R:\media\second.mp4', 'ABC-001-CD2.mp4', 'video', 2, 'ABC-001'))
+        worker = threading.Thread(target=add)
+        worker.start()
+        worker.join()
+        result = dispatch_api_get(self.contract, '/api/items', {})
+        self.assertEqual(result['total'], 2)
+        self.assertEqual(len(result['items']), 2)
+        self.assertEqual(result['work_total'], 1)
+
+    def test_sql_identity_rules_reuse_inputs_across_connections(self):
+        from peach import repository
+        with mock.patch.object(repository, 'is_jav_code', wraps=repository.is_jav_code) as identify:
+            database = LedgerDatabase(self.db_path)
+            for _ in range(3):
+                with database.read_connection() as connection:
+                    self.assertEqual(connection.execute('SELECT is_jav_code(?)', ('ABC-001',)).fetchone()[0], 1)
+            self.assertEqual(identify.call_count, 1)
+            with database.read_connection() as connection:
+                self.assertEqual(connection.execute('SELECT is_jav_code(?)', ('plain',)).fetchone()[0], 0)
+            self.assertEqual(identify.call_count, 2)
 
     def test_task_center_heartbeats_keep_the_cache(self):
         self.contract.cached_until_changed("review", self.compute)
@@ -97,19 +219,25 @@ class LedgerRevisionTests(unittest.TestCase):
     def test_concurrent_catalog_requests_share_one_computation(self):
         from concurrent.futures import ThreadPoolExecutor
         from threading import Event
-        entered, release = Event(), Event()
-        def derive():
-            self.calls += 1
-            entered.set()
-            release.wait(5)
-            return self.calls
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            first = pool.submit(self.contract.cached_until_changed, 'catalog', derive, tables=('asset',))
-            self.assertTrue(entered.wait(5))
-            second = pool.submit(self.contract.cached_until_changed, 'catalog', derive, tables=('asset',))
-            release.set()
-            self.assertEqual((first.result(), second.result()), (1, 1))
-        self.assertEqual(self.calls, 1)
+        def check(tables):
+            self.calls = 0
+            entered, release = Event(), Event()
+            def derive():
+                self.calls += 1
+                entered.set()
+                release.wait(5)
+                return self.calls
+            key = repr(('catalog', tables))
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(self.contract.cached_until_changed, key, derive, tables=tables)
+                self.assertTrue(entered.wait(5))
+                second = pool.submit(self.contract.cached_until_changed, key, derive, tables=tables)
+                release.set()
+                self.assertEqual((first.result(), second.result()), (1, 1))
+            self.assertEqual(self.calls, 1)
+        for tables in ((), ('asset',)):
+            with self.subTest(tables=tables):
+                check(tables)
 
     def test_a_changed_file_input_recomputes(self):
         self.contract.cached_until_changed("review", self.compute, "csv-1")
@@ -148,13 +276,67 @@ class LedgerRevisionTests(unittest.TestCase):
                          3 * web_state.CACHE_KEYS + 1)
         self.assertIn("author:0", self.contract.revision_cache_keys)
 
+    def write_asset(self, asset_id: int, *, background: bool) -> None:
+        def write():
+            with self.contract.write_transaction() as connection:
+                connection.execute(
+                    "INSERT INTO asset(id,location,path,name,medium,size) VALUES(?,?,?,?,?,?)",
+                    (asset_id, "local", f"R:\\media\\{asset_id}.mp4", f"{asset_id}.mp4", "video", 1))
+        thread = threading.Thread(target=in_background(write) if background else write)
+        thread.start()
+        thread.join(5)
+
+    def wait_refreshed(self, key: str) -> None:
+        deadline = time.monotonic() + 5
+        while key in self.contract.stale_refreshing and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertNotIn(key, self.contract.stale_refreshing)
+
+    def test_background_commits_serve_the_previous_result_until_the_refresh_lands(self):
+        """后台任务写账本后先回上一份、另起重算；写回后结果版本跟着变，页面再取拿到新值。"""
+        self.assertEqual(self.contract.cached_until_changed("catalog", self.compute, tables=("asset",)), 1)
+        before = dispatch_api_get(self.contract, "/api/result-updates", {})["result_versions"]["catalog"]
+        self.write_asset(1, background=True)
+        self.assertEqual(self.contract.cached_until_changed("catalog", self.compute, tables=("asset",)), 1)
+        self.wait_refreshed("catalog")
+        self.assertEqual(self.contract.cached_until_changed("catalog", self.compute, tables=("asset",)), 2)
+        self.assertEqual(self.calls, 2)
+        after = dispatch_api_get(self.contract, "/api/result-updates", {})["result_versions"]["catalog"]
+        self.assertNotEqual(after, before)
+
+    def test_foreground_and_out_of_process_writes_still_recompute_on_the_spot(self):
+        """写的人要立刻看到自己写的：前台提交之后，以及命令行、账本同步这类进程外的写之后，都当场重算。"""
+        self.assertEqual(self.contract.cached_until_changed("catalog", self.compute, tables=("asset",)), 1)
+        self.write_asset(1, background=True)
+        self.write_asset(2, background=False)
+        self.assertEqual(self.contract.cached_until_changed("catalog", self.compute, tables=("asset",)), 2)
+        insert_asset(self.db_path, 3)
+        self.assertEqual(self.contract.cached_until_changed("catalog", self.compute, tables=("asset",)), 3)
+        self.assertEqual(self.contract.stale_refreshing, set())
+
+    def test_startup_warms_the_aggregates_every_page_reads(self):
+        """重启后第一个打开页面的人不等形状名单、作品分组快照与推荐池一起冷算：开机就先算好。"""
+        import asyncio
+        from peach import api
+        insert_asset(self.db_path, 1)
+        # 只看每页都碰到的那几份；口味、复核、关注那几份另有后台线程，不在这条测试里起。
+        pages = [entry for entry in api.WARM_AGGREGATES if entry[0] not in {"/api/taste", "/api/review", "/api/ads", "/api/follow"}]
+        with mock.patch.object(api, "WARM_AGGREGATES", tuple(pages)):
+            asyncio.run(api._warm_ledger_aggregates(True, self.contract, asyncio.Event()))
+        for key in ("entity-shapes", "catalog-group-rows", "search-recommendations:"):
+            self.assertIn(key, self.contract.cache)
+
     def test_a_commit_during_a_versioned_computation_keeps_the_result(self):
         def derive():
             self.calls += 1
             self.contract.cache_bust()
             return self.calls
-        self.assertEqual(self.contract.cached_until_changed("catalog", derive, tables=("asset",)), 1)
-        self.assertEqual(self.contract.cached_until_changed("catalog", derive, tables=("asset",)), 1)
+        for tables in ((), ('asset',)):
+            with self.subTest(tables=tables):
+                self.calls = 0
+                key = repr(('catalog', tables))
+                self.assertEqual(self.contract.cached_until_changed(key, derive, tables=tables), 1)
+                self.assertEqual(self.contract.cached_until_changed(key, derive, tables=tables), 1)
 
 
 class _TableReads:
@@ -165,7 +347,8 @@ class _TableReads:
     外层也必须跟着变。
     """
 
-    IGNORED = frozenset({"ledger_revision", "sqlite_master", "sqlite_temp_master", "sqlite_schema"})
+    # json_each 只展开查询绑定的 JSON 参数，缓存失效由参数及其来源负责。
+    IGNORED = frozenset({"ledger_revision", "sqlite_master", "sqlite_temp_master", "sqlite_schema", "json_each"})
 
     def __init__(self, virtual: set[str]):
         self.virtual = virtual
@@ -235,9 +418,9 @@ class DeclaredTablesTests(unittest.TestCase):
 
         real_cached = WebContract.cached_until_changed
 
-        def cached_until_changed(contract, key, fn, *inputs, tables=()):
+        def cached_until_changed(contract, key, fn, *inputs, tables=(), **options):
             return real_cached(contract, key, lambda: self.reads.measure(key, tables, fn),
-                               *inputs, tables=tables)
+                               *inputs, tables=tables, **options)
 
         real_inputs = web_follow._follow_inputs
 
@@ -361,6 +544,14 @@ class DeclaredTablesTests(unittest.TestCase):
         self._fresh()
         return dispatch_api_get(self.contract, path, args)
 
+    def test_json_parameter_expansion_tracks_the_queried_ledger_table(self):
+        with self.contract.database.read_connection() as connection:
+            rows = self.reads.measure('selected-assets', ('asset',), lambda: connection.execute(
+                'SELECT id FROM asset WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id',
+                ('[1,3]',)).fetchall())
+        self.assertEqual([row[0] for row in rows], [1, 3])
+        self.assertEqual(self.reads.frames[-1][2], {'asset'})
+
     def test_cached_computations_read_only_their_declared_tables(self):
         for state in ("", "fresh", "played", "flagged", "later"):
             for jav in ("", "1"):
@@ -376,6 +567,8 @@ class DeclaredTablesTests(unittest.TestCase):
             self._get("/api/index", kind=kind)
         self._get("/api/stats")
         self._get("/api/folders")
+        self._get("/api/ads", limit="10")
+        self._get("/api/duplicates", limit="10")
         with closing(sqlite3.connect(self.db_path)) as connection:
             source_id, item_id = (str(connection.execute(f"SELECT min(id) FROM {table}").fetchone()[0])
                                   for table in ("follow_source", "follow_item"))
@@ -396,14 +589,19 @@ class DeclaredTablesTests(unittest.TestCase):
         declarations = {
             "GROUP_TABLES": GROUP_TABLES, "TOPS_TABLES": TOPS_TABLES,
             "FACETS_TABLES": FACETS_TABLES, "INDEX_TABLES": INDEX_TABLES,
-            "STATS_TABLES": web_stats.STATS_TABLES,
+            "STATS_TABLES": web_stats.STATS_TABLES, "PLAY_STATS_TABLES": web_stats.PLAY_STATS_TABLES,
+            "CATALOG_TOTAL_TABLES": CATALOG_TOTAL_TABLES,
             "FOLLOW_GROUP_TABLES": web_follow.FOLLOW_GROUP_TABLES,
             "TASTE_TABLES": web_stats.TASTE_TABLES,
-            "PROFILE_TABLES": taste_preferences.PROFILE_TABLES}
+            "PROFILE_TABLES": taste_preferences.PROFILE_TABLES,
+            "JUNK_SCORE_TABLES": web_batch.JUNK_SCORE_TABLES,
+            "DUPLICATE_TABLES": web_batch.DUPLICATE_TABLES}
         names = {tuple(tables): name for name, tables in declarations.items()}
         leaks: dict[str, set[str]] = {}
         for label, declared, reads in self.reads.frames:
-            extra = reads - set(declared)
+            # asset_catalog 是 asset 除起播计数和观看进度之外的修订号。
+            represented = set(declared) | ({'asset'} if 'asset_catalog' in declared else set())
+            extra = reads - represented
             if declared and extra:
                 leaks.setdefault(names.get(declared, label), set()).update(extra)
         self.maxDiff = None
@@ -552,6 +750,7 @@ class ResultVersionTablesTests(unittest.TestCase):
     #: `frontend/test/react/result-updates.test.tsx` 核对。
     REFRESHED_BY = {
         "catalog-grid": ("catalog",),
+        "catalog-totals": ("catalog", "follow"),
         "index": ("catalog", "follow", "discoveries"),
         "stats": ("catalog", "follow"),
         "taste": ("catalog", "follow"),
@@ -565,6 +764,7 @@ class ResultVersionTablesTests(unittest.TestCase):
         from peach.web_result_versions import RESULT_TABLES
         declared = {
             "catalog-grid": GROUP_TABLES, "index": INDEX_TABLES, "stats": web_stats.STATS_TABLES,
+            "catalog-totals": CATALOG_TOTAL_TABLES,
             "taste": web_stats.TASTE_TABLES, "follow-feed": web_follow.FOLLOW_GROUP_TABLES,
         }
         missing = {}

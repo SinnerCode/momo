@@ -11,7 +11,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from peach import link_status, web_links   # noqa: E402
+from peach import interface_text, link_status, web_links   # noqa: E402
 from peach.jobs import BackgroundJob   # noqa: E402
 
 from support.ledger import fresh_ledger   # noqa: E402
@@ -66,7 +66,7 @@ class VerdictTests(unittest.TestCase):
         def remember(**fields):
             saved.update(fields)
             if fields['checked'] == 2:
-                raise InterruptedError('停止于检查点')
+                raise InterruptedError('stopped at checkpoint')
             return True
         with mock.patch.object(web_links, '_probe', side_effect=[(404, ''), (503, '')]):
             with self.assertRaises(InterruptedError):
@@ -110,8 +110,14 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("parklogic.com", note)
         self.assertEqual(web_links.link_verdict(status, note), "gone")
-        self.assertIn("parklogic.com", web_links._note(status, note),
+        self.assertIn("parklogic.com", web_links._note(status, note)["note"],
                       "面板上要看得出为什么 200 也判了没了")
+
+    def test_an_unreachable_link_says_why_in_the_interface_language(self):
+        note = web_links._note(0, "ConnectError")
+        self.assertEqual(note["note"], "取不到：ConnectError")
+        self.assertEqual(interface_text.text(f"server:{note['note_code']}", note["note_params"], language="en"),
+                         "Unreachable: ConnectError")
 
 
 class SummaryTests(unittest.TestCase):
@@ -128,7 +134,7 @@ class SummaryTests(unittest.TestCase):
             "created_at,updated_at) VALUES(?,?,?,?,?,'2026-01-01','2026-01-01')",
             [(1, "social", "X @a", "https://x.com/a", "x.com"),
              (1, "official", "T-POWERS", "https://www.t-powers.co.jp/talent/x/", "www.t-powers.co.jp"),
-             (2, "official", "官方网站", "https://moodyz.com/", "moodyz.com")])
+             (2, "official", "official-site", "https://moodyz.com/", "moodyz.com")])
         connection.commit()
         connection.close()
         self.contract = FakeContract(db)
@@ -187,7 +193,7 @@ class SummaryTests(unittest.TestCase):
             "gone": [
                 {"id": 1, "entity": "凉森玲梦", "link_kind": "social", "label": "X @a",
                  "url": "https://x.com/a", "note": "HTTP 404"},
-                {"id": 3, "entity": "MOODYZ", "link_kind": "official", "label": "官方网站",
+                {"id": 3, "entity": "MOODYZ", "link_kind": "official", "label": "official-site",
                  "url": "https://moodyz.com/", "note": "HTTP 404"},
             ],
             "unclear": [], "error": "",
@@ -213,7 +219,7 @@ class SummaryTests(unittest.TestCase):
         self._finished_check()
         state = self.contract.link_check.state
         state["gone"].append({"id": 3, "entity": "MOODYZ", "link_kind": "official",
-                              "label": "官方网站", "url": "https://moodyz.com/", "note": "HTTP 404"})
+                              "label": "official-site", "url": "https://moodyz.com/", "note": "HTTP 404"})
         probed = []
         original = web_links._probe
         self.addCleanup(setattr, web_links, "_probe", original)
@@ -245,7 +251,7 @@ class SummaryTests(unittest.TestCase):
                  "label": "T-POWERS", "url": "https://www.t-powers.co.jp/talent/x/",
                  "note": "HTTP 403"},
                 {"id": 3, "entity": "MOODYZ", "link_kind": "official",
-                 "label": "官方网站", "url": "https://moodyz.com/", "note": "HTTP 500"},
+                 "label": "official-site", "url": "https://moodyz.com/", "note": "HTTP 500"},
             ],
         }
 
@@ -360,6 +366,41 @@ class RetiredLinkTests(unittest.TestCase):
         self.assertEqual((state["status"], state["total"]), ("complete", 0))
         self.assertEqual(self.probed, [])
 
+
+    def _check(self, answers):
+        """跑一趟全量检查；`answers` 按地址给一串依次回的结果，最后一个一直重复。"""
+        calls = {}
+
+        def probe(url, timeout=0):
+            calls[url] = calls.get(url, 0) + 1
+            replies = answers[url]
+            return replies[min(calls[url], len(replies)) - 1]
+
+        web_links._probe = probe
+        web_links.w_links_check(self.contract, {"restart": True})
+        thread = self.contract.link_check.thread
+        if thread is not None:
+            thread.join(5)
+        return self.contract.link_check.snapshot(), calls
+
+    def test_a_temporary_failure_is_rechecked_a_bounded_number_of_times(self):
+        """限流、超时、5xx 是暂时的：这一趟里自动再问，好了就不进结果；站点拒绝（403）只问一次，留给人重试。"""
+        first, second = "https://crusegroup.net/model/316", "https://www.crusegroup.net/model/295"
+        state, calls = self._check({first: [(503, ""), (0, "ReadTimeout"), (200, "")], second: [(403, "")]})
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(calls, {first: 3, second: 1})
+        self.assertEqual(state["gone"], [])
+        self.assertEqual([(item["id"], item["temporary"], item["attempts"]) for item in state["unclear"]],
+                         [(2, False, 1)])
+
+    def test_a_link_that_stays_unreachable_is_kept_with_its_attempts_not_deleted(self):
+        """重查几轮还是打不开：留在「取不到」里并记下问过几次，不当成没了；确证 404 才进待删。"""
+        first, second = "https://crusegroup.net/model/316", "https://www.crusegroup.net/model/295"
+        state, calls = self._check({first: [(429, "")], second: [(502, ""), (404, "")]})
+        self.assertEqual(calls, {first: 1 + web_links.RECHECK_ROUNDS, second: 2})
+        self.assertEqual([(item["id"], item["note"]) for item in state["gone"]], [(2, "HTTP 404")])
+        self.assertEqual([(item["id"], item["temporary"], item["attempts"]) for item in state["unclear"]],
+                         [(1, True, 1 + web_links.RECHECK_ROUNDS)])
 
 if __name__ == "__main__":
     unittest.main()

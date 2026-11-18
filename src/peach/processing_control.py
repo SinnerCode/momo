@@ -10,7 +10,20 @@ from collections import deque
 from contextlib import contextmanager, closing, nullcontext
 from contextvars import ContextVar
 
+from . import interface_text
 from .fsutil import atomic_write_text
+from .task_stages import stage as stage_fields, stage_code
+from .user_messages import UserInterruptedError, UserValueError
+
+
+def _eta(scope: str, basis: str, basis_params: dict | None = None) -> dict:
+    """剩余时间估算的范围与依据（ADR-0159）：`eta_scope`、`eta_basis` 是 zh-CN 原文，
+    旁边是 `labels.processingControl.scope|basis.<名字>` 的 code 与参数。"""
+    scope_code, basis_code = f"labels.processingControl.scope.{scope}", f"labels.processingControl.basis.{basis}"
+    params = dict(basis_params or {})
+    return {"eta_scope": interface_text.text(f"server:{scope_code}"), "eta_scope_code": scope_code,
+            "eta_basis": interface_text.text(f"server:{basis_code}", params), "eta_basis_code": basis_code,
+            "eta_basis_params": params}
 
 CURRENT = ContextVar('peach_library_processing_control', default=None)
 _CONTROLS = {}
@@ -41,6 +54,8 @@ def processing_item(asset_id):
                 control.skip_asset_id = None
                 control._save()
 MODES = ('low', 'standard', 'high')
+#: 用户暂停期间多久重读一次控制文件。
+PAUSED_POLL_SECONDS = 1.0
 MODE_FACTORS = {'low': 1.8, 'standard': 1.0, 'high': 0.75}
 IO_INTERVALS = {
     'low': {'scan': 0.008, 'probe': 0.75, 'network': 1.5, 'frame': 0.75, 'work': 0.15},
@@ -51,7 +66,7 @@ IO_INTERVALS = {
 
 def valid_mode(value):
     if value not in MODES:
-        raise ValueError('请选择低占用、标准或高强度模式')
+        raise UserValueError('errors.processingControl.invalidMode')
     return value
 
 
@@ -90,7 +105,7 @@ def checkpoint_values(values):
 
 def interrupted_state(control):
     if control is not None and control.cancelled:
-        return dict(status='cancelled', outcome='cancelled', stage='已停止', error='')
+        return dict(status='cancelled', outcome='cancelled', **stage_fields('job.cancelled'), error='')
     return dict(status='paused', error='', completed_at=None) if control is not None and control.paused else {}
 
 
@@ -102,13 +117,36 @@ def resume_fields(state, values):
 
 
 def checkpoint(kind='work'):
+    from .task_control import checkpoint as task_checkpoint
     control = CURRENT.get()
+    task_checkpoint(None if control is not None else kind)
     if control is not None:
         control.checkpoint(kind)
 
 
+def current_control():
+    from .task_control import CURRENT as TASK_CONTROL
+    return CURRENT.get() or TASK_CONTROL.get()
+
+
+def default_mode(database):
+    """从当前 profile 读取新任务默认档位。"""
+    from .profiles import read_settings
+    with database.read_connection() as connection:
+        return read_settings(connection).get('taskSpeedMode', 'standard')
+
+
+def execution_mode(database, requested=None, *, control):
+    """执行中的任务沿用本轮档位，独立调用选择显式档位或设置默认值。"""
+    if control is not None:
+        return control.mode
+    if requested is not None:
+        return valid_mode(requested)
+    return default_mode(database)
+
+
 def low_mode():
-    control = CURRENT.get()
+    control = current_control()
     return control is not None and control.mode == 'low'
 
 
@@ -117,8 +155,8 @@ def mode_ratio(target, previous='standard'):
 
 
 def ffmpeg_options(*, filter_option=None):
-    """当前馆藏任务的 FFmpeg 线程选项；高强度与独立调用使用工具默认值。"""
-    control = CURRENT.get()
+    """当前任务的 FFmpeg 线程选项；高强度与独立调用使用工具默认值。"""
+    control = current_control()
     threads = {'low': 1, 'standard': 2}.get(control.mode) if control is not None else None
     if threads is None:
         return []
@@ -163,16 +201,38 @@ class ActiveDeadline(float):
 
 
 def deadline_after(seconds):
-    value, control = time.monotonic() + seconds, CURRENT.get()
+    from .task_control import CURRENT as TASK_CONTROL
+    value, control = time.monotonic() + seconds, CURRENT.get() or TASK_CONTROL.get()
     return ActiveDeadline(value, control) if control is not None else value
 
 
 class ProcessingControl:
+    @property
+    def mode(self):
+        from .task_control import CURRENT as TASK_CONTROL
+        control = TASK_CONTROL.get() if CURRENT.get() is self else None
+        return control.mode if control is not None else self._mode
+
+    @mode.setter
+    def mode(self, value):
+        self._mode = value
+
+    @property
+    def paused_seconds(self):
+        from .task_control import CURRENT as TASK_CONTROL
+        control = TASK_CONTROL.get() if CURRENT.get() is self else None
+        return self._paused_seconds + (control.paused_seconds if control is not None else 0.0)
+
+    @paused_seconds.setter
+    def paused_seconds(self, value):
+        self._paused_seconds = value
+
     def __init__(self, path):
         self.path = path
         self.lock = threading.RLock()
         data = _read(path)
         self.mode = data.get('speed_mode') if data.get('speed_mode') in MODES else 'standard'
+        self.next_mode = data.get('next_speed_mode')
         self.job_id = data.get('job_id')
         self.paused = data.get('paused') is True
         self.cancelled = data.get('cancelled') is True
@@ -182,6 +242,7 @@ class ProcessingControl:
         self.active = lambda: True
         self.db_path = None
         self.next_work = {}
+        self._paced_mode = None
         self.paused_seconds = 0.0
         self.reloaded_at = 0.0
         self.current_asset_id = None
@@ -199,21 +260,28 @@ class ProcessingControl:
                 self.paused = data.get('paused', self.paused)
                 self.cancelled = data.get('cancelled', self.cancelled)
                 self.skip_asset_id = data.get('skip_asset_id')
+                self.next_mode = data.get('next_speed_mode')
                 mode = data.get('speed_mode', self.mode)
-                if mode in MODES and self.mode != mode:
+                if mode in MODES and self._mode != mode:
                     self.mode = mode
                     self.next_work.clear()
 
     def _save(self):
         atomic_write_text(self.path, json.dumps(dict(
             speed_mode=self.mode, job_id=self.job_id, paused=self.paused, cancelled=self.cancelled,
-            skip_asset_id=self.skip_asset_id)) + '\n')
+            skip_asset_id=self.skip_asset_id, next_speed_mode=self.next_mode)) + '\n')
+
+    def select_next_mode(self, mode):
+        with self.lock:
+            self.refresh(force=True)
+            self.next_mode = valid_mode(mode) if mode is not None else None
+            self._save()
 
     def skip_current(self, job_id, asset_id):
         with self.lock:
             self.refresh(force=True)
             if self.job_id != job_id:
-                raise ValueError('任务已变化，请刷新页面后重试')
+                raise UserValueError('errors.processingControl.jobChanged')
             self.skip_asset_id = asset_id
             self._save()
             self.event.set()
@@ -222,14 +290,14 @@ class ProcessingControl:
         self.refresh()
         if self.cancelled:
             from .jobs import JobCancelled
-            raise JobCancelled('用户停止任务')
+            raise JobCancelled('errors.processingControl.userStopped')
         if self.current_asset_id is not None and self.skip_asset_id == self.current_asset_id:
-            raise ItemSkipped('已跳过当前影片')
+            raise ItemSkipped('current item skipped')
 
     def request(self, action, job_id=None, mode=None):
         with self.lock:
             if job_id is not None and job_id != self.job_id:
-                raise ValueError('任务已变化，请刷新页面后重试')
+                raise UserValueError('errors.processingControl.jobChanged')
             if action == 'set_speed':
                 self.mode = valid_mode(mode)
                 self.next_work.clear()
@@ -267,25 +335,36 @@ class ProcessingControl:
 
     def checkpoint(self, kind='work'):
         from .update_tasks import check_pause
+        from .task_control import CURRENT as TASK_CONTROL
+        task = TASK_CONTROL.get()
         started = None
+        generic_started = 0.0
         while True:
+            from .task_control import checkpoint as task_checkpoint
+            task_checkpoint(None)
             check_pause(self.db_path)
             self.refresh()
             self.check_item()
             if not self.active():
-                raise InterruptedError('处理任务已停止')
+                raise UserInterruptedError('errors.processingControl.stopped')
             with self.lock:
                 paused, mode = self.paused, self.mode
+                if mode != self._paced_mode:
+                    self.next_work.clear()
+                    self._paced_mode = mode
                 self.event.clear()
             if paused:
                 if started is None:
                     started = time.monotonic()
+                    generic_started = task.paused_seconds if task is not None else 0.0
                     self.publish(status='paused', speed_mode=mode)
-                self.event.wait(0.25)
+                # 本进程的继续、停止由 `request` 设 `event` 立刻叫醒；这一等只管别的进程改控制文件。
+                self.event.wait(PAUSED_POLL_SECONDS)
                 continue
             if started is not None:
                 spent = time.monotonic() - started
-                self.paused_seconds += spent
+                generic_spent = task.paused_seconds - generic_started if task is not None else 0.0
+                self._paused_seconds += max(0.0, spent - generic_spent)
                 self.publish(status='running', speed_mode=mode, resumed_after=spent)
                 started = None
             # 控制只作用于当前馆藏任务；在单项 I/O 之间留出空档。
@@ -310,16 +389,23 @@ def user_cancelled(db_path, job_id):
     return bool(job_id) and data.get('job_id') == job_id and data.get('cancelled') is True
 
 
-def initial_estimate(config, db_path, stage, asset_ids=None, mode=None):
-    """仅使用账本统计，不在启动 HTTP 请求里遍历媒体目录。"""
-    mode = mode or control_for(config).mode
+def initial_estimate(config, db_path, stage, asset_ids=None, mode=None, *, allow_metered=False):
+    """仅使用账本统计，不在启动 HTTP 请求里遍历媒体目录。预览的范围同 `preview_readable`。"""
+    if mode is None:
+        from .repository import LedgerDatabase
+        mode = execution_mode(LedgerDatabase(db_path), control=current_control())
     query = "SELECT COUNT(*), COALESCE(SUM(size),0) FROM asset WHERE medium='video' AND disposal IS NULL"
     parameters = []
     if asset_ids is not None:
-        query += ' AND id IN (' + ','.join('?' * len(asset_ids)) + ')'
-        parameters += asset_ids
+        query += ' AND id IN (SELECT value FROM json_each(?))'
+        parameters.append(json.dumps(asset_ids))
     if stage == 'previews':
-        query += " AND location='local' AND (snapshot_path IS NULL OR snapshot_path='')"
+        query += " AND location != 'online' AND (snapshot_path IS NULL OR snapshot_path='')"
+        if not allow_metered:
+            from .media_sources import cost_sql
+            expression, values = cost_sql(config=config)
+            query += f" AND {expression}='free'"
+            parameters += list(values)
     if config.locations:
         query += ' AND location IN (' + ','.join('?' * len(config.locations)) + ')'
         parameters += list(config.locations)
@@ -327,7 +413,7 @@ def initial_estimate(config, db_path, stage, asset_ids=None, mode=None):
         count, size = connection.execute(query, parameters).fetchone()
     # 抽帧只读取局部数据；文件总大小仅作为编解码复杂度的温和修正，不按全量读取估时。
     size_factor = min(2.0, max(0.8, (size / max(1, count) / 1024**3) ** 0.15))
-    seconds = {'scan': 0.2, 'metadata': 8.0, 'previews': 12.0 * size_factor,
+    seconds = {'scan': 0.2, 'metadata': 8.0, 'covers': 6.0, 'previews': 12.0 * size_factor,
                'collect': 20.0 * size_factor, 'all': 20.2 * size_factor}[stage]
     history = _read(config.directory('state') / 'library-processing-timing.json')
     sample = history.get(stage)
@@ -341,15 +427,15 @@ def initial_estimate(config, db_path, stage, asset_ids=None, mode=None):
                 eta_seconds_min=max(1, math.ceil(estimate * 0.4)) if known and count else 0 if known else None,
                 eta_seconds_max=max(1, math.ceil(estimate * 2.5)) if known and count else 0 if known else None,
                 eta_kind='historical' if historical else 'estimating', eta_initial=True,
-                eta_scope='本趟处理（已登记文件，未含未知新增）' if stage in ('scan', 'all') else '本趟处理',
-                eta_basis=f'根据已登记的 {count} 个视频、{size / 1024**3:.1f} GiB'
-                          + ('及本机同类历史耗时粗估' if historical else '粗估，运行后校准')
-                          if known else '正在统计新目录的文件数量和大小',
+                **_eta('knownFiles' if stage in ('scan', 'all') else 'thisRun',
+                       ('registeredHistory' if historical else 'registeredRough') if known else 'counting',
+                       {'count': count, 'size': f'{size / 1024**3:.1f}'} if known else None),
                 estimate_file_count=count, estimate_bytes=size)
 
 
 class ProcessingEstimate:
     def __init__(self, config, state, control):
+        control = control or current_control()
         self.config, self.control = config, control
         self.started = time.monotonic()
         self.phase = None
@@ -371,8 +457,7 @@ class ProcessingEstimate:
         known = phase in rates and total > 0
         state.update(eta_seconds_min=math.ceil(seconds * 0.4) if known else None,
                      eta_seconds_max=math.ceil(seconds * 2.5) if known else None,
-                     eta_kind='estimating', eta_initial=True, eta_scope='整趟任务',
-                     eta_basis='根据当前阶段待处理数量粗估，运行后校准')
+                     eta_kind='estimating', eta_initial=True, **_eta('wholeTask', 'stageRough'))
 
     def _total_estimate(self, state, phase, done, total, now):
         """当前阶段用独立样本校准，待执行阶段保留各自的粗估范围。"""
@@ -400,7 +485,7 @@ class ProcessingEstimate:
         state.update(eta_seconds_min=math.ceil(low) if high else None,
                      eta_seconds_max=math.ceil(high) if high else None,
                      eta_kind='estimating' if rough or not high else 'measured', eta_initial=rough,
-                     eta_scope='整趟任务', eta_basis='汇总当前阶段与所有待执行阶段的剩余耗时')
+                     **_eta('wholeTask', 'allStages'))
 
     def update(self, state):
         mode = self.control.mode if self.control is not None else self.mode
@@ -425,12 +510,12 @@ class ProcessingEstimate:
             return
         if any(step['id'] == 'sources' and step['status'] == 'current' for step in state.get('steps', [])):
             return
-        stage = state.get('stage')
-        phase = ('previews' if stage == '生成预览图' else
-                 'images' if stage == '读取配套图片' else
-                 'local' if stage in ('读取本地资料', '检查配套文件') else
-                 'metadata' if stage in ('采集缺失资料', '采集缺失封面', '保存待确认资料') else
-                 'probe' if stage == '读取时长与分辨率' else None)
+        code = stage_code(state)
+        phase = ('previews' if code == 'library.makePreviews' else
+                 'images' if code == 'library.readImages' else
+                 'local' if code == 'library.checkCompanions' else
+                 'metadata' if code in ('library.fetchMetadata', 'library.fetchCovers', 'library.saveCandidates') else
+                 'probe' if code == 'library.probeMedia' else None)
         done, total = state.get('checked', 0), state.get('total', 0)
         now = time.monotonic() - self.paused_elapsed()
         if phase != self.phase or done < self.last_done:
@@ -456,5 +541,4 @@ class ProcessingEstimate:
         remaining = (total - done) * per_item
         state.update(eta_seconds_min=max(1, math.ceil(remaining * (1 - uncertainty))),
                      eta_seconds_max=max(1, math.ceil(remaining * (1 + uncertainty))),
-                     eta_kind='measured', eta_initial=False, eta_scope='整趟任务',
-                     eta_basis=f'根据当前阶段最近完成的 {sampled} 个视频耗时校准')
+                     eta_kind='measured', eta_initial=False, **_eta('wholeTask', 'measured', {'count': sampled}))

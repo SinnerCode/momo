@@ -13,7 +13,7 @@ const MANIFEST: { version: number; sites: Site[] } = JSON.parse(readFileSync(
 const SCRIPT = readFileSync(new URL('../../web/integrations/peach-jav.user.js', import.meta.url), 'utf8');
 const VERSION: string = JSON.parse(readFileSync(
   new URL('../../web/integrations/jav-userscript-release.json', import.meta.url), 'utf8')).version;
-const RELEASE_META = 'https://update.sleazyfork.org/scripts/600821/Peach%20%C2%B7%20JAV%20%E5%85%A5%E5%BA%93.meta.js';
+const RELEASE_META = 'https://update.sleazyfork.org/scripts/600821/Peach%20%E7%94%A8%E6%88%B7%E8%84%9A%E6%9C%AC.meta.js';
 const TOKEN = 'test-only-peach-jav-secret-8b4d';
 const BASE = 'https://peach.example.invalid';
 const ROOT = '#peach-jav-action';
@@ -51,6 +51,11 @@ async function open(browser: Browser, options: {
     contentType: 'text/html; charset=utf-8', body: `<!doctype html><html><head><meta charset="utf-8"><title>${options.title || 'SSIS-057 作品详情'}</title></head><body>${options.html ?? '<h1>SSIS-057 作品详情</h1>'}</body></html>`,
   }));
   await page.addInitScript(({ configured, token, base, initial, resolved, version, releaseMeta }) => {
+    // 交互回归向选择器开放影子树，正式闭合隔离由用户脚本仓库单独验收。
+    const attach = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function (options) {
+      return attach.call(this, { ...options, mode: 'open' });
+    };
     const mock: Mock = {
       calls: [], reports: [], updates: [], pending: [], automatic: true, menus: {},
       values: configured ? { 'peach.jav.base': base, 'peach.jav.token': token } : {},
@@ -71,6 +76,11 @@ async function open(browser: Browser, options: {
               new URL(request.url).searchParams.get('codes')!.split(',').map(code => [code, []])),
           }) }), 0);
           return { abort: () => request.onabort?.() };
+        }
+        // 共享进度的任务列表按不提供该接口的 Peach 应答，脚本退回逐页查询，不占用影片查询与提交的编号。
+        if (new URL(request.url).pathname === '/api/jav-browser/active') {
+          const timer = setTimeout(() => request.onload({ status: 404, responseText: '{}' }), 0);
+          return { abort: () => { clearTimeout(timer); request.onabort?.(); } };
         }
         if (request.url.endsWith('/api/jav-browser/errors')) { mock.reports.push(request); return; }
         const call = { method: request.method, url: request.url, headers: request.headers,
@@ -118,6 +128,8 @@ async function open(browser: Browser, options: {
 }
 
 const button = (page: Page) => page.locator(ROOT).locator('[data-action="add"]');
+// 没在跟踪又要核对状态时，查询是按钮区里的刷新图标键，主按钮隐藏。
+const recheck = (page: Page) => page.locator(ROOT).locator('[data-action="query"]');
 const settingsDialog = (page: Page) => page.locator('#peach-jav-settings').getByRole('dialog');
 async function unpairedStorage(page: Page) {
   const values = await page.evaluate(() => window.javMock.values);
@@ -170,6 +182,8 @@ async function selectCode(page: Page) {
 const AUTOMATIC: Record<string, { path: string; title: string; html: string; source?: string; code?: string }> = {
   dmm: { path: '/av/content/?id=ssis00519&private=secret#player', source: '/av/content/?id=ssis00519', code: 'SSIS-519', title: '作品详情', html: '<h1>作品详情</h1>' },
   mgs: { path: '/product/product_detail/300MIUM-1239/', code: '300MIUM-1239', title: '作品详情', html: '<h1>作品详情</h1>' },
+  'fc2-market': { path: '/article/4900901/', code: 'FC2-PPV-4900901', title: '作品详情', html: '<h1>作品详情</h1>' },
+  'fanza-clip': { path: '/moment?id=img-saba00978-011&i3_ref=fvideo', source: '/moment?id=img-saba00978-011', code: 'SABA-978', title: '作品详情', html: '<h1>作品详情</h1>' },
   missav: { path: '/en/ssis-057', title: 'SSIS-057', html: '<h1>SSIS-057 作品</h1>' },
   jable: { path: '/videos/ssis-057/', title: 'Jable', html: '<div class="video-info"><h4>SSIS-057 作品</h4></div>' },
   'jav-guru': { path: '/12345/ssis-057-detail/', title: 'JAV.guru', html: '<h1 class="entry-title">[SSIS-057] 作品</h1>' },
@@ -568,11 +582,11 @@ describe('JAV 用户脚本', () => {
       await page.clock.fastForward(30_000);
       assert.equal(await page.evaluate(() => window.javMock.calls.length), 2);
       assert.equal(await page.evaluate(() => window.javMock.reports.length), 1);
-      await button(page).click();
+      await recheck(page).click();
       await pending(page, 3);
       await page.evaluate(() => window.javMock.pending[2]!.onerror());
       await ready(page, '查询 Peach 状态');
-      await button(page).click();
+      await recheck(page).click();
       await pending(page, 4);
       await reply(page, 3, body('failed'));
       await ready(page, '重试加入 Peach 馆藏');
@@ -596,7 +610,7 @@ describe('JAV 用户脚本', () => {
       await reply(page, 1, body('owned', 'ABW-123'));
       await ready(page, '查询 Peach 状态');
       assert.match(await page.locator(ROOT).getByRole('status', { name: 'Peach 任务状态', exact: true }).innerText(), /状态无效/);
-      await button(page).click();
+      await recheck(page).click();
       await pending(page, 3);
       await page.evaluate(() => window.javMock.reply(2, {}, 401));
       await ready(page, '查询 Peach 状态');

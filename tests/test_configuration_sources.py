@@ -6,10 +6,11 @@ import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
-from peach import media_configuration as media_config, onboarding, settings_file
+from peach import interface_text, media_configuration as media_config, onboarding, settings_file
 
 
 class ConfigurationIsolationTests(unittest.TestCase):
@@ -66,7 +67,12 @@ class ConfigurationIsolationTests(unittest.TestCase):
                 emit = stack.enter_context(patch.object(routes.error_reporting, "event"))
                 result = routes.snapshot(self.config)
                 self.assertEqual(list(result["section_errors"]), [failed])
-                self.assertEqual(len(result["section_errors"][failed]["error_id"]), 32)
+                issue = result["section_errors"][failed]
+                self.assertEqual(len(issue["error_id"]), 32)
+                self.assertTrue(issue["title"].endswith("未取得"))
+                self.assertEqual(issue["title"], interface_text.text(f"server:{issue['title_code']}", issue["title_params"]))
+                self.assertEqual(issue["title_params"]["section"], interface_text.text(f"server:{issue['section_code']}"))
+                self.assertEqual(issue["message"], interface_text.text(f"server:{issue['message_code']}"))
                 self.assertNotIn("private-detail", str(result))
                 self.assertEqual(result["media_dirs"], [])
                 self.assertEqual(result["port"], 8900)
@@ -90,6 +96,8 @@ class ConfigurationIsolationTests(unittest.TestCase):
                 stack.enter_context(patch.object(routes, "snapshot", return_value={"media_dirs": [], "port": 8900}))
                 stack.enter_context(patch.object(routes, "network_payload", return_value={"scope": "local"}))
                 stack.enter_context(patch.object(routes, "tunnel_payload", return_value={"state": "idle"}))
+                stack.enter_context(patch.object(routes, "api_token_payload", return_value={"rotatable": False}))
+                stack.enter_context(patch.object(routes, "certificate_payload", return_value=None))
                 for key, module, name in (("push_discovery", routes, "push_discovery_payload"),
                                           ("downloads", routes.web_downloads, "settings_payload")):
                     stack.enter_context(patch.object(module, name, side_effect=OSError("private-detail"))
@@ -170,7 +178,7 @@ class MediaConfigurationTests(unittest.TestCase):
         roots, _, errors = media_config.validate(
             [{"location": "local", "path": "/media/movies"}], windows=False, config=config)
         self.assertEqual(roots, {})
-        self.assertIn("无法自动配置", errors[0])
+        self.assertIn("无法自动配置", str(errors[0]))
 
     def test_configuration_uses_the_automatic_prefix_for_library_name_and_cost(self):
         from peach import routes_configuration
@@ -268,21 +276,46 @@ class MediaConfigurationTests(unittest.TestCase):
 
     def test_runtime_fact_entries_list_dependencies_only_when_missing(self):
         from peach import web_entry
+        from peach.ffmpeg import BinaryChoice
         with tempfile.TemporaryDirectory() as directory:
             config = settings_file.load_config(environ={"PEACH_DATA_ROOT": str(Path(directory).resolve())})
-            with patch("peach.ffmpeg.FFmpegResolver.ffmpeg", return_value=Path("ffmpeg")), \
-                    patch("peach.ffmpeg.FFmpegResolver.ffprobe", return_value=Path("ffprobe")), \
-                    patch("peach.mp4recover.untrunc_path", return_value=Path("untrunc")):
-                present = [row["term"] for row in web_entry.runtime_fact_entries(config)]
-            with patch("peach.ffmpeg.FFmpegResolver.ffmpeg", return_value=None), \
-                    patch("peach.ffmpeg.FFmpegResolver.ffprobe", return_value=None), \
-                    patch("peach.mp4recover.untrunc_path", return_value=None):
-                missing = {row["term"]: row for row in web_entry.runtime_fact_entries(config)}
+
+            def facts(choice, untrunc, *, installable):
+                with patch("peach.ffmpeg.FFmpegResolver.ffmpeg", return_value=choice), \
+                        patch("peach.ffmpeg.FFmpegResolver.ffprobe", return_value=choice), \
+                        patch("peach.mp4recover.untrunc_path", return_value=untrunc), \
+                        patch("peach.media_tools.supported", return_value=installable):
+                    return {row["term"]: row for row in web_entry.runtime_fact_entries(config)}
+
+            present = facts(BinaryChoice(Path("ffmpeg"), "path"), Path("untrunc"), installable=True)
+            missing = facts(None, None, installable=False)
+            installable = facts(None, None, installable=True)
+            tools = config.directory("tools")
+            (tools / "ffmpeg").mkdir(parents=True)
+            (tools / "ffmpeg" / "manifest.json").write_text('{"version": "9.0.2"}', encoding="utf-8")
+            managed = facts(BinaryChoice(tools / "ffmpeg" / "bin" / "ffmpeg.exe", "peach-managed"),
+                            (tools / "untrunc" / "untrunc.exe").resolve(), installable=True)
         self.assertNotIn("FFmpeg", present)
         self.assertNotIn("untrunc", present)
         self.assertIn("版本", present)
         self.assertEqual(missing["FFmpeg"]["download_label"], "下载 FFmpeg")
         self.assertEqual(missing["untrunc"]["download_label"], "下载 untrunc")
+        self.assertEqual(missing["FFmpeg"]["value"], "未找到 FFmpeg、ffprobe；转码、媒体信息与缩略图需要 FFmpeg 工具包。")
+        self.assertEqual(missing["untrunc"]["value"],
+                         f"未安装；缺索引的 MP4 需要它才修得了。解压到 {tools / 'untrunc'}。")
+        # 项名、取值与链接文字都带 code，英文界面拿到英文。
+        english = {key: interface_text.text(f"server:{missing['FFmpeg'][f'{key}_code']}",
+                                            missing["FFmpeg"][f"{key}_params"], "en")
+                   for key in ("value", "download_label")}
+        self.assertEqual(english, {
+            "value": "FFmpeg and ffprobe not found. Transcoding, media info and thumbnails need the FFmpeg tools.",
+            "download_label": "Download FFmpeg"})
+        self.assertEqual(interface_text.text(f"server:{present['版本']['term_code']}", None, "en"), "Version")
+        self.assertEqual({term: (row.get("install_tool"), "download_url" in row) for term, row in installable.items()
+                          if term in ("FFmpeg", "untrunc")},
+                         {"FFmpeg": ("ffmpeg", False), "untrunc": ("untrunc", False)})
+        self.assertEqual(managed["FFmpeg"]["value"], "已安装，版本 9.0.2")
+        self.assertEqual(managed["untrunc"]["value"], "已安装在数据目录")
 
     def test_windows_cloud_sources_keep_policy_ids_and_offline_roots(self):
         roots, mounts, errors = media_config.validate([
@@ -307,7 +340,8 @@ class MediaConfigurationTests(unittest.TestCase):
         ], windows=True)
         self.assertEqual(roots, {})
         self.assertEqual(mounts, {})
-        self.assertIn("映射为 Windows 盘符", errors[0])
+        self.assertIn("映射为 Windows 盘符", str(errors[0]))
+        self.assertTrue(errors[0].code.startswith("errors.mediaConfiguration."))
         with patch.object(media_config, "mount_dependencies", return_value=[]):
             roots, mounts, errors = media_config.validate([
                 {"location": "115", "path": r"Z:\视频"},
@@ -342,6 +376,110 @@ class MediaConfigurationTests(unittest.TestCase):
         with patch("peach.platform.os.scandir", side_effect=OSError("Device not configured")):
             self.assertFalse(media_config.rows(config, windows=False, probe=True)[0]["online"])
 
+    def test_settings_read_mount_state_from_the_reachability_snapshot_without_listing_the_mount(self):
+        """所有设置页都等配置接口；网盘卡住时它不能跟着卡在列目录上。"""
+        from peach.mount_reachability import MountReachability, MountRoot
+        config = replace(settings_file.PeachConfig(Path('/unused'), Path('/unused/config.toml')),
+                         locations={"115": ("B:/",)}, mounts={"115": ("/Volumes/115",)})
+        monitor = MountReachability([MountRoot("115", "115", "B:/", Path("/Volumes/115"))],
+                                    probe=lambda path: "ok")
+        monitor.tick()
+        for _ in range(200):
+            monitor.tick()
+            if monitor.sources()[0]["online"] is not None:
+                break
+            threading.Event().wait(0.01)
+        with patch("peach.platform.os.scandir", side_effect=AssertionError("配置接口不该列举网盘根")):
+            row = media_config.rows(config, windows=False, probe=True,
+                                    known=media_config.reachability_states(monitor))[0]
+        self.assertTrue(row["online"])
+
+    def test_reachability_sleeps_until_the_next_due_or_timeout_point(self):
+        """不再每半秒醒一次：在途探测等超时点，探完排到下一个到期点。"""
+        from peach import mount_reachability as reachability
+        now = [100.0]
+        release = threading.Event()
+        monitor = reachability.MountReachability(
+            [reachability.MountRoot("115", "115", "B:/", Path("/Volumes/115"))],
+            probe=lambda path: release.wait(5) and "ok", clock=lambda: now[0], timeout=5.0)
+        self.addCleanup(release.set)
+        self.assertEqual(monitor.tick(), 5.0)
+        now[0] = 103.0
+        self.assertEqual(monitor.tick(), 2.0)
+        now[0] = 105.0
+        self.assertIsNone(monitor.tick(), "已超时的探测只等完成回调")
+        self.assertEqual(monitor.sources()[0]["state"], "timeout")
+        release.set()
+        for _ in range(200):
+            if monitor._states[Path("/Volumes/115")].pending.done():
+                break
+            threading.Event().wait(0.01)
+        now[0] = 106.0
+        self.assertEqual(monitor.tick(), reachability.HEALTHY_INTERVAL)
+        self.assertEqual(monitor.sources()[0]["state"], "ok")
+        now[0] = 106.0 + reachability.HEALTHY_INTERVAL - 1
+        self.assertEqual(monitor.tick(), 1.0)
+        now[0] = 106.0 + reachability.HEALTHY_INTERVAL
+        self.assertEqual(monitor.tick(), 5.0, "到期就起新的探测")
+
+    def test_reachability_loop_wakes_when_a_probe_finishes(self):
+        from peach.mount_reachability import MountReachability, MountRoot
+        release, calls = threading.Event(), []
+
+        def probe(path):
+            calls.append(path)
+            release.wait(5)
+            return "ok"
+        # 冻结的时钟让超时点永远不到；状态能变成在线，只能是完成回调叫醒了调度线程。
+        monitor = MountReachability([MountRoot("115", "115", "B:/", Path("/Volumes/115"))],
+                                    probe=probe, clock=lambda: 0.0, timeout=30.0)
+        monitor.start()
+        self.addCleanup(monitor.stop)
+        self.addCleanup(release.set)
+        for _ in range(200):
+            if calls:
+                break
+            threading.Event().wait(0.01)
+        release.set()
+        for _ in range(200):
+            if monitor.sources()[0]["online"]:
+                break
+            threading.Event().wait(0.01)
+        self.assertTrue(monitor.sources()[0]["online"])
+        self.assertEqual(len(calls), 1)
+
+    def test_a_root_the_snapshot_is_still_checking_is_probed_on_the_spot(self):
+        """服务刚启动、快照还没探完时，不能把在线的根报成未检测。"""
+        from peach.mount_reachability import MountReachability, MountRoot
+        config = replace(settings_file.PeachConfig(Path('/unused'), Path('/unused/config.toml')),
+                         locations={"115": ("B:/",)}, mounts={"115": ("/Volumes/115",)})
+        monitor = MountReachability([MountRoot("115", "115", "B:/", Path("/Volumes/115"))])
+        self.assertIsNone(monitor.sources()[0]["online"])
+        with patch("peach.platform.root_status", return_value="ok"):
+            row = media_config.rows(config, windows=False, probe=True,
+                                    known=media_config.reachability_states(monitor))[0]
+        self.assertTrue(row["online"])
+
+    def test_a_root_missing_from_the_snapshot_is_probed_with_a_deadline(self):
+        """刚保存、服务还没重载的目录不在快照里：现场探测，网盘不回话时按时报未检测。"""
+        config = replace(settings_file.PeachConfig(Path('/unused'), Path('/unused/config.toml')),
+                         locations={"115": ("B:/",)}, mounts={"115": ("/Volumes/115",)})
+        release = threading.Event()
+        calls = []
+
+        def hung(path):
+            calls.append(path)
+            release.wait(5)
+            return "ok"
+        try:
+            with patch("peach.platform.root_status", hung), \
+                    patch("peach.mount_reachability.PROBE_TIMEOUT", 0.05):
+                self.assertIsNone(media_config.rows(config, windows=False, probe=True, known={})[0]["online"])
+                self.assertIsNone(media_config.rows(config, windows=False, probe=True, known={})[0]["online"])
+            self.assertEqual(len(calls), 1, "上一次探测还没返回时不另起线程")
+        finally:
+            release.set()
+
     def test_setup_answers_keep_the_cloud_source_and_its_windows_root(self):
         from peach.routes_pages import _read_answers
         with tempfile.TemporaryDirectory() as directory:
@@ -356,15 +494,16 @@ class MediaConfigurationTests(unittest.TestCase):
 
     def test_setup_local_source_reports_native_directory_error_first(self):
         from peach.routes_pages import _setup_media_source_errors
+        from peach.user_messages import UserValueError
 
         def missing_directory(_path):
-            raise ValueError("目录不存在：/missing")
+            raise UserValueError("errors.onboarding.mediaDirMissing", {"path": "/missing"})
 
         errors = _setup_media_source_errors(
             ["/missing"], ["local"],
             ["Windows 中的对应路径必须包含盘符，例如 B:\\"], missing_directory,
         )
-        self.assertEqual(errors, ["目录不存在：/missing"])
+        self.assertEqual([str(error) for error in errors], ["目录不存在，或者不是目录：/missing。先建好再填。"])
 
     def test_completion_facts_and_entry_leave_out_mounts_and_internals(self):
         from peach.routes_pages import _setup_destination

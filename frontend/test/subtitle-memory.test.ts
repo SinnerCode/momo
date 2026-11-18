@@ -5,6 +5,7 @@ import type { VjsPlayer } from '../src/player/types';
 import { mountPlaybackRate, playerMemory } from '../src/player/memory';
 import { mountPlayerRotation } from '../src/player/rotation';
 import { mountCaptionStyle } from '../src/player/subtitle-style';
+import { configurePlayer } from '../src/player/host';
 
 function mounted() {
   const video = document.createElement('video'), events = new EventTarget();
@@ -146,5 +147,38 @@ describe('每部视频的字幕选择', () => {
     expect(track.mode).toBe('disabled');
     expect(writes).toEqual([{ selected: null }]);
     view.dispose();
+  });
+});
+
+describe('自动中文字幕设置', () => {
+  it('设置打开时读记忆带 auto=zh，由服务端推导中文轨；关着或没接宿主时不带', async () => {
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => { urls.push(url); return new Response(JSON.stringify({ selected: null, tracks: [] })) }));
+    let auto = false;
+    configurePlayer({ stage: () => null, settings: () => ({ ambientMode: false, theaterMode: false, miniplayer: false, detailAutoplay: false,
+      javImage: 'cover', seekSeconds: 10, autoChineseSubtitles: auto }), saveSettings: () => {}, toast: () => {},
+    loadSourceStatus: async () => ({}), offlineReason: () => '' });
+    for (const value of [false, true]) {
+      auto = value;
+      const view = mounted();
+      await playerMemory(view.player).load();
+      view.dispose();
+    }
+    expect(urls).toEqual(['/api/player/memory?video=item%3A1', '/api/player/memory?video=item%3A1&auto=zh']);
+  });
+});
+
+describe('原生全屏的字幕显示', () => {
+  it('iOS 原生全屏时交还原生字幕轨道，回到页面内再由网页层绘制', () => {
+    const view = mounted(), cleanup = new AbortController(), root = view.player.el();
+    let mode = 'inline';
+    Object.defineProperty(view.video, 'webkitPresentationMode', { get: () => mode });
+    mountCaptionStyle(root, view.video, cleanup.signal);
+    expect(root.dataset.peachCaptions).toBe('');
+    mode = 'fullscreen'; view.video.dispatchEvent(new Event('webkitpresentationmodechanged'));
+    expect(root.dataset.peachCaptions).toBeUndefined();
+    mode = 'inline'; view.video.dispatchEvent(new Event('webkitpresentationmodechanged'));
+    expect(root.dataset.peachCaptions).toBe('');
+    cleanup.abort();
   });
 });

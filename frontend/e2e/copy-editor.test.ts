@@ -102,6 +102,57 @@ describe('原位改字', () => {
       } finally { await context.close(); }
     });
 
+    it(`工具条在 Shadow DOM 弹窗外按网页定位，非按钮区域可拖动（${viewport.name}）`, async () => {
+      const context = await browser.newContext({ viewport });
+      try {
+        const page = await context.newPage();
+        await page.setContent('<meta charset="utf-8"><body><aside></aside></body>');
+        await page.addScriptTag({ content: await readFile(new URL('../src/copy-editor-core.js', import.meta.url), 'utf8') });
+        const styles = (await Promise.all([
+          '../src/react/components/selection-dock.css', '../src/react/batch-dock/batch-dock.css',
+          '../src/react/pages/copy-editor-page.css',
+        ].map(path => readFile(new URL(path, import.meta.url), 'utf8')))).join('\n');
+        const originalBodyHeight = await page.evaluate(styles => {
+          const root = document.querySelector('aside')!.attachShadow({ mode: 'open' });
+          root.innerHTML = '<style>dialog{inset:auto 16px 16px auto;margin:0;width:180px;height:200px;overflow:hidden;transform:translateY(0)}</style><dialog><div class="body"><p>设置内容</p></div></dialog>';
+          root.querySelector('dialog')!.showModal();
+          const bodyHeight = root.querySelector('.body')!.getBoundingClientRect().height;
+          (globalThis as any).copyTools = (globalThis as any).PeachCopyEditorCore.createTools({
+            styles, onToggle(active: boolean) { document.body.dataset.active = String(active); },
+          });
+          return bodyHeight;
+        }, '.peach-react *{box-sizing:border-box}' + styles);
+        const dock = page.getByRole('group', { name: '文案编辑', exact: true });
+        await dock.waitFor();
+        assert.equal(await page.locator('dialog .body').evaluate(node => node.getBoundingClientRect().height),
+          originalBodyHeight, '全页浮条不增加设置内容高度');
+        const placement = await dock.evaluate(node => {
+          const rect = node.getBoundingClientRect(), modal = node.closest('dialog')!.getBoundingClientRect();
+          return { open: node.matches(':popover-open'), left: rect.left, center: (rect.left + rect.right) / 2,
+            width: innerWidth, modalLeft: modal.left };
+        });
+        assert.equal(placement.open, true);
+        assert.ok(Math.abs(placement.center - placement.width / 2) <= 1, JSON.stringify(placement));
+        assert.ok(placement.left < placement.modalLeft, JSON.stringify(placement));
+        const before = await dock.boundingBox(), grip = await dock.locator('[data-copy-state]').boundingBox();
+        assert.ok(before && grip);
+        await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2);
+        await page.mouse.down();
+        await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2 - 120, { steps: 8 });
+        await page.mouse.up();
+        const dragged = await dock.boundingBox();
+        assert.ok(dragged && Math.abs(dragged.y - before.y + 120) <= 1);
+        await dock.getByRole('button', { name: '暂停编辑', exact: true }).click();
+        assert.equal(await page.locator('body').getAttribute('data-active'), 'false');
+        assert.deepEqual(await dock.boundingBox(), dragged, '点击按钮不拖动工具条');
+        await page.evaluate(() => document.querySelector('aside')!.shadowRoot!.querySelector('dialog')!.close());
+        await page.locator('body > [data-copy-editor] [data-copy-bar]').waitFor();
+        assert.equal(await dock.evaluate(node => node.matches(':popover-open')), true);
+        await page.evaluate(() => (globalThis as any).copyTools.destroy());
+        assert.equal(await dock.count(), 0);
+      } finally { await context.close(); }
+    });
+
     it(`链接和按钮输入框独占文字位置并恢复原文（${viewport.name}）`, async () => {
       const context = await browser.newContext({ viewport });
       try {
@@ -335,6 +386,27 @@ describe('原位改字', () => {
         await page.evaluate(() => document.documentElement.style.setProperty('--selection-dock-space', '120px'));
         assert.equal(await dock.evaluate(node => getComputedStyle(node).bottom), '120px');
         assert.ok(await dock.evaluate(node => node.getBoundingClientRect().bottom <= innerHeight - 119));
+        const handle = dock;
+        const initial = await dock.boundingBox();
+        assert.ok(initial);
+        await handle.press('Shift+ArrowUp');
+        const moved = await dock.boundingBox();
+        assert.ok(moved && Math.abs(moved.y - initial.y + 40) <= 1);
+        await handle.press('Escape');
+        const reset = await dock.boundingBox();
+        assert.ok(reset && Math.abs(reset.y - initial.y) <= 1);
+        const grip = await dock.locator('[data-copy-state]').boundingBox();
+        assert.ok(grip);
+        await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2);
+        await page.mouse.down();
+        await page.mouse.move(0, 0, { steps: 8 });
+        await page.mouse.up();
+        const dragged = await dock.boundingBox();
+        assert.ok(dragged && dragged.y < initial.y - 30);
+        assert.ok(dragged.x >= 11 && dragged.y >= 11);
+        await dock.locator('[data-copy-state]').dblclick();
+        const restored = await dock.boundingBox();
+        assert.ok(restored && Math.abs(restored.y - initial.y) <= 1);
         assert.deepEqual(opened.problems, []);
       } finally { await opened.close(); }
     });

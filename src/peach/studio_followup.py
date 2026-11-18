@@ -24,20 +24,24 @@ import json
 import sqlite3
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import studio_icons, studio_sites
+from . import interface_text, studio_icons, studio_sites
+from .content_words import LINK_LABEL_OFFICIAL
 from .followups import Attempts, Followup, FollowupType, attempts_root, register
+from .task_outcomes import is_outcome, outcome_parts, said
+from .task_runs import item_progress, task_label
 
 #: 这类后继在任务中心的身份，也是活动页上那一行的名字来源。
 TASK_KEY = "studio-mark"
-TASK_LABEL = "补厂牌官网与标识"
+TASK_LABEL = task_label(TASK_KEY)
 
 #: 这条后继写下的一切都带这个归属串，撤回按它认。
 SOURCE = "auto:studio-mark"
 
-#: 官网登记成哪一种链接、链接上写什么字，与人工复核装进去的那批相同。
-OFFICIAL, OFFICIAL_LABEL = "official", "官方网站"
+#: 官网登记成哪一种链接、链接上写什么字，与人工复核装进去的那批相同。链接名写进账本，是数据。
+OFFICIAL, OFFICIAL_LABEL = "official", LINK_LABEL_OFFICIAL
 
 #: 取候选地址的间隔与超时，与命令行那一趟的缺省相同。
 SITE_INTERVAL, SITE_TIMEOUT = 1.2, 8.0
@@ -48,6 +52,31 @@ ICON_INTERVAL, ICON_TIMEOUT = 1.5, 20.0
 #: 派出去过，`変態紳士倶楽部` 官网 09-23 登记后一直没图。没图的厂牌只有二三十家，几轮就轮遍。
 STOCK_SHARE = 8
 
+#: 候选官网全都连不上时，过多久存量补派再派这一家。与补女优资料「未取得」的那一档同为一天。
+RETRY_UNREACHED = 24 * 3600
+
+
+def release_unbounded_misses(root, clock=time.time) -> int:
+    """给没有重试期限的「官网未取得」记录补一个已过期的期限，存量补派各再派一次。
+
+    带期限之前写下的这类记录分不清当时是断网还是这家确实没有官网，不补就要等作品数或
+    链接数变化才会再试。重试一次之后照现在的规则重记：连不上的带一天期限，回了状态的不带。
+    只动 `studio-mark` 的记录；返回改了几条。
+    """
+    changed = 0
+    for path in sorted(Path(root).glob(f"{TASK_KEY}-*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (not isinstance(record, dict) or not is_outcome(record, "officialSite", "unfetched")
+                or record.get("retry_until") is not None):
+            continue
+        record["retry_until"] = clock()
+        path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        changed += 1
+    return changed
+
 
 def followup_key(entity_id: int) -> str:
     return f"{TASK_KEY}:{int(entity_id)}"
@@ -57,7 +86,7 @@ def parse_key(key: str) -> int:
     """把后继 key 拆回厂牌 id。形状不对就抛——那说明排队的行不是这个版本写的。"""
     prefix, _, raw = str(key).partition(":")
     if prefix != TASK_KEY or not raw.isdigit():
-        raise ValueError(f"认不出这条补厂牌后继：{key}")
+        raise ValueError(f"unrecognized studio followup key: {key}")
     return int(raw)
 
 
@@ -82,8 +111,7 @@ def plan(connection: sqlite3.Connection, logo_root, *, since_entity_id: int) -> 
     found = [(int(row[2] or 0), int(row[0]), str(row[1] or "")) for row in rows
              if not has_mark(logo_root, str(row[1] or ""))]
     found.sort(key=lambda item: (-item[0], item[1]))
-    return [Followup(key=followup_key(entity_id), task_key=TASK_KEY,
-                     label=f"{TASK_LABEL}：{name}" if name else TASK_LABEL)
+    return [Followup.item(followup_key(entity_id), TASK_KEY, name)
             for _assets, entity_id, name in found]
 
 
@@ -119,8 +147,7 @@ def stock(connection: sqlite3.Connection, logo_root, attempts, *, limit: int,
             continue
         if attempts.settled(key, fingerprint(connection, entity_id)):
             continue
-        found.append(Followup(key=key, task_key=TASK_KEY,
-                              label=f"{TASK_LABEL}：{name}" if name else TASK_LABEL))
+        found.append(Followup.item(key, TASK_KEY, name))
         if len(found) >= limit:
             break
     return found
@@ -131,14 +158,17 @@ def run(contract, key: str, handle) -> dict:
 
     人像闸取不到模型的那一次不记：结论取决于那天有没有网，记下来就要等到这家多一部
     作品或多一条链接才会再试，活动中心「立即重试」取回模型之后也补不回来。
+    候选官网一个都连不上的那次照记，但只保 `RETRY_UNREACHED`：同样是那天有没有网的事。
     """
     summary = _run(contract, key, handle)
     if summary.get("face_match_unavailable"):
         return summary
     with contract.database.read_connection() as connection:
         current = fingerprint(connection, parse_key(key))
+    site = summary.get("site") or {}
     Attempts(attempts_root(contract.candidate_root)).record(
-        key, current, str(summary.get("outcome", "")))
+        key, current, outcome_parts(summary),
+        retry_after=RETRY_UNREACHED if site.get("unreached") else None)
     return summary
 
 
@@ -152,22 +182,22 @@ def _run(contract, key: str, handle) -> dict:
                                  (entity_id,)).fetchone()
         if row is None:
             # 实体被合并或删掉了。这不是失败：那件事已经不存在了。
-            return {"outcome": "档案已不存在"}
+            return said("gone")
         name = str(row[0] or "")
         if has_mark(logo_root, name):
-            return {"name": name, "outcome": "已有标识"}
+            return {"name": name, **said("hasMark")}
         linked = connection.execute(
             "SELECT count(*) FROM entity_link WHERE entity_id=? AND link_kind IN (?,?)",
             (entity_id, *studio_icons.ICON_LINK_KINDS)).fetchone()[0]
         aliases = studio_sites.load_aliases(connection, [entity_id]).get(entity_id, ())
     if handle is not None:
-        handle.progress(label=f"{TASK_LABEL}：{name}", throttle=0)
+        handle.progress(**item_progress(TASK_KEY, name), throttle=0)
     summary: dict[str, object] = {"name": name}
     if not linked:
         site = _land_site(contract, entity_id, name, aliases, batch)
         summary["site"] = site
-        if site["outcome"] != "已登记":
-            return {**summary, "outcome": f"官网{site['outcome']}"}
+        if not is_outcome(site, "registered"):
+            return {**summary, **said("officialSite", outcome_parts(site))}
     return {**summary, **_land_mark(contract, entity_id, name, batch)}
 
 
@@ -180,12 +210,18 @@ def _land_site(contract, entity_id: int, name: str, aliases, batch: str) -> dict
     verdict = str(row["verdict"])
     if verdict != "ok":
         # `weak` 与 `未取得` 都不写：前者要人看，后者是没有证据。
-        return {"outcome": "待人确认" if verdict == "weak" else "未取得",
-                "verdict": verdict, "note": str(row["note"])[:200]}
+        result = {**said("needsReview" if verdict == "weak" else "unfetched"),
+                  "verdict": verdict, "note": str(row["note"])[:200]}
+        # 试过候选却没有一个回了 HTTP 状态：全是传输层失败，多半是断网，不是这家没有官网。
+        if row.get("candidate_url") and not row.get("status"):
+            result["unreached"] = True
+        return result
     url = str(row["final_url"] or row["candidate_url"])
     now = datetime.now(timezone.utc).isoformat()
     metadata = {"source": SOURCE, "batch": batch, "verdict": verdict, "installed_at": now,
-                "evidence": f"{row['note']}；标题「{row['title']}」", "sha256": row["sha256"]}
+                "evidence": interface_text.text("server:labels.studioFollowup.evidence",
+                                                {"note": row["note"], "title": row["title"]}),
+                "sha256": row["sha256"]}
     with contract.database.write_transaction() as connection:
         connection.execute(
             "INSERT OR IGNORE INTO entity_link"
@@ -194,7 +230,7 @@ def _land_site(contract, entity_id: int, name: str, aliases, batch: str) -> dict
             (entity_id, OFFICIAL, OFFICIAL_LABEL, url, urlsplit(url).hostname or "",
              json.dumps(metadata, ensure_ascii=False), now, now))
     contract.cache_bust()
-    return {"outcome": "已登记", "url": url}
+    return {**said("registered"), "url": url}
 
 
 def _land_mark(contract, entity_id: int, name: str, batch: str) -> dict:

@@ -19,8 +19,19 @@ updates:
       time: "09:45"
       timezone: Asia/Taipei
 
-  - package-ecosystem: uv
+  # compose.yaml 里 watchtower profile 固定的 nickfedor/watchtower 版本。
+  - package-ecosystem: docker-compose
     directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:45"
+      timezone: Asia/Taipei
+
+  - package-ecosystem: uv
+    directories:
+      - /
+      - /resources/ocr/environment
     schedule:
       interval: weekly
       day: monday
@@ -60,8 +71,11 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
 
+  # 本地组合 action 里引用的第三方 action 也要升级，目录要单独登记。
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - /
+      - /.github/actions/setup-ffmpeg
     schedule:
       interval: weekly
       day: monday

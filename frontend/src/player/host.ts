@@ -3,6 +3,7 @@
  * 播放器是命令式模块，不持有这些状态：设置归遗留壳的 `appSettings`（存在 localStorage 的
  * `peach.settings.v1` 里），回执归全站那一份 Toast，舞台的氛围光与剧场模式类挂在 `#stage` 上。
  * 挂播放器之前由持有方调一次 `configurePlayer` 接上。 */
+import { t } from '../i18n';
 
 /** 播放器读写的那几项设置。对象由持有方给出，播放器改了就地写回再调 `save`。 */
 export interface PlayerSettings {
@@ -11,6 +12,10 @@ export interface PlayerSettings {
   seekSeconds: number;
   miniplayer: boolean;
   detailAutoplay: boolean;
+  /** 没手动选过字幕的影片，打开时自动选同目录的中文字幕（#428），默认关。 */
+  autoChineseSubtitles?: boolean;
+  /** 离片尾不到这个百分比就从头播（`progress.ts` 的 `playbackPosition`）；没给按 0，只有播完才从头。 */
+  resumeRestartPercent?: number;
   /** 番号作品开播前那层封面取官方封面还是预览图（`card-art` 的 `detailPosterUrl` 按它挑）。 */
   javImage: string;
 }
@@ -32,6 +37,6 @@ let current: PlayerHost | null = null;
 export function configurePlayer(host: PlayerHost): void { current = host }
 
 export function playerHost(): PlayerHost {
-  if (!current) throw new Error('播放器还没有接上宿主（configurePlayer）');
+  if (!current) throw new Error(t('catalog:playerControls.hostMissing'));
   return current;
 }

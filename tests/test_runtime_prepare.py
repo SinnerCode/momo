@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from peach import runtime_prepare
@@ -15,6 +16,7 @@ from peach.runtime_prepare import (
     read_record, record, task_gate,
 )
 from peach.sync import marker_path
+from support.processes import finishes_within, hanging_program, kill_grandchild
 
 
 def completed(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -116,6 +118,28 @@ class DependencyTests(unittest.TestCase):
         self.assertTrue(step.failed)
         self.assertIn("lockfile", step.message)
 
+    def test_a_check_that_never_returns_fails_within_its_deadline(self):
+        """托盘启动先跑这一步：uv 卡住时按失败返回，整棵进程树一并收掉。"""
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.addCleanup(kill_grandchild, directory)
+        uv = hanging_program(directory)
+        dependencies = Dependencies(self.tree.root, which=lambda _name: str(uv), environ=dict(os.environ),
+                                    frozen=False)
+        with unittest.mock.patch.object(runtime_prepare, "UV_CHECK_SECONDS", 2), \
+                unittest.mock.patch.dict(os.environ, {"PEACH_LANGUAGE": "en"}):
+            step = finishes_within(dependencies.check, 30)
+        self.assertTrue(step.failed)
+        self.assertIn("didn't finish within 2 seconds", step.message)
+
+    def test_a_sync_that_never_returns_is_a_failure_not_an_exception(self):
+        run = FakeRun(completed(1, OUTDATED), subprocess.TimeoutExpired(["uv", "sync"], 1800))
+        with unittest.mock.patch.dict(os.environ, {"PEACH_LANGUAGE": "en"}):
+            step = self.dependencies(run).sync()
+        self.assertTrue(step.failed)
+        self.assertIn("uv sync didn't finish within 1800 seconds", step.message)
+        self.assertEqual([kwargs["timeout"] for _command, kwargs in run.calls],
+                         [runtime_prepare.UV_CHECK_SECONDS, runtime_prepare.UV_SYNC_SECONDS])
+
     def test_without_uv_nothing_runs(self):
         run = FakeRun()
         step = self.dependencies(run, which=lambda _name: None,
@@ -171,6 +195,10 @@ class WriterTests(unittest.TestCase):
         writer, why = self.writer()
         self.assertFalse(writer)
         self.assertIn("win-1", why)
+        # 接口默认按源语言嵌进自己的一句；托盘按本机语言要译文。
+        english = ledger_writer(replication_enabled=True, db=self.db, shared_db=self.shared,
+                                state_dir=self.state, language="en")
+        self.assertEqual(english, (False, "The primary computer is win-1; this device is read-only"))
 
     def test_the_marked_device_is_the_writer(self):
         (self.state / "device-id").write_text("win-1", encoding="utf-8")
@@ -196,6 +224,11 @@ class MigrationTests(unittest.TestCase):
         return Migrations(self.db, peach=lambda: Path("C:/peach/.venv/Scripts/peach.exe"),
                           writer=lambda: writer, run=run,
                           environ=lambda: {"PEACH_DATA_ROOT": "C:/peach-data"})
+
+    def test_the_step_follows_the_local_language(self):
+        with unittest.mock.patch.dict(os.environ, {"PEACH_LANGUAGE": "en"}):
+            step = self.migrations(lambda *a, **k: None, writer=(False, "reader")).apply()
+        self.assertEqual(step.message, "No migration: reader")
 
     def test_a_reader_never_migrates(self):
         run = FakeRun()
@@ -247,6 +280,28 @@ class MigrationTests(unittest.TestCase):
         self.assertIn("peach.exe missing", step.message)
 
 
+    def test_a_status_that_never_returns_fails_within_its_deadline(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.addCleanup(kill_grandchild, directory)
+        peach = hanging_program(directory)
+        migrations = Migrations(self.db, peach=lambda: peach, writer=lambda: (True, "writer"),
+                                environ=lambda: os.environ)
+        with unittest.mock.patch.object(runtime_prepare, "MIGRATE_STATUS_SECONDS", 2), \
+                unittest.mock.patch.dict(os.environ, {"PEACH_LANGUAGE": "en"}):
+            step = finishes_within(migrations.apply, 30)
+        self.assertTrue(step.failed)
+        self.assertIn("didn't finish within 2 seconds", step.message)
+
+    def test_an_upgrade_past_its_deadline_reports_the_backup(self):
+        run = FakeRun(completed(0, "migrations: 43, pending: 1\n"),
+                      subprocess.TimeoutExpired(["peach.exe", "migrate", "upgrade"], 7200))
+        step = self.migrations(run).apply()
+        self.assertTrue(step.failed)
+        self.assertIn("备份", step.message)
+        self.assertIn("peach migrate 超过 7200 秒没有结束", step.message)
+        self.assertEqual([kwargs["timeout"] for _command, kwargs in run.calls],
+                         [runtime_prepare.MIGRATE_STATUS_SECONDS, runtime_prepare.MIGRATE_UPGRADE_SECONDS])
+
 class RecordTests(unittest.TestCase):
     def test_the_record_is_read_back_only_for_the_tray_that_wrote_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -261,6 +316,13 @@ class RecordTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             written = record(Path(directory), [Step("dependencies", "stale", "不一致")], pid=1)
             self.assertFalse(written["ok"])
+
+    def test_pending_readiness_is_incomplete_without_being_a_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            step = Step("readiness", "pending", "服务仍在启动")
+            written = record(Path(directory), [step], pid=1)
+            self.assertFalse(written["ok"])
+            self.assertFalse(step.problem)
 
 
 class TaskGateTests(unittest.TestCase):

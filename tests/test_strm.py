@@ -22,6 +22,7 @@ from peach.scan import medium_of, scan_location
 from peach.strm_stream import StrmResources, rewrite_playlist
 from support.ledger import fresh_ledger
 from support.web import route_client
+from support.stalls import elapsed, stalled_mount
 
 
 @contextmanager
@@ -56,6 +57,13 @@ class StrmTextTests(unittest.TestCase):
                     strm.read_target(self.path)
                 self.assertNotIn('secret', str(caught.exception))
 
+    def test_a_stuck_pointer_file_is_refused_within_the_deadline(self):
+        self.path.write_text('https://example.com/a.mp4', encoding='utf-8')
+        with stalled_mount(self.path):
+            seconds, result = elapsed(strm.read_target, self.path)
+        self.assertLess(seconds, 3)
+        self.assertIsInstance(result, ValueError)
+
     def test_strm_and_iso_are_catalogued_without_background_probe(self):
         db = fresh_ledger(self.root)
         with closing(sqlite3.connect(db)) as connection, connection:
@@ -63,7 +71,7 @@ class StrmTextTests(unittest.TestCase):
                 self.assertEqual(medium_of(name), 'video')
                 connection.execute('INSERT INTO asset(id,location,path,name,medium) VALUES(?,?,?,?,?)',
                                    (index, 'local', 'R:\\media\\' + name, name, 'video'))
-        measured = (10, 1280, 720, 'h264', 24, None, '速食', '横屏', '720P', 3)
+        measured = (10, 1280, 720, 'h264', 24, None, 'quick', 'landscape', '720P', 3)
         with patch('peach.media_probe.measure', return_value=measured) as measure:
             policy.save(self.root, True)
             self.assertEqual(probe_unmeasured(db, 'ffprobe', 'local', 'R:\\media'), 1)
@@ -319,12 +327,15 @@ class StrmPlaybackTests(unittest.TestCase):
             self.assertEqual(client.post('/api/media-processing', json={'playback_acceleration': 'software'}).status_code, 200)
             self.assertEqual(client.get('/api/media-processing').json()['playback_acceleration'], 'software')
             saved = client.post('/api/media-processing', json={'metadata_only': True}).json()
-            self.assertEqual(saved, {'metadata_only': True, 'preview_acceleration': 'auto', 'playback_acceleration': 'software'})
+            self.assertEqual(saved, {'metadata_only': True, 'preview_acceleration': 'auto', 'playback_acceleration': 'software',
+                                     'playback_max_height': 0})
             self.assertEqual(client.post('/api/media-processing', json={'playback_acceleration': 'invalid'}).status_code, 400)
             self.assertEqual(client.post('/api/media-processing', json={'preview_acceleration': 'software'}).json(),
-                             {'metadata_only': True, 'preview_acceleration': 'software', 'playback_acceleration': 'software'})
+                             {'metadata_only': True, 'preview_acceleration': 'software', 'playback_acceleration': 'software',
+                              'playback_max_height': 0})
             self.assertEqual(client.post('/api/media-processing', json={'playback_acceleration': 'auto'}).json(),
-                             {'metadata_only': True, 'preview_acceleration': 'software', 'playback_acceleration': 'auto'})
+                             {'metadata_only': True, 'preview_acceleration': 'software', 'playback_acceleration': 'auto',
+                              'playback_max_height': 0})
 
 
 class StrmPlaylistTests(unittest.TestCase):

@@ -1,4 +1,5 @@
 """任务中心服务层：互斥、CAS、租约恢复与保留条数。"""
+from contextlib import closing
 import os
 import sqlite3
 import tempfile
@@ -9,10 +10,13 @@ from pathlib import Path
 from unittest import mock
 
 from peach.migrations import upgrade
+from peach.jobs import process_matches
 from peach.repository import LedgerDatabase
 from peach.task_runs import (
     TaskRunConflict,
     TaskRunStore,
+    item_progress,
+    run_error,
     stamp,
     task_label,
 )
@@ -22,6 +26,37 @@ MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
 
 
 class TaskRunStoreTests(unittest.TestCase):
+    def test_pruning_a_finished_run_preserves_download_state_and_clears_its_old_link(self):
+        run = self.store.start('download-postprocess', trigger='manual')
+        self.store.finish(run.id, 'succeeded')
+        with self.database.write_transaction(notify=False) as connection:
+            connection.execute("INSERT INTO download_task(provider,source_uri,target,state,updated_at,"
+                               "postprocess_state,postprocess_run_id,postprocess_detail) "
+                               "VALUES('115','sample','/Movies','ingested','now','complete',?,'整理完成')", (run.id,))
+        self.assertEqual(self.store.prune('download-postprocess', keep=0), 1)
+        with self.database.read_connection() as connection:
+            row = connection.execute('SELECT state,postprocess_state,postprocess_run_id,postprocess_detail '
+                                     'FROM download_task').fetchone()
+            self.assertEqual(tuple(row), ('ingested', 'complete', None, '整理完成'))
+
+    def test_process_identity_preserves_owners_when_creation_time_is_unknown(self):
+        started = stamp(datetime.now(timezone.utc))
+        with mock.patch('peach.jobs.process_creation_time', return_value=None):
+            self.assertTrue(process_matches(os.getpid(), started, alive=lambda _: True))
+            self.assertFalse(process_matches(os.getpid(), started, alive=lambda _: False))
+
+    def test_a_resumed_worker_with_current_heartbeat_is_not_reclaimed(self):
+        run = self.store.start('library-processing', trigger='manual')
+        earlier = datetime.now(timezone.utc) - timedelta(days=1)
+        created = datetime.now(timezone.utc).timestamp() - 30
+        with self.database.write_transaction(notify=False) as connection:
+            connection.execute('UPDATE task_run SET pid=?,started_at=? WHERE id=?',
+                               (os.getpid() + 1, stamp(earlier), run.id))
+        with mock.patch('peach.task_runs.process_alive', return_value=True), \
+                mock.patch('peach.jobs.process_creation_time', return_value=created):
+            self.assertEqual(self.store.recover_interrupted(), [])
+        self.assertEqual(self.store.get(run.id).status, 'running')
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -39,6 +74,31 @@ class TaskRunStoreTests(unittest.TestCase):
         self.assertEqual(run.progress_total, 10)
         self.assertEqual(run.pid, os.getpid())
         self.assertEqual(self.store.get(run.id).progress_label, "准备")
+
+    def test_active_families_match_live_ids_and_each_runs_live_descendants(self):
+        # 已结束的根 → 已结束的子 → 排队的孙；根下另一条在跑的子；独立的已失败与排队各一条。
+        ids = [self.store.start("demo", trigger="manual").id for _ in range(6)]
+        root, child, grandchild, runner, failed, alone = ids
+        layout = {root: (None, "succeeded"), child: (root, "succeeded"), grandchild: (child, "pending"),
+                  runner: (root, "running"), failed: (None, "failed"), alone: (None, "pending")}
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            for run_id, (parent, status) in layout.items():
+                finished = None if status in ("pending", "running") else "2026-01-01T00:00:00Z"
+                connection.execute("UPDATE task_run SET parent_run_id=?, status=?, finished_at=? WHERE id=?",
+                                   (parent, status, finished, run_id))
+
+        families = self.store.active_families()
+
+        self.assertEqual(set(families), self.store.live_ids())
+        self.assertEqual(families[root], [(grandchild, "pending"), (runner, "running")])
+        self.assertEqual(families[child], [(grandchild, "pending")])
+        self.assertEqual(families[alone], [(alone, "pending")])
+        self.assertNotIn(failed, families)
+        for run_id, family in families.items():
+            run = self.store.get(run_id)
+            expected = ([run_id] if run.active else []) + [
+                row.id for row in self.store.active_descendants(run_id)]
+            self.assertEqual([member for member, _status in family], sorted(expected))
 
     def test_missing_empty_or_corrupt_ledgers_have_no_available_task_center(self):
         self.assertTrue(self.store.available())
@@ -58,9 +118,55 @@ class TaskRunStoreTests(unittest.TestCase):
         skipped = self.store.query(status="cancelled")[0]
         self.assertEqual(skipped.trigger, "scheduled")
         self.assertEqual(skipped.result_summary["blocked_by"], first.id)
-        self.assertIn(str(first.id), skipped.error)
+        self.assertEqual(skipped.error, f"与第 {first.id} 轮（手动触发）冲突，本次跳过")
+        self.assertEqual((skipped.error_code, skipped.error_params),
+                         ("taskRun.error.skippedBy", {"run": first.id, "trigger": "manual"}))
         # 跳过的那一轮从没开跑，所以没有开始时刻可报。
         self.assertIsNone(skipped.started_at)
+
+    def test_a_progress_label_keeps_its_code_and_a_plain_one_clears_it(self):
+        run = self.store.start("entity-avatar", trigger="manual", **item_progress("entity-avatar", "涼森れむ"))
+        stored = self.store.get(run.id)
+        self.assertEqual((stored.progress_label, stored.progress_code, stored.progress_params),
+                         ("资料图片补全：涼森れむ", "taskRun.progress.item", {"name": "涼森れむ"}))
+        self.assertTrue(self.store.progress(run.id, current=1, throttle=0))
+        self.assertEqual(self.store.get(run.id).progress_code, "taskRun.progress.item")
+        # 只给原文的那一句不能沿用上一句的 code，否则界面会把它译成上一句。
+        self.assertTrue(self.store.progress(run.id, label="比对封面", throttle=0))
+        self.assertEqual(self.store.get(run.id).payload()["progress_code"], "")
+        self.store.suspend(run.id)
+        waiting = self.store.get(run.id)
+        self.assertEqual((waiting.progress_label, waiting.progress_code),
+                         ("等待安装完成后继续", "taskRun.progress.waitingForUpdate"))
+
+    def test_coded_text_is_not_stored_and_is_rendered_when_read(self):
+        # ADR-0159：带 code 的说明与结束原因只存 code 与参数，读出时按资源渲染；没有 code 的原文照存。
+        from peach.task_outcomes import part, said
+        run = self.store.start("entity-avatar", trigger="manual", **item_progress("entity-avatar", "涼森れむ"))
+        self.store.finish(run.id, "succeeded", summary={"name": "涼森れむ", **said(part("installed")),
+                                                         **said(part("sourceCover", code="ABC-001"), field="source")})
+        failed = self.store.start("demo", trigger="manual")
+        self.store.finish(failed.id, "failed", error="RuntimeError: 原文")
+        with closing(sqlite3.connect(self.db)) as connection:
+            rows = dict(connection.execute("SELECT id, coalesce(progress_label,'') || '|' || coalesce(error,'') "
+                                           "FROM task_run").fetchall())
+        self.assertEqual(rows, {run.id: "|", failed.id: "|RuntimeError: 原文"})
+        payload = self.store.get(run.id).payload()
+        self.assertEqual(payload["progress_label"], "资料图片补全：涼森れむ")
+        self.assertEqual((payload["result_summary"]["outcome"], payload["result_summary"]["source"]),
+                         ("已保存资料图片", "作品封面 ABC-001"))
+        self.assertEqual(payload["result_summary"]["outcome_parts"], [{"code": "installed", "params": {}}])
+
+    def test_queued_followups_carry_the_code_of_their_label(self):
+        from peach.followups import Followup
+        parent = self.store.start("library-processing", trigger="manual")
+        queued = self.store.enqueue_followups(parent.id, [
+            Followup.item("entity-avatar:performer:1", "entity-avatar", "涼森れむ").as_row(),
+            ("studio-mark:2", "studio-mark", "旧写法")])
+        coded, plain = (self.store.get(run_id) for run_id in queued["queued"])
+        self.assertEqual((coded.progress_code, coded.progress_params), ("taskRun.progress.item", {"name": "涼森れむ"}))
+        self.assertEqual((plain.progress_label, plain.progress_code), ("旧写法", ""))
+        self.assertEqual(run_error("unknownFollowup", "no-such-task")["error"], "没有登记 no-such-task 这种后继")
 
     def test_manual_conflict_raises_with_the_blocking_run_id(self):
         first = self.store.start("demo", trigger="scheduled", mutex_key="demo")
@@ -131,6 +237,37 @@ class TaskRunStoreTests(unittest.TestCase):
             self.assertFalse(self.store.progress(run.id, current=3, throttle=0))
         self.assertTrue(self.store.progress(run.id, current=3, throttle=0))
 
+    def test_a_stuck_writer_in_the_same_process_fails_other_writes_instead_of_freezing_them(self):
+        import threading
+        from peach.task_retry import transient_delay
+        from peach.user_messages import UserFacingError
+        run = self.store.start("demo", trigger="manual")
+        holding, release = threading.Event(), threading.Event()
+
+        def stuck():
+            with self.database.write_transaction(notify=False):
+                holding.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=stuck, name="stuck-writer")
+        holder.start()
+        self.addCleanup(holder.join, 10)
+        self.addCleanup(release.set)
+        self.assertTrue(holding.wait(10))
+        with mock.patch("peach.repository.WRITE_LOCK_SECONDS", 0.05), \
+                self.assertLogs("peach.repository", "WARNING") as logs, \
+                self.assertRaises(sqlite3.OperationalError) as caught:
+            with self.database.write_transaction() as connection:
+                connection.execute("UPDATE task_run SET progress_current=9 WHERE id=?", (run.id,))
+        self.assertIn("stuck-writer", logs.output[0])
+        # 超时发生在拿连接之前，这次写入一行都没有落；错误给人看得懂，重试分类按暂时故障处理。
+        self.assertIsInstance(caught.exception, UserFacingError)
+        self.assertEqual(caught.exception.code, "errors.ledger.writeBusy")
+        self.assertEqual(transient_delay(caught.exception), 0.0)
+        release.set()
+        holder.join(10)
+        self.assertNotEqual(self.store.get(run.id).progress_current, 9)
+
     def test_finish_retries_a_locked_ledger_and_then_lands(self):
         run = self.store.start("demo", trigger="manual", mutex_key="demo")
         real = self.store._update_active
@@ -176,6 +313,7 @@ class TaskRunStoreTests(unittest.TestCase):
         self.assertEqual(self.store.recover_interrupted(), [run.id])
         recovered = self.store.get(run.id)
         self.assertEqual(recovered.status, "interrupted")
+        self.assertEqual((recovered.error, recovered.error_code), ("服务重启，这一轮没有跑完", "taskRun.error.interrupted"))
         self.assertIsNotNone(recovered.finished_at)
         # 打断不是失败：任务没有得出坏结果，只是没跑完。
         self.assertNotEqual(recovered.status, "failed")
@@ -188,6 +326,18 @@ class TaskRunStoreTests(unittest.TestCase):
                                    (os.getpid() + 1, run.id))
             self.assertEqual(self.store.recover_interrupted(), [])
         self.assertEqual(self.store.get(run.id).status, "running")
+
+    def test_recovery_does_not_treat_a_reused_pid_as_the_original_worker(self):
+        run = self.store.start("library-processing", trigger="manual")
+        old_start = stamp(datetime.now(timezone.utc) - timedelta(days=1))
+        with self.database.write_transaction(notify=False) as connection:
+            connection.execute("UPDATE task_run SET pid=?,started_at=?,heartbeat_at=? WHERE id=?",
+                               (os.getpid() + 1, old_start, old_start, run.id))
+        created_after_task = datetime.now(timezone.utc).timestamp()
+        with mock.patch("peach.task_runs.process_alive", return_value=True), \
+                mock.patch("peach.jobs.process_creation_time", return_value=created_after_task):
+            self.assertEqual(self.store.recover_interrupted(), [run.id])
+        self.assertEqual(self.store.get(run.id).status, "interrupted")
 
     def test_recovery_of_another_machine_waits_for_the_lease_to_expire(self):
         run = self.store.start("demo", trigger="manual")
@@ -297,10 +447,10 @@ class TaskRunStoreTests(unittest.TestCase):
         self.assertEqual(finished.progress_current, 2)
         with self.assertRaises(RuntimeError):
             with self.store.track("demo", trigger="cli") as failing:
-                raise RuntimeError("来源离线")
+                raise RuntimeError("source offline")
         broken = self.store.get(failing.run_id)
         self.assertEqual(broken.status, "failed")
-        self.assertIn("来源离线", broken.error)
+        self.assertIn("source offline", broken.error)
 
     def test_track_hands_back_an_inert_handle_when_the_mutex_is_taken(self):
         self.store.start("demo", trigger="manual", mutex_key="demo")

@@ -8,7 +8,21 @@ import subprocess
 import sys
 import threading
 
-from . import onboarding, settings_file
+from . import access, distribution, interface_text, onboarding, settings_file
+from .user_messages import UserFacingError, UserRuntimeError
+
+#: 容器首次启动时直接设好的访问密码（ADR-0149）；读过就从环境里删掉，不传给子进程。
+ACCESS_PASSWORD_ENV = "PEACH_ACCESS_PASSWORD"
+#: 看守循环多久看一次服务进程、重载与迁移请求。每轮要读两遍设置文件；重载、迁移本来就要重启
+#: 服务，多等一秒看不出来。
+SUPERVISE_SECONDS = 2
+
+
+def _said(error: BaseException) -> str:
+    """终端里的一句报错：带 code 的按命令行语言渲染，别的照旧给原文。"""
+    if isinstance(error, UserFacingError):
+        return interface_text.text(f"server:{error.code}", error.params, interface_text.local_language())
+    return str(error)
 
 
 def launch(*arguments: str) -> subprocess.Popen:
@@ -35,7 +49,7 @@ def initialize() -> None:
     config = settings_file.load_config()
     if config.present:
         if not (config.directory('database') / 'ledger.db').is_file():
-            raise RuntimeError('已有配置但缺少数据库，请恢复数据库后启动')
+            raise UserRuntimeError('errors.server.databaseMissing')
         from .runtime_prepare import configured_ledger_writer
         writer, _reason = configured_ledger_writer(config)
         if not writer:
@@ -45,26 +59,58 @@ def initialize() -> None:
         try:
             code = migrate.wait(timeout=180)
             if code:
-                raise RuntimeError(f"数据库升级失败，退出码 {code}；服务未启动")
+                raise UserRuntimeError("errors.server.migrateFailed", {"code": code})
         finally:
             stop_process(migrate)
         return
     if config.directory("database").joinpath("ledger.db").exists():
-        raise RuntimeError("已有数据库但缺少配置文件，请恢复 config.toml 后启动")
+        raise UserRuntimeError("errors.server.settingsMissing")
+    if distribution.docker():
+        # 全新数据卷不替用户答题：服务以未配置状态起来，浏览器打开就是首次设置页（ADR-0149）。
+        return
     process = launch("init", "--no-input")
     try:
         code = process.wait(timeout=120)
         if code:
-            raise RuntimeError(f"初始化失败，退出码 {code}")
+            raise UserRuntimeError("errors.server.initFailed", {"code": code})
     finally:
         stop_process(process)
 
 
+def seed_access_password(config) -> str:
+    """还没有访问策略时，用 `PEACH_ACCESS_PASSWORD` 写下 password 策略；返回给日志的一行，不含明文。
+
+    已有策略时忽略它：改密码走配置页，环境变量不能在每次重启时把它改回去。值不合规时只报原因、
+    照常启动，浏览器打开后仍可在首次设置或访问设置里设密码；拒绝启动会让容器反复重启。
+    还没有设置文件时也照写：首次设置会沿用这份策略，访问那一项标成已设置。
+    """
+    password = os.environ.pop(ACCESS_PASSWORD_ENV, "")
+    if not password:
+        return ""
+    path = config.directory("secrets") / "access.json"
+    if path.exists():
+        return interface_text.cli("server.accessIgnored", env=ACCESS_PASSWORD_ENV)
+    try:
+        access.save(path, password)
+    except ValueError as error:
+        return interface_text.cli("server.accessRejected", env=ACCESS_PASSWORD_ENV, error=_said(error))
+    except OSError as error:
+        return interface_text.cli("server.accessWriteFailed", env=ACCESS_PASSWORD_ENV,
+                                  error=error.strerror or type(error).__name__)
+    return interface_text.cli("server.accessSet", env=ACCESS_PASSWORD_ENV)
+
+
 def supervise(host: str, port: int, stopping: threading.Event) -> int:
     service = scanner = None
+    serving_configured = False
 
     def serve() -> subprocess.Popen:
-        return launch("serve", "--host", host, "--port", str(port), "--no-mdns", "--no-ledger-sync")
+        # 还没有设置文件时起的是首次设置服务，与托盘首启同一个 `--setup`；设置一提交、设置文件
+        # 出现，下面的循环就把它换成正常服务。
+        nonlocal serving_configured
+        serving_configured = settings_file.load_config().present
+        setup = () if serving_configured else ("--setup",)
+        return launch("serve", *setup, "--host", host, "--port", str(port), "--no-mdns", "--no-ledger-sync")
 
     def stop_all() -> None:
         nonlocal service, scanner
@@ -86,7 +132,7 @@ def supervise(host: str, port: int, stopping: threading.Event) -> int:
                 continue
             config = settings_file.load_config()
             reload_path = config.directory("state") / onboarding.RELOAD_NAME
-            if service is None or reload_path.exists():
+            if service is None or reload_path.exists() or config.present != serving_configured:
                 stop_process(service)
                 service = serve()
                 reload_path.unlink(missing_ok=True)
@@ -95,13 +141,14 @@ def supervise(host: str, port: int, stopping: threading.Event) -> int:
                 return code or 1
             if scanner is not None and scanner.poll() is not None:
                 if scanner.returncode:
-                    print(f"资料处理失败，退出码 {scanner.returncode}", file=sys.stderr, flush=True)
+                    print(interface_text.cli("server.processFailed", code=scanner.returncode),
+                          file=sys.stderr, flush=True)
                 scanner = None
             if scanner is None:
                 location = onboarding.take_first_scan_request(config)
                 if location is not None:
                     scanner = launch("process", location)
-            stopping.wait(1)
+            stopping.wait(SUPERVISE_SECONDS)
         return 0
     finally:
         stop_process(scanner)
@@ -109,7 +156,7 @@ def supervise(host: str, port: int, stopping: threading.Event) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="运行通过浏览器管理的 Peach 服务")
+    parser = argparse.ArgumentParser(description=interface_text.cli("server.description"))
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8900)
     args = parser.parse_args(argv)
@@ -117,10 +164,24 @@ def main(argv: list[str] | None = None) -> int:
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *_: stopping.set())
     initialize()
-    print(f"Peach 服务监听：{args.host}:{args.port}。容器外部访问地址以宿主机端口映射为准。", flush=True)
-    print("首次登录：在运行 Peach 的环境中执行 peach token 查看口令，登录后设置访问密码。", flush=True)
     if os.environ.get('PEACH_DISTRIBUTION') == 'docker':
-        print("NAS / 局域网访问：Compose 的 PEACH_BIND 应为宿主机局域网 IP；127.0.0.1 只允许宿主机访问。", flush=True)
+        # 起服务前写好：watchtower profile 等 Peach 就绪才启动，启动时读这份令牌（ADR-0140）。
+        from .docker_update import ensure_token
+        try:
+            ensure_token()
+        except OSError as error:
+            print(interface_text.cli("server.updateTokenFailed", error=error), file=sys.stderr, flush=True)
+    config = settings_file.load_config()
+    seeded = seed_access_password(config)
+    if seeded:
+        print(seeded, flush=True)
+    print(interface_text.cli("server.listening", host=args.host, port=args.port), flush=True)
+    if distribution.docker() and not config.present:
+        print(interface_text.cli("server.firstSetup"), flush=True)
+    elif access.load(config.directory("secrets") / "access.json")["mode"] == "legacy":
+        print(interface_text.cli("server.firstOpen" if distribution.docker() else "server.firstSignIn"), flush=True)
+    if os.environ.get('PEACH_DISTRIBUTION') == 'docker':
+        print(interface_text.cli("server.lanAccess"), flush=True)
     return supervise(args.host, args.port, stopping)
 
 

@@ -11,13 +11,18 @@ import { BACKGROUND_ISSUES_URL, type BackgroundIssue } from '../../src/react/act
 import { DOWNLOADS_URL } from '../../src/react/activity/downloads-panel';
 import { ErrorExcerpt } from '../../src/react/activity/error-excerpt';
 import {
-  elapsedText, errorHeadline, followupDetail, hasResultProblems, isRoutine, prefetchTasks, progressText, summaryItems, summaryText, TASKS_URL,
+  elapsedText, errorHeadline, followupDetail, hasResultProblems, isRoutine, prefetchTasks, progressLabel, progressText, summaryItems, summaryText, TASKS_URL,
 } from '../../src/react/activity/tasks';
-import type { ActivityData, FinishedPage, TaskRunPayload } from '../../src/react/activity/tasks';
+import type { ActivityData, TaskResourcesPayload, TaskRunPayload } from '../../src/react/activity/tasks';
 import type { DownloadsSnapshot } from '../../src/react/bundle';
 import { queryClient } from '../../src/react/query';
 
-import { buttonNamed, click, mount, mountRoot, settle } from './render';
+import { buttonNamed, choose, click, mount, mountRoot, pending, settle } from './render';
+
+vi.mock('@peach/legacy/ui', async (original) => ({
+  ...await original<typeof import('@peach/legacy/ui')>(),
+  confirmModal: (await import('../../src/ui-kit/modal')).confirmModal,
+}));
 
 // 客户端是模块级的单例（所有 React 根共用一个），用例之间不清就互相喂数据。
 afterEach(() => queryClient.clear());
@@ -51,15 +56,22 @@ const run = (overrides: Partial<TaskRunPayload> = {}): TaskRunPayload => ({
 /** 一条后继（ADR-0040）：跑完的一行，挂在 `parent` 那一轮下面。 */
 const followup = (parent: number, overrides: Partial<TaskRunPayload> = {}): TaskRunPayload =>
   run({
-    id: 90, task_key: 'entity-avatar', task_label: '补全资料图片', status: 'succeeded',
-    progress_total: null, progress_current: null, progress_label: '补全资料图片：涼森れむ',
+    id: 90, task_key: 'entity-avatar', task_label: '资料图片补全', status: 'succeeded',
+    progress_total: null, progress_current: null, progress_label: '资料图片补全：涼森れむ',
+    progress_code: 'taskRun.progress.item', progress_params: { name: '涼森れむ' },
     finished_at: '2026-09-11T10:04:00Z', parent_run_id: parent, root_run_id: parent,
     followup_key: 'entity-avatar:performer:12', followup_depth: 1,
-    result_summary: { outcome: '已装上' }, ...overrides,
+    result_summary: { outcome: '已保存资料图片', outcome_parts: [{ code: 'installed', params: {} }] }, ...overrides,
   });
 
 const payload = (overrides: Partial<ActivityData> = {}): ActivityData => ({
   available: true, running: [], skipped: [], finished: [], ...overrides,
+});
+const resources = (overrides: Partial<TaskResourcesPayload> = {}): TaskResourcesPayload => ({
+  cpu: { state: 'ready', percent: 12.5, high: false },
+  gpu: { state: 'ready', percent: 0, high: false },
+  network: { state: 'ready', bytes_per_second: 2 * 1024 * 1024, high: false },
+  sampled_at: '2026-10-31T08:00:00Z', ...overrides,
 });
 
 /* 云下载段自己取 `/api/downloads`，「需要处理」自己取 `/api/background-issues`。这里的用例只数
@@ -76,6 +88,16 @@ function stubFetch(tasks: (input: string, init?: RequestInit) => Promise<unknown
       issuePosts.push(input);
       issues = issues.filter((issue) => issue.retry !== input);
       return Promise.resolve({ ok: true, status: 200, json: async () => ({ running: true }) });
+    }
+    if (/^\/api\/tasks\/\d+$/.test(input)) {
+      return tasks(input, init).then(async (value) => {
+        const response = value as { ok: boolean; status: number; json(): Promise<ActivityData> };
+        const body = await response.json();
+        const parent = Number(input.split('/').at(-1));
+        return { ...response, json: async () => ({
+          followups: [...(body.running || []), ...(body.finished || [])].filter((row) => row.parent_run_id === parent),
+        }) };
+      });
     }
     return tasks(input, init);
   });
@@ -96,6 +118,9 @@ function serve(...responses: (ActivityData | null)[]) {
 }
 
 const page = () => <QueryClientProvider client={queryClient}><ActivityPage /></QueryClientProvider>;
+const controlButton = (name: string, root: ParentNode = document) =>
+  root.querySelector<HTMLButtonElement>(`button[aria-label="${name}"]`);
+const confirmTaskCancellation = () => click(document.querySelector('[data-modal-confirm]'));
 
 it('扫描各阶段已结束且留有问题时显示部分结果状态', async () => {
   serve(payload({ finished: [run({ task_key: 'library-processing', task_label: '扫描与采集',
@@ -109,11 +134,16 @@ it('扫描各阶段已结束且留有问题时显示部分结果状态', async (
 
 it('追更检查的问题详情绑定任务快照并提供来源入口', async () => {
   serve(payload({ finished: [run({ status: 'succeeded', result_summary: { source_failed: 1,
-    issues: [{ source: 7, label: '示例作者', provider: '示例站点', kind: '检查失败', error: 'HTTP 403' }] } })] }));
+    issues: [{ source: 7, label: '示例作者', provider: '示例站点', kind: '检查失败', error: 'HTTP 403' },
+      // 带 code 的一条按 code 渲染：类别取 `kind_code`，原因按段拼，不读服务端的原句。
+      { source: 8, label: '订阅源', provider: '', kind: '旧类别', kind_code: 'labels.taskResults.kind.backfill',
+        error: '旧原句', error_parts: [{ code: 'labels.taskResults.noResult' }] }] } })] }));
   await prefetchTasks(new AbortController().signal);
   const host = await mount(page());
   expect(host.querySelector('[data-task-issues]')?.textContent).toContain('示例作者 · 示例站点 · 检查失败');
   expect(host.querySelector('[data-task-issues]')?.textContent).toContain('HTTP 403');
+  expect(host.querySelector('[data-task-issues]')?.textContent).toContain('订阅源 · 补查失败');
+  expect(host.querySelector('[data-task-issues]')?.textContent).toContain('来源未返回检查结果');
   expect(host.querySelector('[data-task-issues]')?.closest('details')?.open).toBe(false);
   expect(host.querySelector('a[href="/subscriptions"]')?.textContent).toContain('查看关注来源');
 });
@@ -128,7 +158,7 @@ it('扫描与采集只有最新那一轮失败才去卡片上重试未完成项'
     scan({ id: 4, status: 'succeeded', error: '', finished_at: '2026-09-11T09:05:00Z' }),
     scan({ id: 3, finished_at: '2026-09-11T08:05:00Z' }),
     // amane 桥的处理入口在页顶「需要处理」那一行，卡上不放。
-    run({ id: 2, task_key: 'amane-bridge', task_label: '重建 amane 桥', status: 'failed',
+    run({ id: 2, task_key: 'amane-bridge', task_label: 'amane 桥重建', status: 'failed',
           progress_total: null, finished_at: '2026-09-11T07:05:00Z', error: '重建未完成' }),
   ] }));
   await prefetchTasks(new AbortController().signal);
@@ -214,17 +244,460 @@ it('总量未知时不画假进度条，只说正在做什么', async () => {
   expect(host.querySelector('[role=status]')?.textContent).toContain('正在查第三个来源');
 });
 
+it('活动主任务和后继持续显示各自的CPU、GPU与实测网速', async () => {
+  const child = followup(1, { status: 'running', resources: resources({
+    cpu: { state: 'ready', percent: 3, high: false },
+    network: { state: 'ready', bytes_per_second: 1024, high: false },
+  }) });
+  const { host } = await open(payload({ running: [run({ resources: resources() }), child] }));
+  const main = host.querySelector('[data-task-resources="1"]')!;
+  const nested = host.querySelector('[data-task-resources="90"]')!;
+  expect(main.querySelector('[data-task-resource="cpu"]')?.textContent).toBe('CPU 12.5%');
+  expect(main.querySelector('[data-task-resource="gpu"]')?.textContent).toBe('GPU 未使用');
+  expect(main.querySelector('[data-task-resource="network"]')?.textContent).toBe('网络 2 MB/s');
+  expect(nested.querySelector('[data-task-resource="cpu"]')?.textContent).toBe('CPU 3%');
+  expect(nested.querySelector('[data-task-resource="network"]')?.textContent).toBe('网络 1 KB/s');
+  expect([...main.querySelectorAll('[data-task-resource]')].every(node => !node.hasAttribute('title'))).toBe(true);
+});
+
+it('资源采样中和未取得分别显示，原因优先说明，不把null填成零', async () => {
+  const { host } = await open(payload({ running: [run({ resources: resources({
+    cpu: { state: 'sampling', percent: null, high: false, reason: '正在建立采样基线' },
+    gpu: { state: 'unavailable', percent: null, high: false, reason: '当前系统无法归属GPU引擎' },
+    network: { state: 'unavailable', bytes_per_second: null, high: false, reason: '挂载盘传输无法准确归属' },
+  }) })] }));
+  const metrics = host.querySelector('[data-task-resources="1"]')!;
+  expect(metrics.querySelector('[data-task-resource="cpu"]')?.textContent).toBe('CPU 采样中');
+  expect(metrics.querySelector('[data-task-resource="gpu"]')?.textContent).toBe('GPU 未取得');
+  expect(metrics.querySelector('[data-task-resource="network"]')?.textContent).toBe('网络 未取得');
+  expect(metrics.textContent).not.toContain('0%');
+  expect(metrics.textContent).not.toContain('0 B/s');
+  expect(metrics.querySelector('[data-task-resource="network"]')?.getAttribute('title')).toMatch(/^挂载盘传输无法准确归属/);
+});
+
+it('从网盘挂载读取时网络写网盘读取，仍不报告零值', async () => {
+  const { host } = await open(payload({ running: [run({ resources: resources({
+    network: { state: 'unavailable', bytes_per_second: null, high: false, via: 'cloud',
+      reason: '网盘挂载的缓存与预读无法按任务取得实际网速' },
+  }) })] }));
+  const network = host.querySelector('[data-task-resources="1"] [data-task-resource="network"]')!;
+  expect(network.textContent).toBe('网络 网盘读取');
+  expect(network.hasAttribute('data-resource-idle')).toBe(false);
+  expect(network.getAttribute('title')).toMatch(/^网盘挂载的缓存与预读/);
+});
+
+it('真实零读数写成未使用，高占用由该指标的真实high状态强调', async () => {
+  const { host } = await open(payload({ running: [run({ resources: resources({
+    cpu: { state: 'ready', percent: 0, high: false },
+    gpu: { state: 'ready', percent: 70.1, high: true },
+    network: { state: 'ready', bytes_per_second: 0, high: false },
+  }) })] }));
+  const metrics = host.querySelector('[data-task-resources="1"]')!;
+  expect(metrics.querySelector('[data-task-resource="cpu"]')?.textContent).toBe('CPU 未使用');
+  expect(metrics.querySelector('[data-task-resource="network"]')?.textContent).toBe('网络 未使用');
+  expect(metrics.querySelector('[data-task-resource="cpu"]')?.hasAttribute('data-resource-idle')).toBe(true);
+  const gpu = metrics.querySelector('[data-task-resource="gpu"]')!;
+  expect(gpu.textContent).toBe('GPU 70.1%');
+  expect(gpu.getAttribute('title')).toContain('当前为高占用');
+  expect(gpu.getAttribute('data-resource-high')).toBe('true');
+  expect(metrics.querySelector('[data-task-resource="cpu"]')?.hasAttribute('data-resource-high')).toBe(false);
+});
+
+it('父任务已结束而后继仍在活动时展示后端聚合读数，历史终态不展示旧采样', async () => {
+  const parent = run({ id: 1, status: 'succeeded', resources: resources() });
+  const historical = run({ id: 2, status: 'cancelled', resources: resources() });
+  const { host } = await open(payload({ running: [followup(1, { status: 'pending' })],
+    finished: [parent, historical], followup_counts: { '1': { pending: 100 } } }));
+  expect(host.querySelector('[data-task-resources="1"]')).not.toBeNull();
+  expect(host.querySelector('[data-task-resources="1"] [data-task-resource="cpu"]')?.textContent).toBe('CPU 12.5%');
+  expect(host.querySelector('[data-task-resources="2"]')).toBeNull();
+});
+
+it('旧快照未提供resources时不伪造资源指标', async () => {
+  const { host } = await open(payload({ running: [run()] }));
+  expect(host.querySelector('[data-task-resources]')).toBeNull();
+});
+
+it('活动任务按服务端给出的动作暂停、继续和取消，并重新读取进度', async () => {
+  const posts: [string, unknown][] = [];
+  let current = run({ control: { state: 'running', actions: ['pause', 'cancel'] } });
+  stubFetch(async (input, init) => {
+    if (init?.method === 'POST') {
+      const body = JSON.parse(String(init.body));
+      posts.push([input, body]);
+      current = body.action === 'pause'
+        ? { ...current, control: { state: 'paused', actions: ['resume', 'cancel'] } }
+        : body.action === 'resume'
+          ? { ...current, control: { state: 'running', actions: ['pause', 'cancel'] } }
+          : { ...current, control: { state: 'cancelling', actions: [] } };
+    }
+    return { ok: true, status: 200, json: async () => payload({ running: [current] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  await click(controlButton('暂停', host));
+  await vi.waitFor(() => expect(controlButton('继续', host)).not.toBeNull());
+  expect(host.querySelector('[data-run-id="1"]')?.textContent).toContain('已暂停');
+  expect(host.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('3');
+  await click(controlButton('继续', host));
+  await vi.waitFor(() => expect(controlButton('暂停', host)).not.toBeNull());
+  await click(controlButton('取消', host));
+  await confirmTaskCancellation();
+  await vi.waitFor(() => expect(host.querySelector('[data-run-id="1"]')?.textContent).toContain('正在取消'));
+  expect(host.textContent).not.toContain('已取消');
+  expect(host.querySelector('[data-task-controls]')).toBeNull();
+  expect(posts).toEqual([
+    ['/api/tasks/1/control', { action: 'pause' }],
+    ['/api/tasks/1/control', { action: 'resume' }],
+    ['/api/tasks/1/control', { action: 'cancel' }],
+  ]);
+});
+
+it('主任务和后继使用带准确名称、提示和编辑键的图标控制', async () => {
+  const child = followup(1, { status: 'running', finished_at: null,
+    control: { state: 'paused', actions: ['resume', 'cancel'] } });
+  const { host } = await open(payload({ running: [run({ control: { state: 'running', actions: ['pause', 'cancel'] } }), child] }));
+  for (const [identity, labels] of [[1, ['暂停', '取消']], [90, ['继续', '取消']]] as const) {
+    const controls = host.querySelector(`[data-task-controls="${identity}"]`)!;
+    for (const label of labels) {
+      const button = controlButton(label, controls)!;
+      expect(button).not.toBeNull();
+      expect(button.textContent).toBe('');
+      expect(button.querySelector('svg')).not.toBeNull();
+      expect(button.getAttribute('title')).toBe(label);
+      expect(button.getAttribute('data-tooltip-copy-key')).toMatch(/^tasks\.control\.action\./);
+      expect(button.hasAttribute('data-copy-key')).toBe(false);
+    }
+  }
+});
+
+it('取消任务先复用确认框，初始聚焦取消，未确认或关闭弹窗都不提交', async () => {
+  const posts: unknown[] = [];
+  const current = run({ control: { state: 'running', actions: ['pause', 'cancel'] } });
+  stubFetch(async (_input, init) => {
+    if (init?.method === 'POST') posts.push(JSON.parse(String(init.body)));
+    return { ok: true, status: 200, json: async () => payload({ running: [current] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  await click(controlButton('取消', host));
+  const dialog = document.querySelector<HTMLDialogElement>('dialog')!;
+  expect(dialog.open).toBe(true);
+  expect(dialog.querySelector('h3')?.textContent).toBe('取消任务「追更检查」');
+  expect(dialog.textContent).toContain('已保存的资料和结果会保留');
+  expect(dialog.textContent).toContain('取消后不能继续');
+  expect(document.activeElement).toBe(dialog.querySelector('[data-modal-cancel]'));
+  expect(posts).toEqual([]);
+  await click(dialog.querySelector('[data-modal-cancel]'));
+  expect(document.querySelector('dialog')).toBeNull();
+  expect(posts).toEqual([]);
+  await click(controlButton('取消', host));
+  await confirmTaskCancellation();
+  await vi.waitFor(() => expect(posts).toEqual([{ action: 'cancel' }]));
+  await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull());
+});
+
+it('确认取消的请求忙态阻止重复提交，失败留在弹窗内供重试', async () => {
+  const answer = pending<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+  let attempts = 0;
+  const current = run({ control: { state: 'running', actions: ['pause', 'cancel'] } });
+  stubFetch(async (_input, init) => {
+    if (init?.method === 'POST') {
+      attempts += 1;
+      return attempts === 1 ? answer.answer : { ok: true, status: 200, json: async () => ({ ok: true }) };
+    }
+    return { ok: true, status: 200, json: async () => payload({ running: [current] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  await click(controlButton('取消', host));
+  const dialog = document.querySelector<HTMLDialogElement>('dialog')!;
+  const confirm = dialog.querySelector<HTMLButtonElement>('[data-modal-confirm]')!;
+  await click(confirm);
+  expect(confirm.getAttribute('aria-busy')).toBe('true');
+  expect(confirm.hasAttribute('disabled')).toBe(false);
+  await click(confirm);
+  await click(dialog.querySelector('[data-modal-cancel]'));
+  expect(attempts).toBe(1);
+  expect(dialog.open).toBe(true);
+  await answer.release({ ok: false, status: 409, json: async () => ({ message: '任务暂时无法停止' }) });
+  await vi.waitFor(() => expect(dialog.querySelector('[data-modal-error]')?.textContent).toContain('任务暂时无法停止'));
+  expect(dialog.open).toBe(true);
+  await click(confirm);
+  await vi.waitFor(() => expect(attempts).toBe(2));
+  await vi.waitFor(() => expect(document.querySelector('dialog')).toBeNull());
+});
+
+it('已结束父任务的取消确认明确覆盖全部正在处理和排队的后继', async () => {
+  const parent = run({ status: 'succeeded', control: { state: 'paused', actions: ['resume', 'cancel'] } });
+  const child = followup(1, { status: 'pending', finished_at: null });
+  const { fetcher, host } = await open(payload({ running: [child], finished: [parent],
+    followup_counts: { '1': { pending: 1200 } } }));
+  await click(controlButton('取消后续任务', host));
+  const dialog = document.querySelector<HTMLDialogElement>('dialog')!;
+  expect(dialog.querySelector('h3')?.textContent).toBe('取消「追更检查」的全部后续任务');
+  expect(dialog.textContent).toContain('全部后续任务，包括正在处理和排队的项目');
+  expect(dialog.querySelector('[data-modal-confirm]')?.textContent).toBe('取消后续任务');
+  expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+  await click(dialog.querySelector('[data-modal-cancel]'));
+});
+
+it.each(['pause', 'resume'] as const)('取消优先于在途的 %s 请求，迟到回执不覆盖真实取消结果', async (action) => {
+  const changeResponse = pending<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+  const cancelResponse = pending<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+  const posts: string[] = [];
+  let current = run({ control: { state: action === 'pause' ? 'running' : 'paused', actions: [action, 'cancel'] } });
+  stubFetch(async (_input, init) => {
+    if (init?.method === 'POST') {
+      const body = JSON.parse(String(init.body));
+      posts.push(body.action);
+      return body.action === 'cancel' ? cancelResponse.answer : changeResponse.answer;
+    }
+    return { ok: true, status: 200, json: async () => payload(current.status === 'cancelled'
+      ? { finished: [current] } : { running: [current] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  await click(controlButton(action === 'pause' ? '暂停' : '继续', host));
+  expect(controlButton('取消', host)?.getAttribute('aria-disabled')).toBeNull();
+  await click(controlButton('取消', host));
+  expect(posts).toEqual([action]);
+  await confirmTaskCancellation();
+  expect(posts).toEqual([action, 'cancel']);
+  current = { ...current, control: { state: 'cancelling', actions: [] } };
+  await cancelResponse.release({ ok: true, status: 200, json: async () => ({ ok: true }) });
+  await vi.waitFor(() => expect(host.querySelector('#run-1')?.textContent).toContain('正在取消'));
+  expect(host.querySelector('#run-1')?.getAttribute('data-status')).toBe('running');
+  current = { ...current, status: 'cancelled', control: undefined, finished_at: '2026-10-31T07:00:00Z' };
+  await changeResponse.release({ ok: false, status: 409,
+    json: async () => ({ message: '任务正在取消，不能再暂停或继续' }) });
+  await vi.waitFor(() => expect(host.querySelector('#run-1')?.getAttribute('data-status')).toBe('cancelled'));
+  expect(host.querySelector('#run-1')?.textContent).toContain('已取消');
+  expect(host.querySelector('[data-task-control-feedback]')).toBeNull();
+  expect(sections(host)).toContain('最近完成');
+});
+
+it('取消请求未被接受时，任务自然完成和原卡卸载后仍保留原因', async () => {
+  const response = pending<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+  let current = run({ control: { state: 'running', actions: ['pause', 'cancel'] } });
+  stubFetch(async (_input, init) => {
+    if (init?.method === 'POST') return response.answer;
+    return { ok: true, status: 200, json: async () => payload(current.status === 'succeeded'
+      ? { finished: [current] } : { running: [current] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  await click(controlButton('取消', host));
+  await confirmTaskCancellation();
+  current = { ...current, status: 'succeeded', control: undefined, finished_at: '2026-10-31T07:00:00Z' };
+  await act(async () => { await queryClient.invalidateQueries({ queryKey: ['tasks'] }) });
+  expect(host.querySelector('[data-task-controls]')).toBeNull();
+  await response.release({ ok: false, status: 409, json: async () => ({ message: '这轮任务已经结束' }) });
+  await vi.waitFor(() => expect(host.querySelector('[data-task-control-feedback]')?.textContent).toContain('取消未完成'));
+  expect(host.querySelector('[data-task-control-feedback]')?.textContent).toContain('这轮任务已经结束');
+  expect(host.querySelector('#run-1')?.textContent).toContain('已完成');
+  expect(host.querySelector('#run-1')?.textContent).not.toContain('已取消');
+});
+
+it('父任务的后继取消后在卡片上直接显示取消状态及数量', async () => {
+  const parent = run({ status: 'succeeded', finished_at: '2026-10-31T07:00:00Z' });
+  const child = followup(parent.id, { status: 'cancelled' });
+  const { host } = await open(payload({ finished: [parent, child], followup_counts: { '1': { cancelled: 120 } } }));
+  const card = host.querySelector('#run-1')!;
+  expect(card.textContent).toContain('后续任务已取消');
+  expect(card.textContent).toContain('后续任务已取消 120 项');
+  expect(card.querySelector('details')?.open).toBe(false);
+  expect(card.querySelector('[data-task-controls]')).toBeNull();
+  expect(card.getAttribute('data-status')).toBe('succeeded');
+});
+
+it.each([
+  ['pausing', '正在暂停', ['resume', 'cancel']],
+  ['paused', '已暂停', ['resume', 'cancel']],
+  ['cancelling', '正在取消', []],
+] as const)('未知总量的任务处于 %s 时展示真实状态，不显示推进动画', async (state, label, actions) => {
+  const { host } = await open(payload({ running: [run({ progress_total: null, progress_current: null,
+    control: { state, actions: [...actions] } })] }));
+  expect(host.querySelector('[data-run-id="1"]')?.textContent).toContain(label);
+  expect(host.querySelector('[role="status"]')).toBeNull();
+  expect(controlButton('暂停', host)).toBeNull();
+  expect(Boolean(controlButton('继续', host))).toBe(state !== 'cancelling');
+});
+
+it('任务控制请求等待时保持按钮焦点并阻止重复提交', async () => {
+  const response = pending<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+  const posts: string[] = [];
+  const current = run({ control: { state: 'running', actions: ['pause', 'cancel'] } });
+  stubFetch(async (input, init) => {
+    if (init?.method === 'POST') {
+      posts.push(input);
+      return response.answer;
+    }
+    return { ok: true, status: 200, json: async () => payload({ running: [current] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  const pause = controlButton('暂停', host)!;
+  pause.focus();
+  await click(pause);
+  expect(pause.hasAttribute('disabled')).toBe(false);
+  expect(pause.getAttribute('aria-busy')).toBe('true');
+  expect(document.activeElement).toBe(pause);
+  await click(pause);
+  expect(posts).toEqual(['/api/tasks/1/control']);
+  await response.release({ ok: true, status: 200, json: async () => ({ ok: true }) });
+});
+
+it('任务控制失败保留原状态和原因，可以在原位重试', async () => {
+  let attempts = 0;
+  const current = run({ control: { state: 'running', actions: ['pause', 'cancel'] } });
+  stubFetch(async (_input, init) => {
+    if (init?.method === 'POST') {
+      attempts += 1;
+      return { ok: false, status: 409, json: async () => ({ message: '任务已变化，请刷新后重试' }) };
+    }
+    return { ok: true, status: 200, json: async () => payload({ running: [current] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  await click(controlButton('暂停', host));
+  await vi.waitFor(() => expect(host.querySelector('[data-task-control-feedback] [role="alert"]')?.textContent).toContain('任务已变化'));
+  expect(controlButton('继续', host)).toBeNull();
+  await click(controlButton('暂停', host));
+  expect(attempts).toBe(2);
+});
+
+it('后继任务使用自身任务号控制，服务端未提供能力的父任务没有控制按钮', async () => {
+  const child = followup(1, { id: 90, status: 'pending', finished_at: null,
+    control: { state: 'paused', actions: ['resume', 'cancel'] } });
+  const ended = run({ status: 'succeeded' });
+  const posts: string[] = [];
+  stubFetch(async (input, init) => {
+    if (init?.method === 'POST') posts.push(input);
+    return { ok: true, status: 200, json: async () => payload({ running: [child], finished: [ended] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  expect(host.querySelector('[data-task-controls="1"]')).toBeNull();
+  const controls = host.querySelector('[data-task-controls="90"]')!;
+  expect(controls).not.toBeNull();
+  await click(controlButton('继续', controls));
+  expect(posts).toEqual(['/api/tasks/90/control']);
+});
+
+it('父任务结束后仍可控制整批后继，未展示的后继也属于同一操作范围', async () => {
+  const posts: [string, unknown][] = [];
+  let parent = run({ status: 'succeeded',
+    control: { state: 'running', actions: ['pause', 'cancel'] } });
+  const child = followup(1, { status: 'pending', finished_at: null });
+  stubFetch(async (input, init) => {
+    if (init?.method === 'POST') {
+      const body = JSON.parse(String(init.body));
+      posts.push([input, body]);
+      parent = { ...parent, control: body.action === 'pause'
+        ? { state: 'paused', actions: ['resume', 'cancel'] }
+        : body.action === 'resume' ? { state: 'running', actions: ['pause', 'cancel'] }
+          : { state: 'cancelling', actions: [] } };
+    }
+    return { ok: true, status: 200, json: async () => payload({ running: [child], finished: [parent],
+      followup_counts: { '1': { pending: 1000 } } }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  expect(host.querySelector('#run-1')?.textContent).toContain('列出其中 1 项');
+  await click(controlButton('暂停后续任务', host));
+  await vi.waitFor(() => expect(controlButton('继续后续任务', host)).not.toBeNull());
+  expect(host.querySelector('#run-1')?.textContent).toContain('已暂停');
+  await click(controlButton('继续后续任务', host));
+  await vi.waitFor(() => expect(controlButton('暂停后续任务', host)).not.toBeNull());
+  await click(controlButton('取消后续任务', host));
+  await confirmTaskCancellation();
+  await vi.waitFor(() => expect(host.querySelector('#run-1')?.textContent).toContain('正在取消'));
+  expect(posts).toEqual([
+    ['/api/tasks/1/control', { action: 'pause' }],
+    ['/api/tasks/1/control', { action: 'resume' }],
+    ['/api/tasks/1/control', { action: 'cancel' }],
+  ]);
+});
+
+it('同类父任务有独立控制范围时分别显示，按钮只提交对应的父任务号', async () => {
+  const first = run({ id: 1, status: 'succeeded',
+    control: { state: 'paused', actions: ['resume', 'cancel'] } });
+  const second = run({ id: 2, status: 'succeeded',
+    control: { state: 'running', actions: ['pause', 'cancel'] } });
+  const children = [followup(1, { id: 90, status: 'pending' }), followup(2, { id: 91, status: 'pending' })];
+  const posts: string[] = [];
+  stubFetch(async (input, init) => {
+    if (init?.method === 'POST') posts.push(input);
+    return { ok: true, status: 200, json: async () => payload({ running: children, finished: [second, first] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  expect(host.querySelectorAll('[data-task-key="follow-check"]')).toHaveLength(2);
+  await click(controlButton('继续后续任务', host.querySelector('#run-1')!));
+  await click(controlButton('暂停后续任务', host.querySelector('#run-2')!));
+  expect(posts).toEqual(['/api/tasks/1/control', '/api/tasks/2/control']);
+});
+
+it('同类父任务控制状态相同时并成一张卡，一次操作提交给每一批', async () => {
+  const batch = (id: number) => run({ id, task_key: 'upgrade-repairs', task_label: '自动修复', status: 'succeeded',
+    control: { state: 'running', actions: ['pause', 'cancel'] } });
+  const children = [followup(1, { id: 90, status: 'pending' }), followup(2, { id: 91, status: 'pending' })];
+  const posts: string[] = [];
+  stubFetch(async (input, init) => {
+    if (init?.method === 'POST') posts.push(input);
+    return { ok: true, status: 200, json: async () => payload({ running: children, finished: [batch(2), batch(1)] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  const cards = host.querySelectorAll('[data-task-key="upgrade-repairs"]');
+  expect(cards).toHaveLength(1);
+  expect(cards[0]!.textContent).toContain('2 批');
+  await click(controlButton('暂停后续任务', cards[0]!));
+  await vi.waitFor(() => expect(posts).toEqual(['/api/tasks/2/control', '/api/tasks/1/control']));
+});
+
+it('服务端未给出控制能力时不按任务种类自行增加按钮', async () => {
+  const { host } = await open(payload({ running: [run()] }));
+  expect(host.querySelector('[data-task-controls]')).toBeNull();
+});
+
+it('活动任务复用三档控件并将档位提交给当前任务', async () => {
+  const posts: unknown[] = [];
+  let current = run({ control: { state: 'running', actions: ['pause', 'cancel', 'set_speed'], speed_mode: 'standard' } });
+  stubFetch(async (_input, init) => {
+    if (init?.method === 'POST') {
+      const body = JSON.parse(String(init.body));
+      posts.push(body);
+      current = { ...current, control: { ...current.control!, speed_mode: body.speed_mode } };
+    }
+    return { ok: true, status: 200, json: async () => payload({ running: [current] }) };
+  });
+  await prefetchTasks(new AbortController().signal);
+  const host = await mount(page());
+  await click(controlButton('处理速度：标准', host));
+  const slider = document.querySelector('input[type="range"]')!;
+  await act(async () => {
+    slider.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true }));
+    slider.dispatchEvent(new KeyboardEvent('keyup', { key: 'Home', bubbles: true }));
+  });
+  await vi.waitFor(() => expect(controlButton('处理速度：低占用', host)).not.toBeNull());
+  expect(posts).toEqual([{ action: 'set_speed', speed_mode: 'low' }]);
+});
+
 it('被挡下的那一轮单独成段，不在最近完成里再出现一次', async () => {
   const blocked = run({
     id: 7, status: 'cancelled', trigger: 'scheduled', progress_total: null,
     finished_at: '2026-09-11T10:05:00Z', elapsed_seconds: null,
-    result_summary: { blocked_by: 3 }, error: '与第 3 轮（手动触发）冲突，本次跳过',
+    // 带 code 的原因按界面语言取译文，触发方式换成当前语言的名字；库里的原文只在没有译文时用。
+    result_summary: { blocked_by: 3 }, error: '旧写法：被第 3 轮挡下',
+    error_code: 'taskRun.error.skippedBy', error_params: { run: 3, trigger: 'manual' },
   });
   const { host } = await open(payload({ skipped: [blocked], finished: [blocked] }));
   expect(sections(host)).toEqual(['正在进行', '本次未执行']);
   expect(host.querySelectorAll('li')).toHaveLength(1);
   // 原因落在卡片底部的说明区，状态由徽章说。
-  expect(host.querySelector('[data-status=cancelled]')?.textContent).toContain('与第 3 轮');
+  expect(host.querySelector('[data-status=cancelled]')?.textContent).toContain('与第 3 轮（手动触发）冲突，本次跳过');
   expect(host.querySelector('[data-status=cancelled] span')?.textContent).toBe('已取消');
 });
 
@@ -232,7 +705,7 @@ it('跑完那一轮显示摘要，失败那一轮显示原因', async () => {
   const { host } = await open(payload({ finished: [
     run({ id: 2, status: 'succeeded', finished_at: '2026-09-11T10:02:00Z',
           progress_total: null, result_summary: { checked: 7, results: [1, 2] } }),
-    run({ id: 3, status: 'failed', task_label: '扫描与采集', finished_at: '2026-09-11T10:03:00Z',
+    run({ id: 3, status: 'failed', task_key: 'library-processing', task_label: '扫描与采集', finished_at: '2026-09-11T10:03:00Z',
           progress_total: null, error: 'RuntimeError: 上游挡回来了' }),
   ] }));
   expect(host.querySelector('[data-status=succeeded]')?.textContent).toContain('已检查 7');
@@ -249,7 +722,7 @@ it('做完的几批派发并成一张卡，摘要说一共处理了几项、失�
     id, task_key: 'upgrade-repairs', task_label: '自动修复', trigger: 'scheduled', status: 'succeeded',
     progress_total: null, finished_at: `2026-10-28T08:${minute}:00Z`, result_summary: { outcome: '已安排 64 项处理' } });
   const child = (id: number, parent: number, status: string) => followup(parent, {
-    id, task_key: 'upgrade-library', task_label: '自动修复资料', status,
+    id, task_key: 'upgrade-library', task_label: '资料自动修复', status,
     result_summary: { outcome: '影片升级补全完成', name: `ABC-${id}` }, followup_key: `upgrade-library:x:${id}` });
   const { host } = await open(payload({
     finished: [batch(3, 43), batch(2, 42), batch(1, 41), child(31, 3, 'succeeded'), child(21, 2, 'failed'), child(11, 1, 'succeeded')],
@@ -271,9 +744,9 @@ it('派出几十条后继的几批合成一张进行中的卡，进度按计数�
     id, task_key: 'upgrade-repairs', task_label: '自动修复', trigger: 'scheduled', status: 'succeeded',
     progress_total: null, started_at: finished_at, finished_at, result_summary: { outcome: '已安排 64 项处理' } });
   const child = (id: number, parentId: number, status: string) => followup(parentId, {
-    id, task_key: 'upgrade-library', task_label: '自动修复资料', status, finished_at: null,
+    id, task_key: 'upgrade-library', task_label: '资料自动修复', status, finished_at: null,
     progress_label: status === 'running' ? 'ABC-001 · 采集缺失资料' : 'ABC-00' + id, result_summary: {},
-    followup_key: `upgrade-library:x:${id}` });
+    progress_code: undefined, progress_params: undefined, followup_key: `upgrade-library:x:${id}` });
   const { host } = await open(payload({
     running: [child(12, 2, 'pending'), child(11, 1, 'running')],
     finished: [parent(2, '2026-10-28T09:03:00Z')],
@@ -289,7 +762,7 @@ it('派出几十条后继的几批合成一张进行中的卡，进度按计数�
   expect(card.textContent).toContain('2 批');
   expect(card.textContent).toContain('已处理 62 / 128 项 · 其中 2 项失败');
   expect(card.querySelector('summary')?.textContent).toBe('任务明细 · 128 项');
-  expect(card.textContent).toContain('列出其中 2 项，正在处理的排在前面');
+  expect(card.textContent).toContain('列出其中 2 项');
   const rows = [...card.querySelectorAll('[data-followup-key]')];
   expect(rows.map((row) => row.getAttribute('data-status'))).toEqual(['running', 'pending']);
   expect(rows[0]!.textContent).toContain('ABC-001 · 采集缺失资料');
@@ -345,8 +818,9 @@ it('后继挂在派出它的那一轮下面，不另占一张卡', async () => {
   expect(host.querySelectorAll('[data-task-key]')).toHaveLength(1);
   const row = host.querySelector('[data-followup-key]')!;
   expect(host.querySelector('[data-task-key=follow-check]')!.contains(row)).toBe(true);
-  expect([...row.querySelectorAll(':scope > span')].map((node) => node.textContent))
-    .toEqual(['补全资料图片', '已完成', '涼森れむ · 已保存资料图片']);
+  expect(row.textContent).toContain('资料图片补全');
+  expect(row.textContent).toContain('已完成');
+  expect(row.textContent).toContain('涼森れむ · 已保存资料图片');
   expect(host.textContent).toContain('已安排 1 项补充任务');
 });
 
@@ -381,14 +855,16 @@ it('后继还在跑时，派出它的那一轮整张卡留在正在进行，那�
                        progress_total: null, finished_at: '2026-09-11T10:03:00Z',
                        result_summary: { followups: 1 } });
   const scraping = followup(parent.id, {
-    task_key: 'feed-scrape', task_label: '取新作资料', status: 'running', finished_at: null,
-    progress_label: '取新作资料：MIZD-441', progress_current: 13, progress_total: 22,
+    task_key: 'feed-scrape', task_label: '新作资料采集', status: 'running', finished_at: null,
+    progress_label: '新作资料采集：MIZD-441', progress_code: 'taskRun.progress.item',
+    progress_params: { name: 'MIZD-441' }, progress_current: 13, progress_total: 22,
     followup_key: 'feed-scrape:MIZD-441', result_summary: {} });
   const { host } = await open(payload({ running: [scraping], finished: [parent] }));
   expect(sections(host)).toEqual(['正在进行']);
   const row = host.querySelector('[data-followup-key]')!;
-  expect([...row.querySelectorAll(':scope > span')].map((node) => node.textContent))
-    .toEqual(['取新作资料', '进行中', 'MIZD-441 · 13 / 22 项']);
+  expect(row.textContent).toContain('新作资料采集');
+  expect(row.textContent).toContain('进行中');
+  expect(row.textContent).toContain('MIZD-441 · 13 / 22 项');
 });
 
 it('连着几轮什么也没发生的定时任务按种类各并成一张卡，有事的那一轮截断并单独摆', async () => {
@@ -456,7 +932,7 @@ it('轮询间隔跟着内容走：有东西在跑两秒一次，全是终态十�
 
 it('一轮请求失败不擦掉上一份数据，只在页内多一条原因', async () => {
   vi.useFakeTimers();
-  const fetcher = serve(payload({ finished: [run({ id: 5, status: 'succeeded', task_label: '扫描与采集' })] }), null);
+  const fetcher = serve(payload({ finished: [run({ id: 5, status: 'succeeded', task_key: 'library-processing', task_label: '扫描与采集' })] }), null);
   await prefetchTasks(new AbortController().signal);
   const host = await mount(page());
 
@@ -485,97 +961,75 @@ const done = (minute: number, overrides: Partial<TaskRunPayload> = {}) => run({
   finished_at: `2026-09-11T10:${String(minute).padStart(2, '0')}:00.000Z`, ...overrides,
 });
 
-/** 轮询与往前翻各有一串回话：地址里带游标的走 `pages`，其余走 `polls`。`null` 那一份回 500。 */
-function route(polls: ActivityData[], pages: (FinishedPage | null)[]) {
-  let polled = 0, paged = 0;
-  const fetcher = vi.fn(async (input: string, _init?: RequestInit) => {
-    if (!input.includes('before_id=')) {
-      const body = polls[Math.min(polled, polls.length - 1)];
-      polled += 1;
-      return { ok: true, status: 200, json: async () => body };
-    }
-    const body = pages[Math.min(paged, pages.length - 1)] ?? null;
-    paged += 1;
-    return body
-      ? { ok: true, status: 200, json: async () => body }
-      : { ok: false, status: 500, json: async () => ({ message: '数据库当前只能浏览' }) };
-  });
-  stubFetch(fetcher);
-  return fetcher;
-}
-
 const shownIds = (host: HTMLElement) =>
   [...host.querySelectorAll('[data-run-id]')].map((node) => Number(node.getAttribute('data-run-id')));
 
-const cursorOf = (fetcher: ReturnType<typeof route>, call: number) =>
-  new URL(fetcher.mock.calls[call]![0], 'http://peach').searchParams;
-
-it('「加载更早」以最旧那一行为游标往后接一页，到头就不再给这个键', async () => {
-  const fetcher = route(
-    [payload({ finished: [done(9), done(8)], finished_has_more: true })],
-    [{ finished: [done(7), done(6)], finished_has_more: true },
-     { finished: [done(5)], finished_has_more: false }]);
+it('最近完成按页替换任务，支持返回上一页，轮询保留当前页', async () => {
+  const calls: string[] = [];
+  stubFetch(async (input) => {
+    calls.push(input);
+    const current = Number(new URL(input, 'http://peach').searchParams.get('page') || 1);
+    return { ok: true, status: 200, json: async () => payload({
+      finished: current === 1 ? [done(9), done(8)] : [done(7)],
+      finished_page: current, finished_total: 21,
+    }) };
+  });
   await prefetchTasks(new AbortController().signal);
   const host = await mount(page());
   expect(shownIds(host)).toEqual([9, 8]);
-
-  await click(buttonNamed('加载更早', host));
-  await settle();
-  expect(cursorOf(fetcher, 1).get('before_id')).toBe('8');
-  expect(cursorOf(fetcher, 1).get('before_finished_at')).toBe('2026-09-11T10:08:00.000Z');
-  expect(shownIds(host)).toEqual([9, 8, 7, 6]);
-
-  await click(buttonNamed('加载更早', host));
-  await settle();
-  expect(cursorOf(fetcher, 2).get('before_id')).toBe('6');
-  expect(shownIds(host)).toEqual([9, 8, 7, 6, 5]);
-  expect(buttonNamed('加载更早', host), '已经到头还留着「加载更早」').toBeNull();
+  await click(buttonNamed('下一页', host));
+  await vi.waitFor(() => expect(shownIds(host)).toEqual([7]));
+  await act(async () => { await queryClient.invalidateQueries({ queryKey: ['tasks'] }); });
+  expect(shownIds(host)).toEqual([7]);
+  expect(calls.at(-1)).toContain('page=2');
+  await click(buttonNamed('上一页', host));
+  await vi.waitFor(() => expect(shownIds(host)).toEqual([9, 8]));
 });
 
-it('第一页之后没有更早的就不给「加载更早」', async () => {
-  const { host } = await open(payload({ finished: [done(9)], finished_has_more: false }));
-  expect(buttonNamed('加载更早', host)).toBeNull();
+it('最近完成只有一页时隐藏分页', async () => {
+  const { host } = await open(payload({ finished: [done(9)], finished_total: 1, finished_page: 1 }));
+  expect(host.querySelector('nav[aria-label="最近完成分页"]')).toBeNull();
 });
 
-it('轮询刷新之后翻过的行还在，被新完成挤出第一页的那一轮也不丢、不重复', async () => {
-  vi.useFakeTimers();
-  route(
-    [payload({ finished: [done(9), done(8)], finished_has_more: true }),
-     // 10:10 又结束了一轮，第一页末尾的 8 被挤了出去。
-     payload({ finished: [done(10), done(9)], finished_has_more: true }),
-     payload({ finished: [done(11), done(10)], finished_has_more: true }),
-     // 翻页之后才进第一页的 10 也要留住：它被挤出去时，哪一页的回话里都没有它。
-     payload({ finished: [done(12), done(11)], finished_has_more: true })],
-    [{ finished: [done(7), done(6)], finished_has_more: true }]);
+it('最近完成切换每页数量后从第一页读取所选条数', async () => {
+  const calls: string[] = [];
+  const rows = Array.from({ length: 40 }, (_, index) => done(index + 1));
+  stubFetch(async (input) => {
+    calls.push(input);
+    const query = new URL(input, 'http://peach').searchParams;
+    const limit = Number(query.get('limit') || 20);
+    const current = Number(query.get('page') || 1);
+    return { ok: true, status: 200, json: async () => payload({
+      finished: rows.slice((current - 1) * limit, current * limit), finished_total: 40, finished_page: current,
+    }) };
+  });
   await prefetchTasks(new AbortController().signal);
   const host = await mount(page());
-  await click(buttonNamed('加载更早', host));
-  await settle();
-  expect(shownIds(host)).toEqual([9, 8, 7, 6]);
-
-  await tick(10_000);
-  expect(shownIds(host)).toEqual([10, 9, 8, 7, 6]);
-  await tick(10_000);
-  await tick(10_000);
-  expect(shownIds(host)).toEqual([12, 11, 10, 9, 8, 7, 6]);
-  expect(buttonNamed('加载更早', host), '刷新一次就把往前翻的进度丢了').not.toBeNull();
+  await click(buttonNamed('下一页', host));
+  await vi.waitFor(() => expect(shownIds(host)[0]).toBe(21));
+  await choose(host.querySelector('[data-table-pagination] button[aria-haspopup="listbox"]'), '每页 10 轮');
+  await vi.waitFor(() => expect(shownIds(host)).toEqual(Array.from({ length: 10 }, (_, index) => index + 1)));
+  expect(calls.at(-1)).toBe('/api/tasks?page=1&limit=10');
 });
 
-it('往前翻失败时原位说原因，已有的行不动，再点一次照常接上', async () => {
-  route([payload({ finished: [done(9)], finished_has_more: true })],
-        [null, { finished: [done(7)], finished_has_more: false }]);
+it('翻页失败保留上一页，重试成功后显示所选页', async () => {
+  let failed = true;
+  stubFetch(async (input) => {
+    const current = input.includes('page=2') ? 2 : 1;
+    if (current === 2 && failed) return { ok: false, status: 500,
+      json: async () => ({ message: '数据库当前只能浏览' }) };
+    return { ok: true, status: 200, json: async () => payload({
+      finished: [done(current === 1 ? 9 : 7)], finished_page: current, finished_total: 21,
+    }) };
+  });
   await prefetchTasks(new AbortController().signal);
   const host = await mount(page());
-
-  await click(buttonNamed('加载更早', host));
-  await settle();
-  expect(host.querySelector('[role=alert]')?.textContent).toContain('数据库当前只能浏览');
+  await click(buttonNamed('下一页', host));
+  await vi.waitFor(() => expect(host.textContent).toContain('数据库当前只能浏览'));
   expect(shownIds(host)).toEqual([9]);
-
-  await click(buttonNamed('加载更早', host));
-  await settle();
-  expect(host.querySelector('[role=alert]')).toBeNull();
-  expect(shownIds(host)).toEqual([9, 7]);
+  failed = false;
+  await click(buttonNamed('下一页', host));
+  await vi.waitFor(() => expect(shownIds(host)).toEqual([7]));
 });
 
 it('时长与摘要的折算各自成立', () => {
@@ -606,9 +1060,34 @@ it('任务主摘要使用中文结果，内部字段保留给技术详情', () =
   expect(summaryItems({ followups: 9, stage: 'finished', requested_stage: 'all',
     eta_seconds_min: 0, entity_watermark: 9936, performer_aliases: 7, auto_rejected: 0 }))
     .toEqual(['已安排 9 项补充任务', '女优别名 7']);
-  expect(followupDetail(followup(4, { task_key: 'performer-profile', task_label: '补全女优资料',
-    progress_label: '补女优资料：演示人物', result_summary: { name: '演示人物', outcome: 'avwikidb 绑定；javdb 绑定' } })))
+  expect(followupDetail(followup(4, { task_key: 'performer-profile', task_label: '女优资料补全',
+    progress_label: '补女优资料：演示人物', result_summary: { name: '演示人物', outcome: '已关联 avwikidb 资料页；已关联 javdb 资料页',
+      outcome_parts: [{ code: 'siteLinked', params: { site: 'avwikidb' } }, { code: 'semicolon', params: {} },
+        { code: 'siteLinked', params: { site: 'javdb' } }] } })))
     .toBe('演示人物 · 已关联 AVWikiDB 资料页；已关联 JavDB 资料页');
+});
+
+it('后继那一行按 code 只写条目；一批几部写成首部加总数，没有 code 的旧行照原文', () => {
+  const pending = { status: 'pending', finished_at: null, result_summary: {} };
+  expect(followupDetail(followup(4, pending))).toBe('涼森れむ');
+  expect(followupDetail(followup(4, { ...pending, task_key: 'feed-scrape', task_label: '新作资料采集',
+    progress_label: '新作资料采集：MIZD-441 等 3 部', progress_code: 'taskRun.progress.items',
+    progress_params: { first: 'MIZD-441', count: 3 } }))).toBe('MIZD-441 等 3 部');
+  expect(followupDetail(followup(4, { ...pending, progress_code: undefined, progress_params: undefined })))
+    .toBe('资料图片补全：涼森れむ');
+  expect(followupDetail(followup(4, { ...pending, progress_label: '资料图片补全', progress_code: undefined,
+    progress_params: undefined }))).toBe('');
+});
+
+it('进度说明里的阶段和批量操作按 code 取当前语言，库里的原文只在没有译文时用', () => {
+  const running = (overrides: Partial<TaskRunPayload>) => followup(4, { status: 'running', finished_at: null, ...overrides });
+  expect(progressLabel(running({ task_key: 'upgrade-library', task_label: '资料自动修复', progress_label: '旧写法',
+    progress_code: 'taskRun.progress.subjectStage', progress_params: { subject: 'ABC-001', stage: 'library.fetchMetadata' } })))
+    .toBe('ABC-001 · 采集缺失资料');
+  expect(progressLabel(running({ task_key: 'library-processing', progress_label: '旧写法',
+    progress_code: 'stage.library.scanFiles', progress_params: {} }))).toBe('扫描文件');
+  expect(progressLabel(running({ task_key: 'batch', progress_label: '旧写法',
+    progress_code: 'batchOperation.performer-delete', progress_params: {} }))).toBe('按女优永久删除影片');
 });
 
 it('报错在列表里只露一行：traceback 取最后一行，别的取第一行非空', () => {
@@ -636,25 +1115,28 @@ it('报错摘要平时只露一行，「查看详情」展开全文、再点收�
 });
 
 it('缺人脸模型跑完的后继标成发现问题，不是已完成', async () => {
-  const down = { outcome: '图库里没有这个名字，人脸模型不可用：取人脸模型失败：断网', face_match_unavailable: true };
+  const down = { outcome: '图库里没有这个名字，人脸模型不可用：取人脸模型失败：断网', face_match_unavailable: true,
+    outcome_parts: [{ code: 'galleryMissing', params: {} }, { code: 'comma', params: {} },
+      { code: 'faceModelUnavailable', params: { reason: '取人脸模型失败：断网' } }] };
   const settled = followup(4, { result_summary: down });
   expect(hasResultProblems(settled)).toBe(true);
   expect(isRoutine(run({ status: 'succeeded', trigger: 'scheduled', result_summary: down }))).toBe(false);
   expect(hasResultProblems(followup(4, { result_summary: { face_match_unavailable: false } }))).toBe(false);
   // 结论本身没写原因时补一句，写了就不重复。
-  expect(summaryItems({ outcome: '图库 2 张彼此认不出同一个人', face_match_unavailable: true }))
+  expect(summaryItems({ outcome: '图库 2 张彼此认不出同一个人', face_match_unavailable: true,
+    outcome_parts: [{ code: 'galleryDisagree', params: { count: 2 } }] }))
     .toEqual(['图库 2 张彼此认不出同一个人', '人脸模型不可用，未做人脸核对']);
   expect(summaryItems(down)).toEqual([down.outcome]);
   const parent = run({ id: 4, status: 'succeeded', task_label: '扫描与采集', progress_total: null,
                        finished_at: '2026-09-11T10:03:00Z', result_summary: { followups: 1 } });
   const { host } = await open(payload({ finished: [parent, settled] }));
-  expect([...host.querySelectorAll('[data-followup-key] > span')].map((node) => node.textContent))
-    .toEqual(['补全资料图片', '发现问题', `涼森れむ · ${down.outcome}`]);
+  expect([...host.querySelectorAll('[data-followup-key] > div:first-child > div:first-child > span')].map((node) => node.textContent))
+    .toEqual(['资料图片补全', '发现问题', `涼森れむ · ${down.outcome}`]);
 });
 
 it('人脸模型取不到的那一轮只记失败与原因，重试在页顶「需要处理」', async () => {
   const { host } = await open(payload({ finished: [run({
-    id: 9, task_key: 'face-models', task_label: '下载人脸模型', trigger: 'scheduled', status: 'failed',
+    id: 9, task_key: 'face-models', task_label: '人脸模型下载', trigger: 'scheduled', status: 'failed',
     progress_total: null, progress_current: null, finished_at: '2026-09-11T10:05:00Z',
     error: '取人脸模型失败：getaddrinfo failed' })] }));
   const card = host.querySelector('[data-task-key=face-models]')!;

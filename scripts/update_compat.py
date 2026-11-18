@@ -23,6 +23,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+from peach.interface_text import dev as t  # noqa: E402
 from peach.update_packages import MANIFEST, SELF_PROVISIONED  # noqa: E402
 
 #: 支持自动更新到新版的最旧客户端。更早的版本要求工具集合与它认得的完全相等，0.48.0 加入人脸
@@ -31,7 +32,7 @@ OLDEST_CLIENT = "0.48.0"
 
 #: 在旧版本的源码树里执行：只走它自己的检查与清单读取，网络换成本次的发布条目。
 PROBE = r"""
-import json, sys, tempfile
+import inspect, json, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
 sys.path[:0] = [sys.argv[1]]
@@ -44,7 +45,11 @@ def transport(request, *_):
     if request.url == release_updates.DOWNLOADS_API:
         return SimpleNamespace(status=200, headers={}, body=json.dumps(payload["rows"]).encode(), url=request.url)
     return SimpleNamespace(status=404, headers={}, body=b"", url=request.url)
-release = release_updates.check(transport=transport)
+# 这道核对针对 Windows 更新包。0.53.0 起检查按本机平台选包，在 macOS 上只认 DMG，所以明确按
+# Windows x64 客户端核对；更早的版本不分平台、只认 Windows 包，照原样调用。
+windows = ({"system": "win32", "machine": "AMD64"}
+           if "system" in inspect.signature(release_updates.check).parameters else {})
+release = release_updates.check(transport=transport, **windows)
 result = {"state": release.get("state"), "latest": release.get("latest_version"),
           "kind": release.get("package_kind"), "tools": sorted(update_packages.TOOL_PATHS)}
 if release.get("package_kind") != "full":
@@ -72,7 +77,7 @@ def client_tags(root: Path, version: str, oldest: str = OLDEST_CLIENT) -> list[s
     tags = [tag for tag in listed.stdout.split() if re.fullmatch(r"v\d+\.\d+\.\d+", tag)
             and _version(oldest) <= _version(tag) < _version(version)]
     if not tags:
-        raise ValueError(f"没有可核对的旧版本标签（{oldest} 起）；检出须带发布标签")
+        raise ValueError(t("update_compat.noClientTags", oldest=oldest))
     return sorted(tags, key=_version)
 
 
@@ -95,14 +100,19 @@ def package_manifest(packages: Path, version: str) -> dict:
 
 def probe(root: Path, tag: str, payload: dict) -> dict:
     with tempfile.TemporaryDirectory(prefix="peach-update-compat-") as folder:
-        exported = subprocess.run(["git", "-C", str(root), "archive", "--format=tar", tag, "src/peach"],
+        # 0.58.0 起后端导入时就读 `resources/locales`（ADR-0159），安装包随附；旧标签没有这个目录就不带。
+        paths = ["src/peach"]
+        if subprocess.run(["git", "-C", str(root), "ls-tree", "-d", "--name-only", tag, "resources/locales"],
+                          capture_output=True, text=True, encoding="utf-8", check=True).stdout.strip():
+            paths.append("resources/locales")
+        exported = subprocess.run(["git", "-C", str(root), "archive", "--format=tar", tag, *paths],
                                   capture_output=True, check=True).stdout
         with tarfile.open(fileobj=io.BytesIO(exported)) as archive:
             archive.extractall(folder, filter="data")
         completed = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", PROBE, str(Path(folder) / "src")],
                                    input=json.dumps(payload), capture_output=True, text=True, encoding="utf-8")
     if completed.returncode != 0:
-        return {"error": (completed.stderr or completed.stdout).strip().splitlines()[-1:] or ["无输出"]}
+        return {"error": (completed.stderr or completed.stdout).strip().splitlines()[-1:] or [t("update_compat.noOutput")]}
     return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
@@ -114,13 +124,15 @@ def check_clients(root: Path, rows: list[dict], manifest: dict, version: str,
     for tag in client_tags(root, version, oldest):
         result, reasons = probe(root, tag, payload), []
         if result.get("state") != "available" or result.get("latest") != version:
-            reasons.append(f"检查结果是 {result.get('state')}、{result.get('latest')}，选不中 {version}")
+            reasons.append(t("update_compat.notSelected", state=str(result.get("state")),
+                                 latest=str(result.get("latest")), version=version))
         if result.get("error"):
-            reasons.append(f"读不了这一版：{result['error']}")
+            reasons.append(t("update_compat.unreadable", error=str(result["error"])))
         if result.get("kind") == "update":
             orphaned = set(manifest.get("tools", {})) - set(result.get("tools", [])) - SELF_PROVISIONED
             if orphaned:
-                reasons.append("清单里有它不认得、运行时也补不齐的工具：" + "、".join(sorted(orphaned)))
+                reasons.append(t("update_compat.orphanedTools",
+                                     tools=sorted(orphaned)))
         if reasons:
             problems[tag] = reasons
     return problems
@@ -131,8 +143,8 @@ def verify(packages: Path, version: str, root: Path = ROOT) -> dict[str, list[st
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--packages", type=Path, required=True, help="package_windows_release.py 的输出目录")
+    parser = argparse.ArgumentParser(description=t("update_compat.description"))
+    parser.add_argument("--packages", type=Path, required=True, help=t("update_compat.packagesHelp"))
     parser.add_argument("--version", required=True)
     args = parser.parse_args(argv)
     problems = verify(args.packages, args.version)

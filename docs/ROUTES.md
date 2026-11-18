@@ -1,5 +1,11 @@
 # 页面路由
 
+`GET /api/items?summary_only=1` 按相同筛选只返回 `total`、`bytes` 和 `work_total`。馆藏网格先读取 `count=0` 的首屏条目，再独立取得统计和后续条目；既有调用不带该参数时行为不变。
+
+「应用与维护」的存储状态使用 `GET /api/configuration/storage`；`POST /api/configuration/storage/measure` 启动统计，`POST /api/configuration/storage/clean` 按所选类别清理，`POST /api/configuration/storage/policy` 保存本机容量保护（`enabled` 总开关默认开启）并返回同一状态形状。`GET /api/configuration/storage/external-cache` 只读本机 CloudDrive 缓存目录，不自动保存；需要登录与本机管理，未配置、远程地址、权限不足或路径不可读取返回 400。容量数值为整数 `GiB`，`0` 表示自动磁盘保留值或不设对应总量上限；外部缓存目录不会由 Peach 删除。写请求需要登录、本机管理与同源检查，字段或目录无效返回 400，跨站请求返回 403；统计或清理已在运行时返回 409。规则与清理边界见[容量保护](OPERATIONS.md#容量保护与显示尺寸补测)。
+
+`GET /api/result-updates` 是每个页面常驻的那一处轻量检查：返回结果版本 `result_versions`、入库通知 `ingest_notices`、有没有任务在排或在跑 `busy`，以及在排在跑的任务 `running_tasks`。`running_tasks` 每个 `task_key` 一项 `{task_key, run_id, status}`，按 `task_key` 排序；有一轮在跑时 `status` 为 `running`、`run_id` 是在跑的最新一轮，只在排队时为 `pending` 与最新排进来的那一轮，没有任务时是空数组。页面有任务时每 5 秒、闲着每 10 秒读一次，读失败按 4、8、16、30 秒退避；其余页面只读这份缓存决定要不要开始读自己的任务进度，闲着时不各自轮询。
+
 馆藏处理的 `POST /api/library-processing` 支持按 `job_id` 暂停、继续、取消及归档结束提示；`stopping` 仍占用当前范围，`cancelled` 不自动恢复。`scope=new` 在启动时解析成固定资产集合，不与 `asset_ids` 或失败重试混用。状态只返回新入库数量，不下发内部处理路径。
 
 `GET /api/library-processing/issues` 返回任务号、内容摘要 `revision`、总数、偏移和记录。导出后续页传入首份摘要；同任务追加、恢复或记录替换时拒绝混合读取。旧完整问题数组可分页读取，原始记录缺失或损坏作为失败返回。
@@ -96,25 +102,41 @@
 | `/settings/maintenance` | 应用与维护 |
 | `/settings/diagnostics` | 系统诊断：系统检查、库健康、来源会话与后台诊断、刮削记录导出 |
 | `/subscriptions` | 关注管理：关注列表统一管理创作者来源与 JAV 订阅；添加关注提供创作者、女优入口和别名管理，标签管理支持在线标签分页与批量操作 |
-| `/sources` | 来源和凭证：采集来源、访问方式与凭据状态 |
+| `/sources` | 来源和凭证：采集来源、访问方式与凭据状态，全部来源的连接检查 |
 | `/tasks` | 任务中心与云下载进度 |
 | `/stats` | 统计 |
 | `/taste` | 口味分析 |
-| `/review` | 人工复核 |
-| `/data-cleanup` | 数据管理 |
+| `/review` | 人工复核；元数据字段下逐条列出核查结算自动写入的资料，可勾选后预览并撤回 |
+| `/data-cleanup` | 数据管理概览；日常扫描、待处理摘要、维护与清理入口 |
+| `/data-cleanup/organize` | 文件整理与批次历史 |
+| `/data-cleanup/resource-sync` | 核对文件与馆藏记录，清理失效条目、空目录与缓存 |
+| `/data-cleanup/orphan-records` | 处理文件已丢失但仍保留个人记录的作品 |
+| `/data-cleanup/media-repair` | 媒体修复 |
+| `/data-cleanup/links` | 链接检查与失效地址复核 |
+| `/data-cleanup/batch-delete` | 按女优批量永久删除关联影片 |
 | `/duplicates` | 重复文件 |
 | `/quality-goals` | 高清版目标 |
 | `/login` | 登录 |
 
 设置分区可直接打开、刷新和用浏览器前进后退。偏好面板从当前页面打开时保留背景；配置分区复用配置页及其权限检查。配置分类导航停在搜索栏下方，切换分类时显示所选分区的开头。
 
-用户脚本通过专用令牌调用 `POST /api/jav-browser/errors`，仅接收白名单错误字段并写入本机日志；批次、体积、限频与诊断包范围见 [浏览器添加 JAV](JAV_BROWSER.md)。状态接口 `GET /api/jav-browser` 同时投影真实下载与整理进度，不授予配置、账号或账本写入权限。
+用户脚本通过专用令牌调用 `POST /api/jav-browser/errors`，仅接收白名单错误字段并写入本机日志；批次、体积、限频与诊断包范围见 [浏览器添加 JAV](JAV_BROWSER.md)。状态接口 `GET /api/jav-browser` 同时投影真实下载与整理进度，`GET /api/jav-browser/active` 以同一结构列出进行中与最近结束的任务，均不授予配置、账号或账本写入权限。`POST /api/jav-browser/postprocess` 只能重试该番号已失败的整理，走任务中心同一入口。`POST /api/jav-browser/dismiss` 只记下脚本确认过哪些已结束的任务，不改任务与账本。`GET`/`POST /api/jav-browser/performer` 认出女优页是哪位并开关她的「订阅新作」，与人物页开关同一套订阅；编号没人持有时会新建女优并绑上编号，规则见 ADR-0143。
 
-`GET /api/client-updates` 要求应用鉴权，返回运行版本与构建标记、发行版检查结果、安装状态、用户脚本版本和自动补修状态，不触发外部检查。`GET /api/jav-browser/updates` 使用用户脚本专用令牌，无需番号，返回运行与发行版、脚本版本快照，不暴露补修明细。`POST /api/configuration/upgrade-repairs/retry` 限本机同源请求，重试失败项；`GET /api/configuration/upgrade-repairs/review` 限本机管理权限，下载 JSON 复核记录，无记录时返回 404。
+`GET /api/review/auto-landings` 逐条列出 ADR-0139 两条规则仍在的自动写入：作品、封面地址、写入的字段与值、写入前的值或补上的标签、规则与时间；带 `items=<决定键>`（换行分隔）时只读返回这几条要改回的值、要删的标签、写入后被改过或已删除而不动的作品，以及计划摘要 `token`。`POST /api/review/auto-landings/revert` 接收 `items` 与 `token`，在写锁里重算计划，对不上返回 400 要求重新预览；对上后先备份账本再撤回，回执带备份文件名与未改动的作品。列表里没有的决定键一律拒绝，其余自动落库来源仍由 `scripts/revert_auto_landing.py` 撤回；只读端拒绝撤回（ADR-0141）。
+
+`GET /api/client-updates` 要求应用鉴权，返回运行版本与构建标记、发行版检查结果、安装状态、用户脚本版本、自动补修状态和启动迁移状态（进行中带阶段 `stage`，备份阶段另带百分比 `progress`），不触发外部检查。服务启动时迁移数据库期间，它与 `/healthz` 照常回应且不读数据库，其余 `/api/` 与媒体路由回 503，`message_code` 为 `api.ledger.migrating`。`GET /api/jav-browser/updates` 使用用户脚本专用令牌，无需番号，返回运行与发行版、脚本版本快照，不暴露补修明细。`POST /api/configuration/upgrade-repairs/retry` 限本机同源请求，重试失败项；`GET /api/configuration/upgrade-repairs/review` 限本机管理权限，下载 JSON 复核记录，无记录时返回 404。
+
+Docker 镜像的一键更新（[ADR-0140](adr/0140-docker-one-click-update-via-watchtower.md)）：容器里的 `GET /api/configuration/updates` 在 Docker Hub 的版本号标签与 `edge` 指向同一镜像前返回 `state: pending`；有新镜像时多一个 `one_click`，`available` 表示镜像标签是 `edge`、令牌已生成且探测得到 Watchtower，不能时 `reason` 说明原因，没启用 Watchtower 时为空。`POST /api/configuration/docker-update` 请 Watchtower 异步拉取并重建容器，收到 202 后返回 `state: updating`；条件不满足、Watchtower 拒绝令牌或正忙返回 409。接口限本机同源请求，非 Docker 部署返回 404，从不回传令牌。
 
 `GET /api/configuration/cloud-proxies` 返回已添加媒体库对应的 CloudDrive 账号及 API／数据代理、未匹配媒体库和账号修订号，不回显代理密码；尚未填写 CloudDrive2 地址时返回空列表与 `configured: false`。`POST` 接受账号 `id`、`revision` 和本次修改的 `api`／`data`，写回 CloudDrive 后返回该账号当前状态；配置冲突返回 409。这两条接口均限本机管理权限，写入还要求同源请求。
 
 `POST /api/configuration/smb/test` 接受共享地址及连接字段，验证只读目录访问，返回 `readable` 和最多 500 个可进入子目录名。接口要求本机管理权限与同源请求；地址无效返回 400，无读取权限返回 403，共享不可达返回 502，不回显密码。配置读取只返回账号、加密要求与密码是否已保存。
+
+`POST /api/configuration/access/first` 是已配置、还没有访问策略的 Docker 部署的访问设置提交（[ADR-0149](adr/0149-docker-first-access-setup.md)），不要求登录。正文 `{mode, password, confirmation, next}`，`mode` 为 `password` 或 `open`；成功写入访问策略，返回站内地址 `url`，设了密码时同时设下会话 cookie。只在 Docker 且还没有访问策略时可用：非 Docker 返回 404，已有策略返回 409，来源不是本机或私有网络、带代理转发头或不同源时返回 403，密码错误按 `errors.password`、`errors.confirmation` 返回 400。
+
+`POST /api/configuration/access/token/rotate` 更换访问口令，运行中的服务立即改用新口令。接口要求本机管理权限与同源请求；口令由 `--token`、`PEACH_TOKEN` 指定或这次启动没有口令时返回 409，访问设置读不出时也返回 409。响应只在这一次带回新口令 `token`（`Cache-Control: no-store`），另有访问方式 `mode` 和被登出的其他设备数 `signed_out`。配置读取的 `api_token` 只给出 `rotatable`、`reason`、`paired`，不回显口令。
+
+`GET /api/configuration/certificate` 限本机管理权限，返回本机 CA 的 SHA-256 `fingerprint`、到期日 `not_after`、下载路径和二维码：`phone_url` 是带 10 分钟签名的下载地址，`qr` 是模块矩阵。没有 HTTPS 服务或没有 CA 时返回 404，配置读取的 `certificate` 为 null。`GET /api/configuration/certificate/peach-local-ca.crt` 只下发 CA 的公开证书（`application/x-x509-ca-cert`），任何私钥都不经过它；带有效签名 `k` 时不需要登录，签名无效或过期返回 403；不带签名时要求应用鉴权。
 
 ## 兼容地址与服务接口
 
@@ -131,7 +153,7 @@
 | `/follow-manage` | `/subscriptions` |
 | `/configuration` | `/settings/library` |
 | `/diagnostics` | `/settings/diagnostics` |
-| `/resource-sync` | `/data-cleanup#resource-sync` |
+| `/resource-sync` | `/data-cleanup/resource-sync` |
 
 兼容跳转保留查询参数；后退前进的背景信息留在历史条目中。索引尾斜杠跳到无尾斜杠路径。
 

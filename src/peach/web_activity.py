@@ -4,14 +4,15 @@ from __future__ import annotations
 import time
 from typing import Protocol
 
-from .personal_records import VANISHED
+from .personal_records import VANISHED, being_purged
+from .user_messages import UserValueError
 
 DEFAULT_PROFILE_ID = "local-default"
 
 
 class ActivityContract(Protocol):
     def cache_bust(self) -> None: ...
-    def write_transaction(self): ...
+    def write_transaction(self, *, notify: bool = True): ...
 
 
 def w_activity(contract: ActivityContract, body):
@@ -21,7 +22,9 @@ def w_activity(contract: ActivityContract, body):
     add = float(body.get("delta", 0))
     ended = bool(body.get("ended"))
     seeks = int(body.get("seeks", 0))
-    with contract.write_transaction() as connection:
+    # 十秒一次的心跳只改观看进度：不清缓存，触发器也不推 asset 版本（migration 0054），
+    # 否则看片期间首页、统计与背景网格每十秒整份重算一轮。
+    with contract.write_transaction(notify=False) as connection:
         row = connection.execute(
             "SELECT play_seconds,max_reached,seek_count FROM asset WHERE id=?", (aid,),
         ).fetchone()
@@ -45,10 +48,13 @@ def w_play(contract: ActivityContract, body):
     contract.cache_bust()
     aid = int(body["id"])
     with contract.write_transaction() as connection:
-        connection.execute(
+        changed = connection.execute(
             "UPDATE asset SET play_count=COALESCE(play_count,0)+1, last_played=? WHERE id=?",
             (time.time(), aid),
-        )
+        ).rowcount
+    from .capacity_history import record_playback
+    if changed:
+        record_playback(contract)
     return {"ok": True}
 
 
@@ -72,6 +78,8 @@ def w_feedback(contract: ActivityContract, body):
             # 已消失的行文件不在盘上：切进回收站再切出来就成了在库（ADR-0087），整行不动。
             if current == VANISHED:
                 raise ValueError("vanished assets cannot be moved to the recycle bin")
+            if current == "trash" and being_purged([aid]):
+                raise UserValueError("errors.webBatch.purgingCannotRestore")
             connection.execute(
                 "UPDATE asset SET disposal=?, disposal_reason=?, feedback_at=? WHERE id=?",
                 (None if current == "trash" else "trash", None if current == "trash" else "manual", time.time(), aid),
@@ -103,6 +111,8 @@ def w_watch_later(contract: ActivityContract, body):
     contract.cache_bust()
     aid = int(body["id"])
     with contract.write_transaction() as connection:
+        if not connection.execute("SELECT 1 FROM asset WHERE id=?", (aid,)).fetchone():
+            raise ValueError("asset not found")
         exists = connection.execute(
             "SELECT 1 FROM watch_queue WHERE profile_id=? AND asset_id=?",
             (DEFAULT_PROFILE_ID, aid),

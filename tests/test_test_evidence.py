@@ -84,9 +84,17 @@ class ParallelShardTests(unittest.TestCase):
             def checkpoint(assigned, report, normal):
                 observed.append(normal)
                 return True
-            with redirect_stdout(io.StringIO()):
-                runner.run_shards(('checks',), jobs=1, shard_count=1, plan=[['test_a.py']],
-                                  spawn=spawn, checkpoint=checkpoint)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                passed, _, _ = runner.run_shards(('checks',), jobs=1, shard_count=1, plan=[['test_a.py']],
+                                                spawn=spawn, checkpoint=checkpoint)
+            self.assertEqual(passed, success and code == 0)
+            if not passed:
+                row = next(line for line in output.getvalue().splitlines() if line.startswith('分片失败明细：'))
+                details = json.loads(row.removeprefix('分片失败明细：'))
+                self.assertEqual(details['exit_code'], code)
+                self.assertEqual(details['files'], ['test_a.py'])
+                self.assertEqual(details['reported_success'], success)
             return observed
         for success, code, expected in ((False, 1, True), (False, 15, False), (True, 1, False), (True, 0, True)):
             with self.subTest(success=success, code=code):
@@ -95,6 +103,23 @@ class ParallelShardTests(unittest.TestCase):
     def test_imported_verification_code_belongs_to_this_workspace(self):
         self.assertEqual(Path(runner.__file__).resolve().parents[1], Path(__file__).resolve().parents[1])
         self.assertEqual(Path(evidence.__file__).resolve().parents[1], Path(__file__).resolve().parents[1])
+
+    def test_a_zero_exit_with_incomplete_coverage_reports_the_missing_proof(self):
+        def spawn(command, **kwargs):
+            path = Path(command[command.index('--timings') + 1])
+            path.write_text(json.dumps({'complete': True, 'success': True, 'count': 1,
+                                        'timings': [], 'files': {}, 'results': []}), encoding='utf8')
+            return mock.Mock(returncode=0, poll=lambda: 0)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            passed, _, _ = runner.run_shards(('checks',), jobs=1, shard_count=1,
+                plan=[['test_a.py']], spawn=spawn, checkpoint=lambda *_: False)
+        self.assertFalse(passed)
+        row = next(line for line in output.getvalue().splitlines() if line.startswith('分片失败明细：'))
+        details = json.loads(row.removeprefix('分片失败明细：'))
+        self.assertEqual(details['exit_code'], 0)
+        self.assertTrue(details['reported_success'])
+        self.assertFalse(details['coverage_complete'])
 
     def test_requested_parallelism_has_no_machine_slot_ceiling(self):
         live, peak = set(), [0]
@@ -768,10 +793,12 @@ class ShardReportTests(unittest.TestCase):
                     time.sleep(.02)
                 self.assertTrue(path.exists())
                 self.assertIsNone(process.poll())
+                forced = set()
                 with redirect_stdout(io.StringIO()):
                     finished = test_shard_results.completed_processes({0: (process, None)}, Path(folder),
-                        {0: 0}, now=test_shard_results.EXIT_GRACE_SECONDS + 1)
+                        {0: 0}, now=test_shard_results.EXIT_GRACE_SECONDS + 1, forced=forced)
                 self.assertEqual(finished, [0])
+                self.assertEqual(forced, {0})
                 self.assertIsNotNone(process.poll())
             finally:
                 if process.poll() is None:
@@ -780,7 +807,8 @@ class ShardReportTests(unittest.TestCase):
 
 class SubprocessResumeTests(unittest.TestCase):
     def invoke(self, repo, scope, *options):
-        env = {**os.environ, 'GITHUB_ACTIONS': 'false', 'CI': ''}
+        # 夹具仓库的运行只验证续跑，不去排本机真实的整机名额。
+        env = {**os.environ, 'GITHUB_ACTIONS': 'false', 'CI': '', 'PEACH_TEST_SLOTS_HELD': str(os.getpid())}
         for key in ('PEACH_TEST_FOCUS', 'PEACH_E2E_FILES', 'PEACH_VITEST_FILES'):
             env.pop(key, None)
         return fixture_process([sys.executable, '-X', 'utf8', str(repo / 'entry.py'),
@@ -795,11 +823,14 @@ class SubprocessResumeTests(unittest.TestCase):
     def check_resume_after_failure(self, scope, *options, check_full_modes=False):
         source = Path(__file__).resolve().parents[1]
         modules = ('test_runner', 'test_evidence', 'test_history', 'test_resume', 'test_run_progress',
-                   'test_shard_results', 'test_environment_identity', 'test_focus', 'change_impact', 'test_inputs')
+                   'test_shard_results', 'test_environment_identity', 'test_focus', 'change_impact', 'test_inputs',
+                   'test_slots')
         files = {'scripts/__init__.py': '', '.gitignore': 'build/\nruntime/\n__pycache__/\n*.pyc\n',
                  '.gitattributes': '* text=auto eol=lf\n'}
         files.update({'scripts/' + name + '.py': (source / 'scripts' / (name + '.py')).read_text(encoding='utf8')
                       for name in modules})
+        # 运行器在导入时读选测登记表。
+        files['scripts/scope_registry.toml'] = (source / 'scripts/scope_registry.toml').read_text(encoding='utf8')
         files['entry.py'] = (
             'from scripts import test_runner as runner\nraise SystemExit(runner.main())\n')
         sample = ('from pathlib import Path\nimport unittest\nclass Suite(unittest.TestCase):\n'
@@ -954,7 +985,7 @@ class VerificationTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}))
         self.enterContext(mock.patch.object(coordinator, "require_pull_request", side_effect=
             lambda worker, branch, target, head: {"url": "https://github.com/example/peach/pull/1",
-                                                  "head": head, "base": target}))
+                                                  "head": head, "base": target, "refs": []}))
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
@@ -974,7 +1005,6 @@ class VerificationTests(unittest.TestCase):
         (worker / "README.zh-CN.md").write_text("Test content\n", encoding="utf-8")
         evidence.git(worker, "add", "README.md", "README.zh-CN.md")
         evidence.git(worker, "commit", "-m", "docs: test", "-m",
-                     "README-Impact: updated; 测试文档\n"
                      "Co-Authored-By: Codex (GPT-5.5) <noreply@openai.com>")
         return worker, item["branch"]
 
@@ -1452,7 +1482,7 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(runner.scopes_for_changes(["web/app.js", "src/peach/follow.py"])[0],
                          ("follow", "web"))
         for path in ("pyproject.toml", "scripts/test_runner.py", "scripts/test_evidence.py", 'scripts/test_focus.py',
-                     "uv.lock", "src/peach/unknown.py"):
+                     "scripts/test_slots.py", "uv.lock", "src/peach/unknown.py"):
             self.assertEqual(runner.scopes_for_changes([path])[0], ("full",))
 
     def test_runner_reuses_success_and_fresh_failure_invalidates_it(self):
@@ -1626,7 +1656,7 @@ class VerificationTests(unittest.TestCase):
     def test_full_run_retains_unaffected_files_then_completes_with_auto(self):
         mapping = {"full": ("test_checks.py", "test_web.py"), "checks": ("test_checks.py",),
                    "web": ("test_web.py",)}
-        select = lambda scope: tuple(Path(name) for name in mapping.get(scope, ()))
+        select = lambda scope, **_: tuple(Path(name) for name in mapping.get(scope, ()))
 
         def mutate(*args, **kwargs):
             (self.repo / "README.md").write_text("检查期间的文档修订\n", encoding="utf-8")

@@ -1,15 +1,19 @@
 """按模板整理：模板渲染、逃逸防护、计划生成、执行与回滚（ADR-0039）。"""
 from __future__ import annotations
 
+import os
 import sqlite3
 import json
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
-from contextlib import closing
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path, PureWindowsPath
 from unittest import mock
 
-from peach import organize
+from peach import media_io, organize
 from peach.organize_templates import (
     TemplateError, render, sanitise_component, validate_template, clean_filename,
 )
@@ -156,6 +160,61 @@ def _seed(db_path: Path, rows: list[dict]) -> None:
         connection.commit()
 
 
+@contextmanager
+def hung_mount(stuck, *functions):
+    """模拟挂死的挂载：本进程与媒体子进程里，`functions`（如 `os.rename`、`builtins.open`）
+    碰到 `stuck` 里的路径都卡住。
+
+    本进程只卡 30 秒，好让旧写法下的用例以超时失败而不是一直挂着；子进程卡 60 秒，
+    由父进程按期限结束。产出拉起过的子进程。
+    """
+    import builtins
+    stuck = sorted(str(path) for path in stuck)
+    script = ('import builtins, os, sys, time\n'
+              f'sys.path[:0] = {sys.path!r}\n'
+              'import peach.media_io as m\n'
+              f'stuck = {stuck!r}\n'
+              'def hang(original):\n'
+              '    def call(path, *args, **kwargs):\n'
+              '        if isinstance(path, (str, os.PathLike)) and os.fspath(path) in stuck: time.sleep(60)\n'
+              '        return original(path, *args, **kwargs)\n'
+              '    return call\n'
+              + ''.join(f'{name} = hang({name})\n' for name in functions)
+              + 'sys.exit(m.main(sys.argv[1:]))\n')
+    children, original_popen = [], subprocess.Popen
+
+    def spawn(command, **options):
+        if '-m' in command and 'peach.media_io' in command:
+            # venv 的 python.exe 是转发器：结束它不一定结束真正的解释器，这里直接起基础解释器。
+            command = [sys._base_executable, '-c', script, *command[command.index('peach.media_io') + 1:]]
+        child = original_popen(command, **options)
+        children.append(child)
+        return child
+
+    def hang(original):
+        def call(path, *args, **kwargs):
+            if isinstance(path, (str, os.PathLike)) and os.fspath(path) in stuck:
+                time.sleep(30)
+            return original(path, *args, **kwargs)
+        return call
+
+    modules = {'os': os, 'os.path': os.path, 'builtins': builtins}
+    with ExitStack() as stack:
+        stack.enter_context(mock.patch.object(media_io, 'TIMEOUT_SECONDS', 1.0))
+        stack.enter_context(mock.patch.object(media_io.subprocess, 'Popen', side_effect=spawn))
+        for name in functions:
+            module, _, attribute = name.rpartition('.')
+            target = modules[module]
+            stack.enter_context(mock.patch.object(target, attribute, hang(getattr(target, attribute))))
+        try:
+            yield children
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=10)
+
+
 def _plan(db_path: Path, **kwargs) -> dict:
     with closing(sqlite3.connect(db_path)) as connection:
         return organize.build_plan(connection, location="local", roots=DECLARED,
@@ -181,6 +240,26 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(result['counts']['change'], 1)
         self.assertEqual(result['counts']['skip'], 1)
         self.assertEqual(result['rows'][1]['reason'], organize.SKIP_OFFLINE)
+
+    def test_a_hung_root_is_offline_after_the_deadline_and_the_other_root_is_planned(self):
+        online, hung = self.holder / 'online', self.holder / 'hung'
+        online.mkdir()
+        hung.mkdir()
+        _seed(self.db_path, [
+            dict(id=1, path='R:\\media\\a.mp4', name='a.mp4', code='ABC-001'),
+            dict(id=2, path='S:\\media\\b.mp4', name='b.mp4', code='ABC-002'),
+        ])
+        roots = {'R:\\media': online, 'S:\\media': hung}
+        started = time.monotonic()
+        with closing(sqlite3.connect(self.db_path)) as connection, \
+                mock.patch.object(organize, 'translate_ledger_path', side_effect=lambda root: roots[root]), \
+                hung_mount([hung], 'os.scandir') as children:
+            result = organize.build_plan(connection, location='local', roots={'local': ('R:\\media', 'S:\\media')},
+                                         file_template='{number}')
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual((result['counts']['change'], result['counts']['skip']), (1, 1))
+        self.assertEqual(result['rows'][1]['reason'], organize.SKIP_OFFLINE)
+        self.assertEqual(len(children), 2)
 
     def test_rename_in_place_and_move_into_template_directory(self):
         _seed(self.db_path, [
@@ -287,6 +366,10 @@ class PlanTests(unittest.TestCase):
                                        online=False, file_template="{number}")
         self.assertEqual(plan["counts"]["skip"], 1)
         self.assertEqual(plan["reasons"], {organize.SKIP_OFFLINE: 1})
+        # 计划里记 id、界面按 code 取语言；写给人看的计划 CSV 按本机语言写成一句话。
+        self.assertEqual((organize.SKIP_OFFLINE, plan["reason_codes"]), ("offline", {"offline": "labels.organize.skip.offline"}))
+        path = organize.write_plan(self.holder / "plan.csv", plan["rows"])
+        self.assertIn("来源未挂载", path.read_text(encoding="utf-8-sig"))
 
     def test_path_outside_the_declared_root_is_skipped(self):
         _seed(self.db_path, [
@@ -315,7 +398,7 @@ class ApplyTests(unittest.TestCase):
                                   name=f'{index}.mp4', code=f'ABC-00{index}') for index in (1, 2)])
         plan = _plan(self.db_path, file_template='{number}')
         def stop(**fields):
-            raise InterruptedError('模拟整理中断')
+            raise InterruptedError('simulated organize interruption')
         with closing(sqlite3.connect(self.db_path)) as connection, self.assertRaises(InterruptedError):
             organize.apply_plan(connection, plan['rows'], generated_root=self.holder, stamp='resume', progress=stop)
         with closing(sqlite3.connect(self.db_path)) as connection:
@@ -324,6 +407,21 @@ class ApplyTests(unittest.TestCase):
         journal = json.loads(Path(result['log_path']).read_text(encoding='utf-8'))
         self.assertEqual(len(journal['entries']), 2)
         self.assertEqual(len(list(organize.batch_log_dir(self.holder).glob('*.json'))), 1)
+
+    def test_only_the_latest_batch_journals_are_kept_after_a_run(self):
+        folder = organize.batch_log_dir(self.holder)
+        folder.mkdir(parents=True)
+        for day in range(1, 7):
+            (folder / f'organize-2026010{day}-000000.json').write_text('{"entries": []}', encoding='utf-8')
+        self._file('old/1.mp4')
+        _seed(self.db_path, [dict(id=1, path='R:\\media\\old\\1.mp4', name='1.mp4', code='ABC-001')])
+        plan = _plan(self.db_path, file_template='{number}')
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            result = organize.apply_plan(connection, plan['rows'], generated_root=self.holder, stamp='20260201-000000')
+        self.assertEqual(organize.latest_batch(self.holder).name, result['batch'])
+        self.assertEqual(sorted(path.name for path in folder.glob('*.json')),
+                         [f'organize-2026010{day}-000000.json' for day in range(3, 7)]
+                         + ['organize-20260201-000000.json'])
 
     def setUp(self):
         self.holder = Path(tempfile.mkdtemp(prefix="peach-organize-apply-")).resolve()
@@ -348,6 +446,61 @@ class ApplyTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db_path)) as connection:
             return organize.apply_plan(connection, plan["rows"],
                                        generated_root=self.holder)
+
+    def _three_rows(self):
+        for name in ('a', 'b', 'c'):
+            self._file(f'old/{name}.mp4')
+        _seed(self.db_path, [dict(id=index, path=f'R:\\media\\old\\{name}.mp4', name=f'{name}.mp4',
+                                  code=f'ABC-00{index}') for index, name in enumerate('abc', 1)])
+        return _plan(self.db_path, file_template='{number}')
+
+    def test_a_hung_rename_fails_only_that_row_and_the_rest_are_moved_by_a_new_worker(self):
+        plan = self._three_rows()
+        started = time.monotonic()
+        with hung_mount([self.media / 'old/b.mp4'], 'os.rename') as children:
+            result = self._apply(plan)
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual((result['moved'], result['failed']), (2, 1))
+        failure = result['failures'][0]
+        self.assertEqual((failure['asset_id'], failure['reason_code'], failure['retryable']),
+                         (2, 'labels.organize.failure.renameFailed', True))
+        self.assertEqual(sorted(path.name for path in (self.media / 'old').iterdir()),
+                         ['ABC-001.mp4', 'ABC-003.mp4', 'b.mp4'])
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute('SELECT path FROM asset WHERE id=2').fetchone()[0],
+                             'R:\\media\\old\\b.mp4')
+        journal = json.loads(Path(result['log_path']).read_text(encoding='utf-8'))
+        self.assertEqual([entry['asset_id'] for entry in journal['entries']], [1, 3])
+        self.assertEqual(len(children), 2, '卡住的那一条之后换一个新的子进程接着做')
+
+    def test_a_hung_rollback_keeps_that_entry_for_the_next_rollback(self):
+        result = self._apply(self._three_rows())
+        self.assertEqual(result['moved'], 3)
+        batch = organize.latest_batch(self.holder)
+        with closing(sqlite3.connect(self.db_path)) as connection, \
+                hung_mount([self.media / 'old/ABC-002.mp4'], 'os.rename'):
+            result = organize.rollback_batch(connection, batch)
+        self.assertEqual((result['restored'], result['failed']), (2, 1))
+        remaining = json.loads(batch.read_text(encoding='utf-8'))['entries']
+        self.assertEqual([entry['asset_id'] for entry in remaining], [2])
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            result = organize.rollback_batch(connection, batch)
+        self.assertEqual((result['restored'], result['failed']), (3, 0))
+        self.assertEqual(sorted(path.name for path in (self.media / 'old').iterdir()), ['a.mp4', 'b.mp4', 'c.mp4'])
+
+    def test_cancel_takes_effect_before_the_next_row(self):
+        plan = self._three_rows()
+        seen = []
+
+        def cancel(**fields):
+            seen.append(fields['checked'])
+            raise KeyboardInterrupt('simulated cancel')
+        with closing(sqlite3.connect(self.db_path)) as connection, self.assertRaises(KeyboardInterrupt):
+            organize.apply_plan(connection, plan['rows'], generated_root=self.holder, stamp='cancel',
+                                progress=cancel)
+        self.assertEqual(seen, [1])
+        self.assertEqual(sorted(path.name for path in (self.media / 'old').iterdir()),
+                         ['ABC-001.mp4', 'b.mp4', 'c.mp4'])
 
     def test_apply_moves_the_file_and_updates_the_ledger(self):
         self._file("旧/abc123.mp4")
@@ -374,6 +527,34 @@ class ApplyTests(unittest.TestCase):
         result = self._apply(plan)
         self.assertEqual((result['moved'], result['failed']), (0, 1))
         self.assertTrue(original.is_file())
+
+    def test_case_only_rename_updates_spelling_and_can_be_rolled_back(self):
+        self._file('old/abc-123.mp4')
+        original = r'R:\media\old\abc-123.mp4'
+        target = r'R:\media\old\ABC-123.mp4'
+        _seed(self.db_path, [dict(id=1, path=original, name='abc-123.mp4', code='ABC-123')])
+        plan = _plan(self.db_path, file_template='{number}')
+        result = self._apply(plan)
+        self.assertEqual((result['moved'], result['failed']), (1, 0))
+        self.assertEqual([path.name for path in (self.media / 'old').iterdir()], ['ABC-123.mp4'])
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute('SELECT path,name FROM asset').fetchone(),
+                             (target, 'ABC-123.mp4'))
+            result = organize.rollback_batch(connection, organize.latest_batch(self.holder))
+            self.assertEqual((result['restored'], result['failed']), (1, 0))
+            self.assertEqual(connection.execute('SELECT path,name FROM asset').fetchone(),
+                             (original, 'abc-123.mp4'))
+        self.assertEqual([path.name for path in (self.media / 'old').iterdir()], ['abc-123.mp4'])
+
+    def test_case_only_move_committed_before_journal_is_not_renamed_again(self):
+        self._file('old/ABC-123.mp4')
+        original = r'R:\media\old\abc-123.mp4'
+        target = r'R:\media\old\ABC-123.mp4'
+        _seed(self.db_path, [dict(id=1, path=target, name='ABC-123.mp4', code='ABC-123')])
+        plan = {'rows': [dict(asset_id=1, action='rename', current_path=original, target_path=target)]}
+        with mock.patch.object(organize, '_rename', side_effect=AssertionError('已提交的行不应再次改名')):
+            result = self._apply(plan)
+        self.assertEqual((result['moved'], result['failed']), (1, 0))
 
     def test_scoped_symbol_cleanup_and_rollback_preserve_unselected_files(self):
         self._file('合集/★标题⧹⧹片段.mp4')
@@ -424,7 +605,7 @@ class ApplyTests(unittest.TestCase):
                           "target_path": "R:\\media\\ABC-123.mp4"}]}
         result = self._apply(plan)
         self.assertEqual((result["moved"], result["failed"]), (0, 1))
-        self.assertEqual(result["failures"][0]["reason"], organize.SKIP_TARGET_EXISTS)
+        self.assertEqual(result["failures"][0]["reason_code"], organize.SKIP_REASON_CODES[organize.SKIP_TARGET_EXISTS])
         self.assertTrue((self.media / "旧" / "abc123.mp4").is_file())
 
     def test_cross_volume_row_is_refused(self):
@@ -437,7 +618,7 @@ class ApplyTests(unittest.TestCase):
                           "current_path": "R:\\media\\旧\\abc123.mp4",
                           "target_path": "B:\\media\\ABC-123.mp4"}]}
         result = self._apply(plan)
-        self.assertEqual(result["failures"][0]["reason"], organize.SKIP_CROSS_VOLUME)
+        self.assertEqual(result["failures"][0]["reason_code"], organize.SKIP_REASON_CODES[organize.SKIP_CROSS_VOLUME])
         self.assertTrue((self.media / "旧" / "abc123.mp4").is_file())
 
     def _pikpak_plan(self):
@@ -553,6 +734,21 @@ class EndpointTests(unittest.TestCase):
                 w_organize_preview(self.contract, body)
             with self.subTest(body=body), self.assertRaisesRegex(organize.OrganizeError, '整理路径'):
                 w_organize_apply(self.contract, {**body, 'confirm': True})
+
+    def test_a_scope_outside_the_source_is_a_bad_request_not_a_server_error(self):
+        """整理路径填错是参数问题：接口回 400 并带原因，不是 500。"""
+        from peach.api import create_app
+        from peach.config import PeachSettings
+        from support.web import route_client
+
+        app = create_app(PeachSettings(db_path=self.db_path, configured=True, token=""))
+        with route_client(app) as client:
+            for route in ("/api/organize/preview", "/api/organize/apply"):
+                with self.subTest(route=route):
+                    response = client.post(route, json={"location": "local", "path": r"S:\outside",
+                                                        "file_template": "{number}", "confirm": True})
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn("整理路径不在所选来源内", response.json()["error"])
 
     def test_apply_on_a_source_without_verified_rename_is_refused(self):
         from peach.web_organize import w_organize_apply

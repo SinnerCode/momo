@@ -14,7 +14,6 @@ import { releaseManagedRoute } from './../history/managed';
 import { catalogState, clearCatalogGrid } from './catalog.js';
 import { peachHistory, shellNavigate } from './../history/index';
 import { loadingState } from './loading.js';
-import { syncPostSetupTutorial } from './tutorial.js';
 import { pageOpens, writeShell } from './../shell/index';
 export const navigationState = { routeMeta: undefined, routePathOf: undefined, catalogPage: undefined, managedPagePath: undefined, openRoutePath: undefined, surfaceEpoch: undefined, surfacePath: undefined, surfaceRequests: undefined, surfaceToken: undefined, surfaceCurrent: undefined, claimSurface: undefined, route: undefined, navigatePath: undefined, requestedOverlay: undefined, requestedQueue: undefined, queueOpenRequest: undefined, initialOverlayOpened: undefined };
 
@@ -53,7 +52,6 @@ export function syncRouteChrome(){
   loadingState.syncPageTitle(location.href);
   paintSidebar();
   clearOverlayBackground();
-  void syncPostSetupTutorial();
 }
 
 export function openRoutedPage(path){
@@ -110,7 +108,7 @@ navigationState.route = (path,replace=false,state)=>{
   navigationState.surfaceEpoch++;
   catalogState.barsRequestSeq++;
   shellNavigate(path,{replace,state});loadingState.syncPageTitle(path);
-  queueMicrotask(()=>{syncHeaderActions();paintListTitle();paintSidebar();void syncPostSetupTutorial()});
+  queueMicrotask(()=>{syncHeaderActions();paintListTitle();paintSidebar()});
 };
 navigationState.navigatePath = (path,replace=false,state)=>{
   if(replace)peachHistory.replace(path,state);else peachHistory.push(path,state);

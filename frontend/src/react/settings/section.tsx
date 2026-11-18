@@ -3,7 +3,7 @@
  * 外框取 BoardUI 设置弹层的 `SettingsSectionLabel` + `SettingsCard`，开关行直接用 `SettingsRow`。
  * 注册表里没有折叠，它用 BoardUI token 组合，差异登记在 `boardui/ORIGIN.md`。
  * 提示与进度条另有页面共用的一份，在 `../components/`。 */
-import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { Fragment, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { ComponentType, FormEvent, MouseEvent, ReactNode } from 'react';
 import { RiArrowRightLine, RiArrowRightSLine, RiExternalLinkLine } from '@remixicon/react';
 import { setCollapseOpen } from '@peach/legacy/ui';
@@ -11,9 +11,12 @@ import { setCollapseOpen } from '@peach/legacy/ui';
 import { SettingsCard, SettingsSectionLabel } from '@/components/application/settings/settings-rows';
 import { LinkButton } from '@/components/base/buttons/link-button';
 import { cx } from '@/utils/cx';
+import { t } from '../../i18n';
 
 interface SectionProps {
   title: string;
+  /** 导览跟随组件身份，不依赖可编辑的标题文案。 */
+  guide?: string;
   icon?: ReactNode;
   id?: string;
   /** 跟着标题走的次要内容（来源站点的外链）。标题占剩下的宽度，它靠右。 */
@@ -25,7 +28,7 @@ interface SectionProps {
 
 /* 分区里的说明、报错与读数常带长 URL、堆栈和无空格路径：整个分区按 `overflow-wrap:anywhere`
    就地折断（属性会继承，行内说明、Help 与读数都跟着走），不把卡片撑出横向滚动。 */
-export function Section({ title, icon, id, aside, onSubmit, children }: SectionProps) {
+export function Section({ title, guide, icon, id, aside, onSubmit, children }: SectionProps) {
   const label = icon ? <span className="inline-flex items-center gap-1.5">{icon}{title}</span> : title;
   const body = (
     <>
@@ -40,8 +43,8 @@ export function Section({ title, icon, id, aside, onSubmit, children }: SectionP
     </>
   );
   return onSubmit
-    ? <form id={id} aria-label={title} noValidate onSubmit={onSubmit} className="flex w-full flex-col gap-2 wrap-anywhere">{body}</form>
-    : <section id={id} aria-label={title} className="flex w-full flex-col gap-2 wrap-anywhere">{body}</section>;
+    ? <form id={id} data-guide-target={guide} aria-label={title} noValidate onSubmit={onSubmit} className="flex w-full flex-col gap-2 wrap-anywhere">{body}</form>
+    : <section id={id} data-guide-target={guide} aria-label={title} className="flex w-full flex-col gap-2 wrap-anywhere">{body}</section>;
 }
 
 /** 设置行组：内部由行画线，相邻行组由共享样式补齐边界。 */
@@ -50,11 +53,13 @@ export function Rows({ children }: { children: ReactNode }) {
 }
 
 /** 卡片只管左内边距和底色；不是 `SettingsRow` 的内容由这一层给行距和上下右内边距。
- *  排在 `Rows` 或 `FactList` 后面时 `divided`，和上面那组行之间补一道分隔线。 */
+ *  排在 `Rows` 或 `FactList` 后面时 `divided`，和上面那组行之间补一道分隔线。
+ *  嵌在里面的 `FactList` 退回这层的右内边距：行间线和别处的设置行一样右端顶到卡边，
+ *  读数仍由每行自己的右内边距对齐。 */
 export function Stack({ divided = false, children }: { divided?: boolean; children: ReactNode }) {
   return divided
-    ? <div className="flex flex-col gap-4 border-t border-separator-border py-4 pr-3 empty:hidden">{children}</div>
-    : <div className="flex flex-col gap-4 py-4 pr-3 empty:hidden">{children}</div>;
+    ? <div className="flex flex-col gap-4 border-t border-separator-border py-4 pr-3 empty:hidden [&>.ui-settings-facts]:-mr-3">{children}</div>
+    : <div className="flex flex-col gap-4 py-4 pr-3 empty:hidden [&>.ui-settings-facts]:-mr-3">{children}</div>;
 }
 
 /** 分区首次取数：画 `configuration-skeleton.ts` 里这个分区的那一份骨架，与整页骨架里这一块是同一段
@@ -77,12 +82,35 @@ export function Footer({ status, children }: { status?: ReactNode; children?: Re
   );
 }
 
+/** 句中嵌组件（如滚动的数字）的译文：`nodes` 里的占位换成对应节点，其余占位照常代入，语序跟着译文走。 */
+export function translateWithNodes(key: string, options: Record<string, unknown>, nodes: Record<string, ReactNode>): ReactNode[] {
+  const marks = Object.fromEntries(Object.keys(nodes).map((name) => [name, `\u0001${name}\u0001`]));
+  return String(t(key, { ...options, ...marks })).split('\u0001')
+    .map((part, index) => index % 2 ? <Fragment key={index}>{nodes[part]}</Fragment> : part);
+}
+
 export function Help({ role, children }: { role?: 'status'; children: ReactNode }) {
   return <p role={role} className="text-body-2-regular text-text-secondary">{children}</p>;
 }
 
 export function ErrorText({ children }: { children: ReactNode }) {
   return <p role="alert" className="text-body-2-regular text-text-error-primary">{children}</p>;
+}
+
+/** 设置页做不了、要在宿主机上照抄执行的几步：每步一句说明加一条命令（容器的迁移与更新）。 */
+export function CommandSteps({ label, steps }: { label: string; steps: { text: string; command: string }[] }) {
+  return (
+    <ol className="flex list-decimal flex-col gap-2 pl-5 text-body-2-regular text-text-secondary" aria-label={label}>
+      {steps.map((step) => (
+        <li key={step.command}>
+          {step.text}
+          <code className="mt-1 block rounded-md bg-background-tertiary-default px-2 py-1 text-caption-1-regular break-all text-text-primary">
+            {step.command}
+          </code>
+        </li>
+      ))}
+    </ol>
+  );
 }
 
 /** 字段上方的名字，外观同 BoardUI `Label`；控件自己的无障碍名称由 `aria-label` 给。 */
@@ -108,7 +136,7 @@ export function ExternalLink({ href, children, leadingIcon }: {
 export function TaskCenterLink() {
   return (
     <LinkButton href="/tasks" size="small" trailingIcon={RiArrowRightLine} className="self-start">
-      在任务中心查看进度
+      {t('settings:taskCenterLink.viewProgress')}
     </LinkButton>
   );
 }
@@ -132,8 +160,8 @@ export function Fact({ term, children }: { term: ReactNode; children: ReactNode 
 /** 展开正文。原生 `details` 给键盘与无障碍语义；开合交给共用 Collapse 的 `setCollapseOpen`，
  *  它给正文外层挂上 `ui-kit/collapse.css` 的 `.ui-fcollapse` 让高度过渡。内边距放在里层，高度才能收到 0。 */
 export function Disclosure(
-  { summary, defaultOpen = false, isOpen, children, trailing = false, onOpenChange, contentClassName }:
-  { summary: ReactNode; defaultOpen?: boolean; isOpen?: boolean; children: ReactNode; trailing?: boolean; onOpenChange?(open: boolean): void; contentClassName?: string },
+  { summary, defaultOpen = false, isOpen, children, trailing = false, row = false, onOpenChange, contentClassName }:
+  { summary: ReactNode; defaultOpen?: boolean; isOpen?: boolean; children: ReactNode; trailing?: boolean; row?: boolean; onOpenChange?(open: boolean): void; contentClassName?: string },
 ) {
   const id = useId();
   const details = useRef<HTMLDetailsElement>(null);
@@ -164,13 +192,13 @@ export function Disclosure(
   return (
     <details ref={attach}>
       <summary aria-expanded={open} aria-controls={id} onClick={toggle}
-        className={`${trailing ? 'w-full' : 'w-fit'} flex cursor-pointer list-none items-center gap-1 rounded-sm text-body-2-medium text-text-secondary outline-none select-none hover:text-text-primary focus-visible:ring-2 focus-visible:ring-border-focus-ring`}>
+        className={cx('flex w-full cursor-pointer list-none items-center gap-1 rounded-sm text-body-2-medium text-text-secondary outline-none select-none hover:text-text-primary focus-visible:ring-2 focus-visible:ring-border-focus-ring', row && 'px-5 py-2.5')}>
         {!trailing ? <RiArrowRightSLine aria-hidden className={open ? 'size-(--icon-inline) shrink-0 rotate-90 transition-transform' : 'size-(--icon-inline) shrink-0 transition-transform'} /> : null}
         {summary}
         {trailing ? <RiArrowRightSLine aria-hidden className={open ? 'ml-auto size-(--icon-inline) shrink-0 -rotate-90 transition-transform' : 'ml-auto size-(--icon-inline) shrink-0 rotate-90 transition-transform'} /> : null}
       </summary>
       <div ref={body} id={id} inert={!open}>
-        <div className={cx('flex flex-col gap-2 pt-3', contentClassName)}>{children}</div>
+        <div className={cx('flex flex-col gap-2', row ? 'px-5 pt-0.5' : 'pt-3', contentClassName)}>{children}</div>
       </div>
     </details>
   );

@@ -1,4 +1,5 @@
-/* Peach 原位改字核心。以 classic script 同步注册，保存由各端适配器提供。 */
+/* Peach 原位改字核心。以 classic script 同步注册，保存由各端适配器提供。
+ * i18n-exempt-file: classic script 不能导入翻译入口，且与官网、演示站共用一份，界面文字随兄弟项目接入多语言时再抽。 */
 (() => {
   const SKIP = '[data-copy-editor],script,style,textarea,input,select,svg,[contenteditable]';
   const INTERACT = '[role="tab"],[role="switch"],[role="radio"],[role="radiogroup"],[role="slider"],[role="checkbox"],[role="combobox"],[data-platform-option],[aria-expanded],[aria-pressed],[aria-haspopup],summary,input,select,label,[data-copy-interact]';
@@ -79,15 +80,76 @@
     }
   }
 
+  function attachToolbarDrag(bar, handle = bar) {
+    const properties = ['left', 'top', 'right', 'bottom', 'transform'];
+    const original = properties.map(name => bar.style.getPropertyValue(name));
+    let position = null, drag = null;
+    const move = (x, y) => {
+      const viewport = window.visualViewport;
+      const left = (viewport?.offsetLeft ?? 0) + 12, top = (viewport?.offsetTop ?? 0) + 12;
+      const width = viewport?.width ?? innerWidth, height = viewport?.height ?? innerHeight;
+      Object.assign(bar.style, { left: '0px', top: '0px', right: 'auto', bottom: 'auto', transform: 'none' });
+      // 模态框的 transform 可能改变 fixed 的包含块，拖动坐标仍按实际视口计算。
+      const origin = bar.getBoundingClientRect();
+      position = { x: Math.max(left, Math.min(x, left + width - origin.width - 24)),
+        y: Math.max(top, Math.min(y, top + height - origin.height - 24)) };
+      bar.style.left = `${(position.x - origin.left) / (origin.width / bar.offsetWidth || 1)}px`;
+      bar.style.top = `${(position.y - origin.top) / (origin.height / bar.offsetHeight || 1)}px`;
+    };
+    const reposition = () => {
+      if (position) { move(position.x, position.y); return; }
+      const rect = bar.getBoundingClientRect(), viewport = window.visualViewport;
+      const left = viewport?.offsetLeft ?? 0, top = viewport?.offsetTop ?? 0;
+      if (rect.left < left + 12 || rect.right > left + (viewport?.width ?? innerWidth) - 12
+        || rect.top < top + 12 || rect.bottom > top + (viewport?.height ?? innerHeight) - 12) move(rect.left, rect.top);
+    };
+    const stop = () => {
+      if (drag && handle.hasPointerCapture(drag.id)) handle.releasePointerCapture(drag.id);
+      drag = null; delete handle.dataset.dragging;
+    };
+    const down = event => {
+      if (event.button !== 0 || event.target.closest('button,a,input,select,textarea,[contenteditable]')) return;
+      const rect = bar.getBoundingClientRect();
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: rect.left, top: rect.top };
+      handle.setPointerCapture(event.pointerId); handle.dataset.dragging = ''; handle.focus({ preventScroll: true }); event.preventDefault();
+    };
+    const motion = event => { if (drag?.id === event.pointerId) move(drag.left + event.clientX - drag.x, drag.top + event.clientY - drag.y); };
+    const reset = () => { stop(); position = null; properties.forEach((name, index) => bar.style.setProperty(name, original[index])); reposition(); };
+    const key = event => {
+      if (event.target !== handle) return;
+      const direction = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[event.key];
+      if (event.key === 'Escape') { event.preventDefault(); reset(); }
+      if (!direction) return;
+      event.preventDefault(); const rect = bar.getBoundingClientRect(), step = event.shiftKey ? 40 : 10;
+      move(rect.left + direction[0] * step, rect.top + direction[1] * step);
+    };
+    handle.title = '拖动工具栏空白处移动，方向键微调，双击空白处或 Esc 复位';
+    handle.dataset.copyDrag = '';
+    const events = { pointerdown: down, pointermove: motion, pointerup: stop, pointercancel: stop, keydown: key,
+      dblclick: event => { if (!event.target.closest('button,a,input,select,textarea,[contenteditable]')) reset(); } };
+    for (const [name, listener] of Object.entries(events)) handle.addEventListener(name, listener);
+    const resize = new ResizeObserver(reposition); resize.observe(bar);
+    addEventListener('resize', reposition); window.visualViewport?.addEventListener('resize', reposition);
+    window.visualViewport?.addEventListener('scroll', reposition);
+    return { reposition, destroy() {
+      stop(); resize.disconnect();
+      for (const [name, listener] of Object.entries(events)) handle.removeEventListener(name, listener);
+      removeEventListener('resize', reposition); window.visualViewport?.removeEventListener('resize', reposition);
+      window.visualViewport?.removeEventListener('scroll', reposition);
+    } };
+  }
+
   function createTools(options = {}) {
     const css = document.createElement('style'); css.dataset.copyEditor = '';
-    css.textContent = `
+    css.textContent = (options.styles || '') + `
       [data-copy-highlight]{position:fixed;pointer-events:none;z-index:2147483646;outline:1.5px dashed var(--tungsten);outline-offset:3px;border-radius:var(--badge-radius);display:none}
       [data-copy-inline]{outline:2px solid var(--tungsten);outline-offset:3px;border-radius:var(--badge-radius);background:var(--hover);user-select:text;cursor:text}
       [data-copy-input]{position:fixed;z-index:2147483647;padding:2px 6px;border:0;border-radius:var(--badge-radius);outline:2px solid var(--tungsten);background:var(--ground);color:var(--ink)}
-      [data-copy-bar]>[role=status]{max-width:min(360px,calc(100vw - 64px));white-space:normal;overflow-wrap:anywhere}
-      [data-copy-bar][data-selection-dock]{bottom:max(16px,var(--selection-dock-space,0px))}
-      @media(max-width:600px){[data-copy-bar]>[role=status]{flex-basis:100%;text-align:center}}
+      [data-copy-state]{box-sizing:content-box;width:5em;flex:none;padding:0 8px;white-space:nowrap;text-align:center;overflow:hidden;text-overflow:ellipsis}
+      [data-copy-feedback]{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+      [data-copy-drag]{cursor:grab!important;touch-action:none;user-select:none}[data-copy-drag][data-dragging]{cursor:grabbing!important}
+      [data-copy-bar][data-selection-dock]{top:auto;right:auto;margin:0;bottom:max(16px,env(safe-area-inset-bottom),var(--selection-dock-space,0px),var(--copy-toolbar-clearance,0px))}
+      @media(max-width:600px){[data-copy-state]{flex-basis:100%;text-align:center}}
       [data-copy-choice]{position:fixed;z-index:2147483647;background:var(--ground);color:var(--ink);border:1px solid var(--border-15);border-radius:var(--control-radius);padding:8px;max-width:calc(100vw - 32px)}
     `;
     document.head.append(css);
@@ -95,28 +157,68 @@
     const host = document.createElement('div'); host.className = 'peach-react'; host.dataset.copyEditor = ''; host.dataset.batchScope = '';
     for (const type of ['pointerdown', 'click']) host.addEventListener(type, event => event.stopPropagation());
     const bar = document.createElement('div'); bar.dataset.copyEditor = ''; bar.dataset.copyBar = '';
+    bar.popover = 'manual'; bar.tabIndex = 0;
     bar.dataset.selectionDock = ''; bar.dataset.glassPane = ''; bar.setAttribute('role', 'group'); bar.setAttribute('aria-label', '文案编辑');
     const hint = document.createElement('span'); hint.id = 'peach-copy-hint'; hint.hidden = true;
     hint.textContent = '点击文字修改，回车或点别处保存，Esc 取消；暂停编辑后可操作页面。';
     bar.setAttribute('aria-describedby', hint.id);
-    const status = document.createElement('span'); status.setAttribute('role', 'status'); status.textContent = '编辑文案'; bar.append(status);
-    const say = text => { status.textContent = text; };
+    const state = document.createElement('span'); state.dataset.copyState = ''; state.textContent = '改字模式'; bar.append(state);
+    const status = document.createElement('span'); status.dataset.copyFeedback = ''; status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
+    const say = (text, tone = '') => {
+      status.textContent = text; state.title = text || '';
+      state.textContent = tone === 'err' ? '保存失败' : text?.includes('Enter 保存') ? '正在编辑'
+        : text?.startsWith('已保存') ? '已保存' : text === '已取消' ? '已取消'
+        : text?.includes('…') ? '处理中' : active ? '改字模式' : '编辑已暂停';
+    };
     const button = (text, action) => {
       const node = document.createElement('button'); node.type = 'button'; node.textContent = text;
       node.onclick = action; bar.append(node); return node;
     };
     let active = true, busy = false, recovery = null, choice = null;
+    const toolbarDrag = attachToolbarDrag(bar);
     const toggle = button('暂停编辑', () => {
       if (busy) return;
-      active = !active; options.onToggle?.(active); toggle.textContent = active ? '暂停编辑' : '继续编辑';
+      active = !active; options.onToggle?.(active); toggle.textContent = active ? '暂停编辑' : '继续编辑'; say('');
     });
     button('导出修改', () => options.onExport?.());
     button('退出编辑', () => { if (!busy) options.onExit?.(); });
-    host.append(hint, bar);
-    const modalHost = () => [...document.querySelectorAll('dialog:modal')].at(-1) || document.body;
+    bar.append(status); host.append(hint, bar);
+    const localStyles = new Map();
+    const shadowObservers = new Map();
+    let footer = null, toolsParent = null;
+    const measureTools = () => {
+      bar.style.setProperty('--copy-toolbar-clearance', `${footer ? innerHeight - footer.getBoundingClientRect().top + 12 : 0}px`);
+      toolbarDrag.reposition();
+    };
+    const layout = new ResizeObserver(measureTools); layout.observe(bar);
+    const modalHost = () => [...document.querySelectorAll('dialog:modal'), ...[...document.querySelectorAll('aside')].flatMap(node => [...node.shadowRoot?.querySelectorAll('dialog:modal') || []])].at(-1) || document.body;
     function placeTools() {
+      for (const aside of document.querySelectorAll('aside')) {
+        const root = aside.shadowRoot;
+        if (root && !shadowObservers.has(root)) {
+          const observer = new MutationObserver(placeTools);
+          observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['open'] });
+          shadowObservers.set(root, observer);
+        }
+      }
+      for (const [root, observer] of shadowObservers) if (!root.host.isConnected) { observer.disconnect(); shadowObservers.delete(root); }
       const parent = modalHost();
-      for (const node of [highlight, host, choice?.node]) if (node && node.parentElement !== parent) parent.append(node);
+      if (parent !== toolsParent) {
+        toolsParent?.removeEventListener('transitionend', measureTools);
+        toolsParent = parent; toolsParent.addEventListener('transitionend', measureTools);
+      }
+      const root = parent.getRootNode();
+      if (root instanceof ShadowRoot && !localStyles.has(root)) {
+        const style = css.cloneNode(true); root.append(style); localStyles.set(root, style);
+      }
+      for (const [root, style] of localStyles) if (!root.host.isConnected) { style.remove(); localStyles.delete(root); }
+      let moved = false;
+      for (const node of [highlight, host, choice?.node]) if (node && node.parentElement !== parent) { parent.append(node); moved = true; }
+      // 保持模态框内的可交互资格，工具条本身在顶层按整个视口定位，不受弹窗裁切。
+      if (!bar.matches(':popover-open')) bar.showPopover();
+      const nextFooter = parent.matches('dialog') ? parent.querySelector('footer,.footer') : null;
+      if (footer !== nextFooter) { if (footer) layout.unobserve(footer); footer = nextFooter; if (footer) layout.observe(footer); }
+      if (moved) measureTools();
     }
     const observer = new MutationObserver(placeTools);
     observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['open'] });
@@ -146,7 +248,13 @@
           document.addEventListener('keydown', cancel, true);
         });
       },
-      destroy() { observer.disconnect(); choice?.cancel(); highlight.remove(); host.remove(); css.remove(); },
+      destroy() {
+        observer.disconnect(); layout.disconnect(); toolbarDrag.destroy(); choice?.cancel();
+        for (const observer of shadowObservers.values()) observer.disconnect();
+        toolsParent?.removeEventListener('transitionend', measureTools);
+        for (const style of localStyles.values()) style.remove();
+        highlight.remove(); host.remove(); css.remove();
+      },
     };
   }
 
@@ -163,7 +271,8 @@
     const scroll = () => { hideHighlight(); positionInput(); };
     const rectsOf = node => { const range = document.createRange(); range.selectNodeContents(node); return [...range.getClientRects()]; };
     function textAt(x, y) {
-      const caret = document.caretPositionFromPoint?.(x, y), range = caret ? null : document.caretRangeFromPoint?.(x, y);
+      const shadowRoots = [...document.querySelectorAll('aside')].map(node => node.shadowRoot).filter(Boolean);
+      const caret = document.caretPositionFromPoint?.(x, y, { shadowRoots }), range = caret ? null : document.caretRangeFromPoint?.(x, y);
       const node = caret?.offsetNode || range?.startContainer;
       if (!node || node.nodeType !== 3 || !node.data.trim() || !node.parentElement || node.parentElement.closest(skip)) return null;
       return rectsOf(node).some(rect => x >= rect.left - 2 && x <= rect.right + 2 && y >= rect.top - 2 && y <= rect.bottom + 2) ? node : null;
@@ -307,5 +416,5 @@
       },
     };
   }
-  globalThis.PeachCopyEditorCore = Object.freeze({ version: 1, create, createTools, readJson, resolveDraft, applyDrafts, replaceTextParts });
+  globalThis.PeachCopyEditorCore = Object.freeze({ version: 1, create, createTools, attachToolbarDrag, readJson, resolveDraft, applyDrafts, replaceTextParts });
 })();

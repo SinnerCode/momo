@@ -32,6 +32,7 @@ const names = ['媒体库与入库', '来源与订阅', '下载渠道', '网络�
 function serve(config: ConfigurationData, credentials: CredentialData = { root: '', providers: [] }) {
   const fetcher = vi.fn(async (url: string) => ({ ok: true, status: 200, json: async () => {
     if (url === CONFIGURATION_URL) return config;
+    if (url === '/api/configuration/seed-sharing') return { enabled: false, available: false, schema: 1, last_attempt: {} };
     if (url === '/api/configuration/indexers') return { indexers: [], max_indexers: 4 };
     if (url === '/api/configuration/jav-browser') return { enabled: false, provider: '115', available: true,
       providers: [{ key: '115', label: '115', configured: true, target: '/115/Movies' }] };
@@ -123,6 +124,11 @@ it('挂载状态只跟随已保存路径，修改文件夹时撤下读数', asyn
   expect(row.querySelector('[data-mount="offline"]')?.textContent).toBe('离线');
   await type(row.querySelector<HTMLInputElement>('input[aria-label^="媒体目录 "]'), 'B:/Movies');
   expect(row.querySelector('[data-mount]')).toBeNull();
+});
+it('网盘检测超时的挂载（快照里是 null）显示未检测，不当离线', async () => {
+  const host = await open(data({ windows: true, media_sources: [{ location: '115', path: 'B:/', root: 'B:/', online: null }] }));
+  const badge = host.querySelector('[data-folder-row] [data-mount]');
+  expect([badge?.getAttribute('data-mount'), badge?.textContent]).toEqual(['unknown', '未检测']);
 });
 it('非 Windows 文件夹只展示媒体目录，提交时保留已有路径对应关系', async () => {
   const host = await open(data({ windows: false,

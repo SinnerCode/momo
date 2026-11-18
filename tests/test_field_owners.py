@@ -26,6 +26,7 @@ from peach.field_owners import (
     write_owned_fields,
 )
 from peach.migrations import upgrade
+from support.ledger import fresh_ledger
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
 
@@ -34,9 +35,7 @@ class FieldOwnerWriteTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        database = Path(self.tmp.name).resolve() / "ledger.db"
-        sqlite3.connect(database).close()
-        upgrade(database, MIGRATIONS)
+        database = fresh_ledger(self.tmp.name)
         self.connection = sqlite3.connect(database)
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)

@@ -23,7 +23,7 @@
  * `sidebar.css`，不用工具类。 */
 import {
   createContext, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore,
-  type DragEvent, type MouseEvent, type ReactNode,
+  type CSSProperties, type MouseEvent, type ReactNode,
 } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 
@@ -34,14 +34,18 @@ import { Icon } from '../settings-panel/icon';
 import type {
   SidebarApi, SidebarChip, SidebarContent, SidebarDot, SidebarFacets, SidebarHost, SidebarProps,
 } from './sidebar-api';
-import { moveSidebarKey, useCommitSidebarOrder } from './sidebar-order';
+import { useCommitNavigationOrder } from './sidebar-order';
+import { useSidebarReorder } from './use-sidebar-reorder';
+import { resetSidebarOrder } from '../../sidebar';
+import { NavigationOrderMenu } from '../components/navigation-order';
+import { t } from '../../i18n';
+import { SidebarWidth } from './sidebar-width';
+import { Duration } from './duration-filter';
 
 /* 首页那一项的键是空串；空串写进 dataTransfer 等于没写，给它一个占位。 */
 const HOME = '__home__';
 /* 「展开全部」之前每组先露多少条。 */
 const LIMITS = { creator: 26, tag: 30, tech: 16 } as const;
-/* 时长拉条的量程（分钟）：右端拉到头是「不限」。 */
-const DURATION_MAX = 180;
 
 let host: SidebarHost | null = null;
 /* store 里的一份：壳推来的 props 与导航按下态的代次（壳说「重读一遍」时加一，玻璃按新的按下项落位）。
@@ -53,7 +57,6 @@ function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   return () => { listeners.delete(listener) };
 }
-
 function notify(): void {
   for (const listener of [...listeners]) listener();
 }
@@ -85,6 +88,7 @@ function Sidebar({ host: at, props: view, epoch }: { host: SidebarHost; props: S
   return (
     <>
       <div data-sidebar-head="" />
+      {at.scroll.parentElement ? <SidebarWidth drawer={at.scroll.parentElement} /> : null}
       <Navigation host={at} epoch={epoch} version={version} />
       {view.content ? <Groups host={at} content={view.content} filters={view.filters} latest={view.latest} /> : null}
     </>
@@ -94,7 +98,7 @@ function Sidebar({ host: at, props: view, epoch }: { host: SidebarHost; props: S
 /* ── 导航 ── */
 
 function Navigation({ host: at, epoch, version }: { host: SidebarHost; epoch: number; version: number }) {
-  const commit = useCommitSidebarOrder(at.store);
+  const commit = useCommitNavigationOrder(at.store);
   const order = at.store.value.sidebarOrder;
   const byKey = new Map(at.navCatalog.map((item) => [item[0], item]));
   const items = order.map((key) => byKey.get(key)).filter((item) => item !== undefined);
@@ -120,48 +124,33 @@ function Navigation({ host: at, epoch, version }: { host: SidebarHost; epoch: nu
     return () => { resize.disconnect(); cancelAnimationFrame(frame); document.removeEventListener('board:sidebar', later) };
   }, [at, sync]);
 
-  const [dragging, setDragging] = useState<string | null>(null);
-  const [drop, setDrop] = useState<{ key: string; after: boolean } | null>(null);
-  const clearDrag = () => { setDragging(null); setDrop(null) };
-  const drag = (key: string) => ({
-    draggable: true,
-    onDragStart: (event: DragEvent<HTMLButtonElement>) => {
-      setDragging(key);
-      event.dataTransfer.effectAllowed = 'move';
-      event.dataTransfer.setData('text/plain', key || HOME);
-    },
-    onDragOver: (event: DragEvent<HTMLButtonElement>) => {
-      if (dragging === null || dragging === key) return;
-      event.preventDefault();
-      event.dataTransfer.dropEffect = 'move';
-      const after = event.clientY > event.currentTarget.getBoundingClientRect().top + event.currentTarget.offsetHeight / 2;
-      if (drop?.key !== key || drop.after !== after) setDrop({ key, after });
-    },
-    onDrop: (event: DragEvent<HTMLButtonElement>) => {
-      event.preventDefault();
-      const from = dragging, after = drop?.key === key ? drop.after : false;
-      clearDrag();
-      const next = from === null ? null : moveSidebarKey(order, from, key, after);
-      if (next) commit(next);
-    },
-    onDragEnd: clearDrag,
-  });
+  const reorder = useSidebarReorder(column, order, commit, () => requestAnimationFrame(sync));
 
   const drawer = at.scroll.parentElement;
   return (
     <>
-      <div data-sidebar-nav="" ref={column} onPointerLeave={glide.leave}>
-        {items.map(([key, label, glyph], index) => (
+      <div data-sidebar-nav="" ref={column} onPointerLeave={glide.leave}
+        data-reordering={reorder.picked ? '' : undefined} onClickCapture={reorder.clickCapture}>
+        {items.map(([key, label, glyph], index) => {
+          const nudge = reorder.nudge(key);
+          return (
           <button type="button" key={key || HOME} data-nav={key} aria-pressed={pressed[index]} aria-label={label}
-            data-dragging={dragging === key ? '' : undefined}
-            data-drop={drop?.key === key ? (drop.after ? 'after' : 'before') : undefined}
-            onClick={() => at.navTo(key)} onPointerEnter={glide.hover} {...drag(key)}>
+            data-dragging={reorder.picked?.key === key ? '' : undefined}
+            aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+            style={{ '--sidebar-picked-top': reorder.picked?.key === key ? `${reorder.picked.offset}px` : undefined,
+              '--sidebar-nudge': `${nudge.distance}px`, '--sidebar-delay': `${nudge.delay}ms` } as CSSProperties}
+            onClick={() => at.navTo(key)} onDoubleClick={() => at.navToTop()} onPointerEnter={glide.hover}
+            {...reorder.bindings(key)}>
             {key === '' ? <img data-sidebar-home-logo="" src="/peach-logo-64.png"
               srcSet="/peach-logo-64.png 64w, /peach-logo-128.png 128w" sizes="24px" width={24} height={24} alt=""
-              decoding="async" /> : <Icon name={glyph} />}
+              decoding="async" draggable={false} /> : <Icon name={glyph} />}
             <span>{label}</span>
           </button>
-        ))}
+        )})}
+        {reorder.hint ? <span data-sidebar-drop-line="" aria-hidden="true"
+          style={{ '--sidebar-line-top': `${reorder.linePosition}px` } as CSSProperties}><span /></span> : null}
+        <NavigationOrderMenu order={{ label: t('navigation:navigationGroups.sidebar'), keys: order, defaults: resetSidebarOrder(order), commit }} />
+        <span role="status" aria-live="polite" data-sidebar-order-status="">{reorder.announcement}</span>
       </div>
       {drawer ? createPortal(<span data-sidebar-glide="" aria-hidden="true" ref={pane} />, drawer) : null}
     </>
@@ -232,19 +221,19 @@ function catalogGroups(
     };
   };
   return [
-    spec('来源', 'src', facets.locations, 'loc', true),
+    spec(t('navigation:sidebarFilters.storage'), 'src', facets.locations, 'loc', true),
     facets.duration
-      ? { title: '时长', kind: 'meta', active: false, body: <Duration host={at} filters={filters} /> }
+      ? { title: t('navigation:sidebarFilters.duration'), kind: 'meta', active: false, body: <Duration host={at} filters={filters} /> }
       : null,
     /* 产地紧挨着来源：两者回答的都是「这批片打哪来」，一个说存储，一个说发行体系。可多选。 */
-    spec('产地', 'general', facets.regions, 'region', true),
-    spec('发行年份', 'meta', facets.years || [], 'year', true),
-    spec('画幅', 'meta', facets.orientations, 'orient', false),
-    spec('创作者', 'artist', facets.creators, 'creator', false, 'creator'),
-    spec('内容标签', 'general', facets.tags, 'tag', false, 'tag'),
-    spec('影片属性', 'meta', facets.tech, 'tag', false, 'tech'),
+    spec(t('navigation:sidebarFilters.region'), 'general', facets.regions, 'region', true),
+    spec(t('navigation:sidebarFilters.releaseYear'), 'meta', facets.years || [], 'year', true),
+    spec(t('navigation:sidebarFilters.orientation'), 'meta', facets.orientations, 'orient', false),
+    spec(t('navigation:favoritesTabs.creators'), 'artist', facets.creators, 'creator', false, 'creator'),
+    spec(t('navigation:sidebarFilters.contentTags'), 'general', facets.tags, 'tag', false, 'tag'),
+    spec(t('navigation:sidebarFilters.videoProperties'), 'meta', facets.tech, 'tag', false, 'tech'),
     facets.followTags.length ? {
-      title: '关注标签', kind: 'online', active: false,
+      title: t('navigation:sidebarFilters.followingTags'), kind: 'online', active: false,
       body: <FollowChips rows={facets.followTags} host={at} selected={null} badges />,
     } : null,
   ];
@@ -260,15 +249,15 @@ function followGroups(
   const selected = new Set(content.selected);
   return [
     providers.length ? {
-      title: '来源', kind: 'src', active: providers.some((row) => provider.includes(row.value)),
+      title: t('navigation:sidebarFilters.storage'), kind: 'src', active: providers.some((row) => provider.includes(row.value)),
       body: <ChipList rows={providers} filterKey="provider" multi={false} selected={provider} counts={null} host={at}
         onToggle={(_key, value) => at.selectFollowProvider(value)} />,
     } : null,
     content.duration
-      ? { title: '时长', kind: 'meta', active: false, body: <Duration host={at} filters={filters} commit={at.setFollowDuration} /> }
+      ? { title: t('navigation:sidebarFilters.duration'), kind: 'meta', active: false, body: <Duration host={at} filters={filters} commit={at.setFollowDuration} /> }
       : null,
     content.tags.length ? {
-      title: '内容标签', kind: 'online', active: content.tags.some((row) => selected.has(row.value)),
+      title: t('navigation:sidebarFilters.contentTags'), kind: 'online', active: content.tags.some((row) => selected.has(row.value)),
       body: <FollowChips rows={content.tags} host={at} selected={selected} badges={false} />,
     } : null,
   ];
@@ -412,7 +401,7 @@ function MoreList({ epoch, title, rows, latest, limit, filterKey, selected, coun
         counts={counts} host={at} />
       {expandable && rows.length > limit
         ? <button type="button" ref={button} data-sidebar-more={filterKey} aria-expanded={expanded}
-            aria-label={`${expanded ? '收起' : '展开全部'}${title}`} onClick={more}><Icon name="chevron-down" /></button>
+            aria-label={t(expanded ? 'navigation:sidebarFilters.collapseGroup' : 'navigation:sidebarFilters.expandGroup', { title })} onClick={more}><Icon name="chevron-down" /></button>
         : null}
     </>
   );
@@ -433,90 +422,6 @@ function FollowChips({ rows, host: at, selected, badges }: {
           </span>
         </button>
       ))}
-    </div>
-  );
-}
-
-/* ── 时长 ──
-   时长只有一处读数：手柄上方那枚气泡。另起一行写「不限 — 不限」是同一件事说第二遍，而且滑块不动时
-   它永远是那句话。两端都常显：这里是唯一报数的地方，藏起来的话不碰滑块就看不出当前筛的是哪一段。 */
-
-const minutesOf = (seconds: unknown, fallback: number) =>
-  seconds ? Math.min(DURATION_MAX, Number(seconds) / 60) : fallback;
-
-function Duration({ host: at, filters, commit: onCommit = at.setDuration }: {
-  host: SidebarHost; filters: SidebarProps['filters'];
-  /** 松手时回给谁：缺省是目录筛选，关注页换成它自己的。 */
-  commit?: SidebarHost['setDuration'];
-}) {
-  const source = `${filters.dur_min ?? ''}:${filters.dur_max ?? ''}`;
-  const [seen, setSeen] = useState(source);
-  const [range, setRange] = useState(() => [minutesOf(filters.dur_min, 0), minutesOf(filters.dur_max, DURATION_MAX)]);
-  /* 刚动过的那枚压在上面：两端拖到一起时它们会叠，底下那枚报的是自己停下的位置。 */
-  const [active, setActive] = useState<'min' | 'max'>('max');
-  if (seen !== source) {
-    setSeen(source);
-    setRange([minutesOf(filters.dur_min, 0), minutesOf(filters.dur_max, DURATION_MAX)]);
-  }
-  const [lo, hi] = range;
-  const group = useRef<HTMLDivElement | null>(null);
-  const minInput = useRef<HTMLInputElement | null>(null);
-  const maxInput = useRef<HTMLInputElement | null>(null);
-  const latest = useRef(range);
-  latest.current = range;
-
-  const move = (end: 'min' | 'max', value: number) => {
-    let [nextLo, nextHi] = end === 'min' ? [value, hi] : [lo, value];
-    if (nextLo > nextHi) { if (end === 'min') nextHi = nextLo; else nextLo = nextHi }
-    setActive(end);
-    setRange([nextLo, nextHi]);
-    return [nextLo, nextHi];
-  };
-
-  /* 拖动只改读数，松手（`change`）才提交：React 的 onChange 接的是每一步 input。 */
-  useEffect(() => {
-    const commit = () => onCommit(latest.current[0], latest.current[1]);
-    const inputs = [minInput.current, maxInput.current];
-    inputs.forEach((input) => input?.addEventListener('change', commit));
-    return () => inputs.forEach((input) => input?.removeEventListener('change', commit));
-  }, [onCommit]);
-
-  /* 已选那一截与两枚气泡的位置写在样式变量与 `left` 上。气泡对着手柄居中，伸出轨道的那一截按实测
-     溢出量收回来：侧栏只比轨道宽出一点点，越界的半截被侧栏裁掉，读数就只剩一半。量之前先把上一次的
-     位移清掉，否则量到的是已经收过一次的位置，越拖越偏。 */
-  useLayoutEffect(() => {
-    const node = group.current;
-    if (!node) return;
-    node.style.setProperty('--lo', `${lo / DURATION_MAX * 100}%`);
-    node.style.setProperty('--hi', `${hi / DURATION_MAX * 100}%`);
-    const bounds = node.getBoundingClientRect();
-    node.querySelectorAll<HTMLElement>('[data-sidebar-range-tip]').forEach((tip) => {
-      const value = tip.dataset.rangeEnd === 'max' ? hi : lo;
-      tip.style.left = `${value / DURATION_MAX * 100}%`;
-      tip.style.setProperty('--range-tip-shift', '0px');
-      const box = tip.getBoundingClientRect();
-      const shift = box.right > bounds.right ? bounds.right - box.right : box.left < bounds.left ? bounds.left - box.left : 0;
-      if (shift) tip.style.setProperty('--range-tip-shift', `${Math.round(shift)}px`);
-    });
-  }, [lo, hi]);
-
-  const tip = (end: 'min' | 'max', value: number) => (
-    <output data-sidebar-range-tip="" data-range-end={end} data-range-active={active === end ? '' : undefined} aria-hidden="true">
-      {end === 'max' && value >= DURATION_MAX ? '不限' : `${value} 分钟`}
-    </output>
-  );
-  return (
-    <div data-sidebar-duration="">
-      <div data-sidebar-range="" id="durationRange" ref={group}>
-        <span data-sidebar-range-base="" />
-        <span data-sidebar-range-fill="" />
-        <input id="durMin" type="range" min="0" max={DURATION_MAX} step="5" value={lo} aria-label="最短时长（分钟）"
-          ref={minInput} onChange={(event) => move('min', Number(event.currentTarget.value))} />
-        <input id="durMax" type="range" min="0" max={DURATION_MAX} step="5" value={hi} aria-label="最长时长（分钟）"
-          ref={maxInput} onChange={(event) => move('max', Number(event.currentTarget.value))} />
-        {tip('min', lo)}
-        {tip('max', hi)}
-      </div>
     </div>
   );
 }

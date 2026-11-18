@@ -5,6 +5,7 @@ import type { QueryKey } from '@tanstack/react-query';
 import { apiGet } from '../../api';
 import { queryClient } from '../query';
 import { fetchItem, itemKey, type DetailEntityRef, type DetailItem } from '../item-detail/item-detail';
+import { joinList, t } from '../../i18n';
 
 /** 片单里的一条（`/api/items` 的卡片那一份）。 */
 export interface ImmerseItem {
@@ -82,10 +83,10 @@ export interface Owner {
 export function ownerOf(item: Pick<DetailItem, 'performers' | 'creator' | 'entity_refs'>): Owner {
   const cast = item.performers || [];
   const who = cast.length
-    ? cast.slice(0, 3).join('、') + (cast.length > 3 ? ` 等 ${cast.length} 人` : '')
-    : (item.creator || '未归属');
+    ? joinList(cast.slice(0, 3)) + (cast.length > 3 ? t('catalog:immerse.castMore', { count: cast.length - 3, total: cast.length }) : '')
+    : (item.creator || t('catalog:shared.uncredited'));
   const kind = cast.length ? 'performer' : (item.creator ? 'creator' : '');
-  const name = cast.length ? cast[0]! : (item.creator || '未归属');
+  const name = cast.length ? cast[0]! : (item.creator || t('catalog:shared.uncredited'));
   const ref = kind ? (item.entity_refs?.[kind]?.[0] || null) : null;
   return { who, kind, name, ref };
 }
@@ -132,3 +133,28 @@ export const DISLIKE_ADVANCE_MS = 260;
 export const SLIDE_MS = 210;
 /** 等一格可以出画的上限。 */
 export const READY_TIMEOUT_MS = 15_000;
+/** 按住不动满这么久进长按倍速（与舞台的触屏、鼠标长按同一个时长）。 */
+export const HOLD_MS = 500;
+
+/* ── 横置（全屏 + 横版 + 竖屏视口，内容层转 -90°）后的手势坐标（#585） ── */
+
+/** 指针位移换算回内容坐标系：不转时原样；横置后内容水平 = −ΔclientY、内容垂直 = ΔclientX。 */
+export function swipeDelta(dx: number, dy: number, rotated: boolean): { x: number; y: number } {
+  return rotated ? { x: -dy, y: dx } : { x: dx, y: dy };
+}
+
+/** 横划换算全程用的画面宽；横置后画面宽是视口高。 */
+export const swipeSpan = (rotated: boolean): number => (rotated ? window.innerHeight : window.innerWidth);
+
+/** 点按落在哪半区（−1 左、1 右）：横置后屏幕下半是内容的左半。 */
+export function tapSide(clientX: number, clientY: number, rotated: boolean): number {
+  return rotated ? (clientY > window.innerHeight / 2 ? -1 : 1) : (clientX < window.innerWidth / 2 ? -1 : 1);
+}
+
+/** 进度条落点比例（0..1）：横置后条在屏幕上是竖的，内容 x 从条的下端往上走。 */
+export function scrubRatio(clientX: number, clientY: number,
+  box: { left: number; top: number; width: number; height: number }, rotated: boolean): number {
+  const at = rotated ? box.top + box.height - clientY : clientX - box.left;
+  const span = rotated ? box.height : box.width;
+  return span > 0 ? Math.min(1, Math.max(0, at / span)) : 0;
+}

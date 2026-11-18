@@ -1,8 +1,8 @@
-/* 首页筛选栏的两份聚合（`src/catalog-bars.ts`）：键、回退、30 秒复用、口径变了重取、刷新强制重取、续页。 */
+/* 首页筛选栏的两份聚合（`src/catalog-bars.ts`）：键、回退、标签页内复用、口径变了重取、刷新强制重取、续页。 */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
 import {
-  BARS_STALE_MS, dropBars, facetsKey, fetchBars, fetchTopsPage, loadTops, topsKey, topsPageKey,
+  dropBars, facetsKey, fetchBars, fetchTopsPage, loadTops, topsKey, topsPageKey,
 } from '../src/catalog-bars';
 import { queryClient } from '../src/query';
 
@@ -51,13 +51,13 @@ it('没有状态页参数、或者收窄后仍有人时不回退', async () => {
   expect(full.urls()).toEqual(['/api/tops?n=60&state=flagged']);
 });
 
-it('同一份口径 30 秒内复用，过了 30 秒重取', async () => {
+it('同一份口径跨长时间往返复用，主动刷新后重取', async () => {
   const net = serve(answer(FULL));
   await fetchBars('', 'n=60&seed=s');
-  vi.setSystemTime(BARS_STALE_MS - 1);
+  vi.setSystemTime(24 * 60 * 60 * 1000);
   await fetchBars('', 'n=60&seed=s');
   expect(net.urls()).toEqual(['/api/facets', '/api/tops?n=60&seed=s']);
-  vi.setSystemTime(BARS_STALE_MS + 1);
+  dropBars();
   await fetchBars('', 'n=60&seed=s');
   expect(net.fetcher).toHaveBeenCalledTimes(4);
 });
@@ -79,7 +79,7 @@ it('同时要同一份只发一次请求', async () => {
   expect(net.fetcher).toHaveBeenCalledTimes(2);
 });
 
-it('dropBars 之后 30 秒内也真的重取', async () => {
+it('dropBars 之后立即重取', async () => {
   const net = serve(answer(FULL));
   await fetchBars('', 'n=60&seed=s');
   dropBars();
@@ -111,7 +111,7 @@ it('两排同时翻到同一页只发一次请求，与第一页的键分开', a
   expect(topsPageKey('p')).not.toEqual(topsKey('p', ''));
 });
 
-it('续页 30 秒内复用，dropBars 之后重取，状态页空页照样退回全库口径', async () => {
+it('续页复用，dropBars 之后重取，状态页空页照样退回全库口径', async () => {
   const net = serve((url) => (url.includes('state=') ? EMPTY : FULL));
   await fetchTopsPage('n=60&page=2&state=flagged');
   await fetchTopsPage('n=60&page=2&state=flagged');

@@ -12,10 +12,18 @@ it('三类对象与队列兼容地址保留筛选和播放位置', () => {
     expect(overlayTarget('/assets/22', `?${key}=21&t=42`)).toEqual({ kind: 'queue', queue: key, key: 21, item: 22 });
   }
   expect(canonicalPath('/api/item?id=12')).toBe('/api/item?id=12');
+  expect(canonicalPath('/data-cleanup?edit#resource-sync')).toBe('/data-cleanup/resource-sync?edit');
+  expect(canonicalPath('/data-cleanup#libraryProcessing')).toBe('/data-cleanup#libraryProcessing');
   for (const [source, target] of [['activity', 'tasks'], ['scraping', 'sources'],
     ['follow-manage', 'subscriptions'], ['configuration', 'settings/library'], ['diagnostics', 'settings/diagnostics']]) {
     expect(canonicalPath(`/${source}?tab=x`)).toBe(`/${target}?tab=x`);
   }
+});
+
+it('关注管理的标签旧入口转向在线标签，并保留搜索与编辑状态', () => {
+  expect(canonicalPath('/subscriptions?tab=tags')).toBe('/tags?scope=online');
+  expect(canonicalPath('/follow-manage?tab=tags&page=2&sort=name&dir=asc&q=word&edit'))
+    .toBe('/tags?q=word&edit=&scope=online');
 });
 
 it('规范名优先于同名别名，歧义别名交给服务器解析', () => {

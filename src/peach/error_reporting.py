@@ -210,6 +210,30 @@ class ErrorHandler(logging.Handler):
             pass
 
 
+def _tidy_process_logs() -> None:
+    """正常退出时收走本进程没写进任何问题的日志（#485）：空的崩溃日志、只有启动记录的事件日志。
+
+    崩溃时解释器来不及跑 `atexit`，崩溃日志自然留下；写过事件的日志也留下。"""
+    global _fault_stream
+    if _fault_stream is not None:
+        try:
+            faulthandler.disable()
+            _fault_stream.close()
+        except (OSError, ValueError):
+            pass
+        _fault_stream = None
+    from .log_retention import idle_process_log
+    with _write_lock:
+        for directory in log_directories():
+            for name in (f"crash-{os.getpid()}.log", f"errors-{os.getpid()}.log"):
+                path = directory / name
+                if idle_process_log(path):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+
+
 def install(log_dir: Path | None = None) -> None:
     global _hooks_installed, _log_dir, _fault_stream
     if log_dir is not None:
@@ -250,6 +274,8 @@ def install(log_dir: Path | None = None) -> None:
                 _fault_stream.close()
                 _fault_stream = None
     event("entry")
+    import atexit
+    atexit.register(_tidy_process_logs)
     try:
         from . import remote_reporting
         remote_reporting.usage()
@@ -266,14 +292,22 @@ def console_ready() -> None:
 
 
 def failure_details(stage: str, error: BaseException) -> str:
+    """托盘弹窗与通知里的一段：异常本身加诊断报告或错误日志的位置，跟本机语言（`tray.failure.*`）。"""
+    from . import interface_text
+    from .user_messages import UserFacingError
+    language = interface_text.local_language()
+    shown = (interface_text.text(f"server:{error.code}", error.params, language)
+             if isinstance(error, UserFacingError) else str(error))
     path = event(stage, error)
     try:
         from .support_bundle import save_bundle
         report = save_bundle()
-        return f"{error}\n\n诊断报告：{report}"
+        return interface_text.text("server:tray.failure.report", {"error": shown, "path": report}, language)
     except Exception as report_error:
         event("report-failed", report_error)
-        return f"{error}\n\n错误日志：{path}" if path else f"{error}\n\n错误日志未能写入，请保留此弹窗。"
+        if path:
+            return interface_text.text("server:tray.failure.log", {"error": shown, "path": path}, language)
+        return interface_text.text("server:tray.failure.noLog", {"error": shown}, language)
 
 
 def tray_main() -> int:
@@ -285,13 +319,17 @@ def tray_main() -> int:
         message = failure_details("tray-import", error)
         if os.name == "nt":
             import ctypes
-            ctypes.windll.user32.MessageBoxW(None, message, "Peach 启动失败", 0x10)
+            from . import interface_text
+            title = interface_text.text("server:tray.title.startFailed", None, interface_text.local_language())
+            ctypes.windll.user32.MessageBoxW(None, message, title, 0x10)
         elif sys.stderr is not None:
             print(message, file=sys.stderr)
         return 1
 
 
 def cli_main() -> int:
+    from .docker_entrypoint import drop_root_for_cli
+    drop_root_for_cli()
     install()
     try:
         from .cli import main
@@ -328,10 +366,14 @@ def _asyncio_fields(context) -> dict:
     return fields
 
 
+#: 清理回调里 `shutdown` 会报的 Winsock 错误：10054 对端已重置连接，10022 套接字已失效（WSAEINVAL）。
+_CLEANUP_WINERRORS = frozenset({10054, 10022})
+
+
 def is_asyncio_connection_cleanup(error, fields) -> bool:
-    """识别 Winsock 重置连接时、纯标准库清理回调中的异常。"""
+    """识别对端断开后、纯标准库清理回调中 `shutdown` 抛出的 Winsock 异常。"""
     callback = "asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost"
-    if (not isinstance(error, ConnectionResetError) or getattr(error, "winerror", None) != 10054
+    if (not isinstance(error, OSError) or getattr(error, "winerror", None) not in _CLEANUP_WINERRORS
             or fields.get("asyncio_callback") != callback
             or error.__cause__ is not None or error.__context__ is not None):
         return False
@@ -362,8 +404,98 @@ def _finish_asyncio_connection_cleanup(context) -> bool:
     return True
 
 
-def asyncio_handler(loop, context) -> None:
+def is_asyncio_accept_abort(error, context) -> bool:
+    """识别客户端在 AcceptEx 完成前断开（WinError 64，ERROR_NETNAME_DELETED）的 accept 失败。
+
+    这是对端行为，不是 Peach 故障；但 CPython 3.14 的 Proactor `_start_serving` 在处理器
+    返回后会关掉监听套接字，这之后该端口不再接受连接，由 `_listen_again` 按原地址重新监听。
+    """
+    return (context.get("message") == "Accept failed on a socket"
+            and isinstance(error, OSError) and getattr(error, "winerror", None) == 64
+            and context.get("socket") is not None)
+
+
+#: 重新监听前的等待秒数。刚关的监听套接字没有 TIME_WAIT，正常第一次就能绑上。
+_REARM_DELAYS = (0, 0.5, 2)
+#: 在途的重新监听任务；事件循环只弱引用任务。
+_rearm_tasks = set()
+
+
+def _rearm_listener(loop, uvicorn_server, listener) -> bool:
+    """标准库关掉 `listener` 之后，替 uvicorn 补上一份同地址的监听。
+
+    这时标准库还没关它，fileno 仍能和 uvicorn 手里的 `asyncio.Server` 对上。
+    """
+    if not any(sock.fileno() == listener.fileno()
+               for server in getattr(uvicorn_server, "servers", ()) for sock in server.sockets):
+        return False
+    task = loop.create_task(_listen_again(uvicorn_server, listener.getsockname(), listener.family,
+                                          dualstack=_dualstack(listener)))
+    _rearm_tasks.add(task)
+    task.add_done_callback(_rearm_tasks.discard)
+    return True
+
+
+def _dualstack(listener) -> bool:
+    """`listening.bind` 的 `::` 套接字关着 `IPV6_V6ONLY`，IPv4 连接也从它进来；重新监听要照样关。"""
+    import socket
+    if listener.family != socket.AF_INET6:
+        return False
+    try:
+        return listener.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 0
+    except OSError:
+        return False
+
+
+async def _listen_again(uvicorn_server, address, family, *, dualstack=False) -> None:
+    """任务排在处理器所在回调之后执行，此时旧监听已关。绑不上就让服务退出，交给托盘重拉。
+
+    旧的 `asyncio.Server` 原样留着：主机名解析出多个地址时，它的其余监听还在服务；
+    里面那个已关的 socket 在停机 `close()` 时是空操作。
+    """
+    import asyncio
+    import socket
+    config = uvicorn_server.config
+
+    def create_protocol(_loop=None):
+        # 与 uvicorn `Server.startup` 里的工厂相同，新连接照样进 `server_state`，停机时一并收尾。
+        return config.http_protocol_class(config=config, server_state=uvicorn_server.server_state,
+                                          app_state=uvicorn_server.lifespan.state, _loop=_loop)
+
+    failure = None
+    for delay in _REARM_DELAYS:
+        await asyncio.sleep(delay)
+        if uvicorn_server.should_exit:
+            return
+        listener = None
+        try:
+            listener = socket.create_server(address, family=family, backlog=config.backlog,
+                                            dualstack_ipv6=dualstack)
+            server = await asyncio.get_running_loop().create_server(
+                create_protocol, sock=listener, ssl=config.ssl, backlog=config.backlog)
+        except OSError as error:
+            if listener is not None:
+                listener.close()
+            failure = error
+            continue
+        if uvicorn_server.should_exit:
+            # 停机已经遍历过 `servers`，这一份没人关。
+            server.close()
+        else:
+            uvicorn_server.servers.append(server)
+        return
+    event("unhandled-asyncio", failure, classification="accept-listener-lost")
+    uvicorn_server.should_exit = True
+
+
+def asyncio_handler(loop, context, *, uvicorn_server=None) -> None:
     error = context.get("exception")
+    if is_asyncio_accept_abort(error, context):
+        rearm = uvicorn_server is not None and _rearm_listener(loop, uvicorn_server, context["socket"])
+        # 默认处理器会经 asyncio 记录器写 ERROR 日志并远程上报，这里只留本机证据。
+        local_event("unhandled-asyncio", error, message=context.get("message", ""),
+                    classification="accept-aborted", listener_closed=True, listener_rearm=rearm)
+        return
     fields = _asyncio_fields(context)
     if is_asyncio_connection_cleanup(error, fields):
         fields["classification"] = "connection-cleanup"

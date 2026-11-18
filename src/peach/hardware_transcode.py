@@ -9,12 +9,16 @@ import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from .task_control import run as run_task_process
+from .user_messages import UserValueError
 
 logger = logging.getLogger(__name__)
 CUDA_DECODE_CODECS = frozenset({"h264", "hevc", "vp9", "av1"})
 VIDEOTOOLBOX_DECODE_CODECS = frozenset({"h264", "hevc", "av1", "prores"})
 #: D3D11VA 与 CUDA 同一份名单：名单外的编码（如 vc1）硬解出错时 FFmpeg 不报错，绿帧直接进缓存。
 D3D11_DECODE_CODECS = CUDA_DECODE_CODECS
+#: Linux 抽帧的 VAAPI 解码沿用同一份名单，理由同上。
+VAAPI_DECODE_CODECS = CUDA_DECODE_CODECS
 #: AMF 只认 AMD 显卡上的 D3D11 设备，混合显卡机器上默认序号常是别家，按序号逐个试。
 D3D11_ADAPTER_PROBES = 4
 BACKENDS = ("auto", "software", "nvenc", "amf", "qsv", "vaapi", "videotoolbox")
@@ -25,6 +29,75 @@ _WINDOWS_ENCODER_OUTPUT = {
             "-pix_fmt", "nv12"),
     "qsv": ("-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23", "-pix_fmt", "nv12"),
 }
+#: 设置页「画质上限」每一档的目标码率与峰值；原画（0）不缩放、不限码率，命令和没有这项设置时一样。
+QUALITY_BITRATES = {1080: ("6M", "8M"), 720: ("3M", "4M"), 480: ("1500k", "2M")}
+
+
+def scale_size(max_height: int) -> str:
+    """缩放滤镜的宽高参数：短边超过上限才缩到上限，长边按比例取偶数；短边本来就不超的原样不动。
+
+    按短边算，竖屏片子的「720p」也是宽 720。逗号在单引号里，滤镜图不会把它当成滤镜分隔。
+    """
+    return (f"w='if(gt(iw,ih),-2,min(iw,{max_height}))'"
+            f":h='if(gt(iw,ih),min(ih,{max_height}),-2)'")
+
+
+def rate_limit(max_height: int) -> tuple[str, ...]:
+    """在质量优先的码控上再压一个峰值码率，libx264 的 CRF 与 NVENC 的 CQ 都认。"""
+    if max_height not in QUALITY_BITRATES:
+        return ()
+    _target, peak = QUALITY_BITRATES[max_height]
+    return ("-maxrate", peak, "-bufsize", f"{int(peak[:-1]) * 2}{peak[-1]}")
+
+
+def software_video_output(max_height: int = 0, *, threads: str = "") -> tuple[str, ...]:
+    """libx264 的视频参数；整片与分片共用，只差分片多一个线程上限。"""
+    scale = ("-vf", f"scale={scale_size(max_height)}") if max_height in QUALITY_BITRATES else ()
+    return (*scale, "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", *rate_limit(max_height),
+            "-pix_fmt", "yuv420p", *(("-threads", threads) if threads else ()))
+
+
+def _capped_windows_output(backend: str, max_height: int) -> tuple[str, ...]:
+    """AMF 与 QSV 的恒定质量模式不认峰值码率，有上限时改成带峰值的 VBR，前面接软件缩放。"""
+    target, peak = QUALITY_BITRATES[max_height]
+    rate = ("-rc", "vbr_peak") if backend == "amf" else ()
+    encoder = ("-c:v", "h264_amf", "-quality", "speed") if backend == "amf" else (
+        "-c:v", "h264_qsv", "-preset", "veryfast")
+    return ("-vf", f"scale={scale_size(max_height)}", *encoder, *rate, "-b:v", target, "-maxrate", peak,
+            "-pix_fmt", "nv12")
+
+
+#: 帧全程留在 Intel 显卡：D3D11VA 解码后映射成 QSV 帧，`vpp_qsv` 转 NV12（含 10 位）再编码。
+#: 按厂商号选卡，混合显卡机器不用试序号；解码池默认定长，AV1 不加余量会报 surface pool 用尽。
+_QSV_FULL_DEVICES = (
+    "-init_hw_device", "d3d11va=peach_d3d11:,vendor=0x8086",
+    "-init_hw_device", "qsv=peach_qsv@peach_d3d11", "-filter_hw_device", "peach_qsv",
+)
+_QSV_FULL_DECODE = (
+    *_QSV_FULL_DEVICES, "-hwaccel", "d3d11va", "-hwaccel_device", "peach_d3d11", "-hwaccel_output_format", "d3d11",
+    "-extra_hw_frames", "16",
+)
+_QSV_FULL_OUTPUT = ("-vf", "hwmap=derive_device=qsv,vpp_qsv=format=nv12", *_WINDOWS_ENCODER_OUTPUT["qsv"][:-2])
+
+
+def qsv_scale_size(max_height: int) -> str:
+    """`vpp_qsv` 的宽高参数，按短边缩到上限，口径同 `scale_size`。
+
+    `vpp_qsv` 只认 -1（保持比例），不认软件 `scale` 的 -2（取偶数），所以两边都写成显式的偶数式子。
+    """
+    short = f"min(ih,{max_height})"
+    narrow = f"min(iw,{max_height})"
+    return (f"w='if(gt(iw,ih),trunc(iw*{short}/ih/2)*2,trunc({narrow}/2)*2)'"
+            f":h='if(gt(iw,ih),trunc({short}/2)*2,trunc(ih*{narrow}/iw/2)*2)'")
+
+
+def _qsv_full_output(max_height: int) -> tuple[str, ...]:
+    """全硬件链的滤镜与编码参数。有画质上限时在 `vpp_qsv` 里缩放，码控与其余 QSV 路径一样改成带峰值的 VBR。"""
+    if max_height not in QUALITY_BITRATES:
+        return _QSV_FULL_OUTPUT
+    target, peak = QUALITY_BITRATES[max_height]
+    return ("-vf", f"hwmap=derive_device=qsv,vpp_qsv={qsv_scale_size(max_height)}:format=nv12",
+            "-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", target, "-maxrate", peak)
 
 
 def videotoolbox_decode_options(codec: str) -> tuple[str, ...]:
@@ -39,21 +112,33 @@ def d3d11va_decode_options(codec: str, device: str = "") -> tuple[str, ...]:
     return ("-hwaccel", "d3d11va", *(("-hwaccel_device", device) if device else ()))
 
 
+def vaapi_devices(configured: str = "") -> list[str]:
+    """`PEACH_VAAPI_DEVICE` 指定了就只用它，否则按序号列出本机的 DRM 渲染节点。"""
+    return [configured] if configured else sorted(p.as_posix() for p in Path("/dev/dri").glob("renderD*"))
+
+
+def vaapi_decode_options(codec: str, device: str) -> tuple[str, ...]:
+    """Linux 显卡解码。同 D3D11VA，不指定输出格式，解出的帧回到内存交给缩放与 JPEG 编码。"""
+    if codec not in VAAPI_DECODE_CODECS:
+        return ()
+    return ("-hwaccel", "vaapi", "-hwaccel_device", device)
+
+
 def _run_probe(ffmpeg: Path, label: str, arguments: tuple[str, ...]) -> bool:
     """跑一条只吃合成画面、输出丢弃的探测命令；失败记一条警告。"""
     command = (str(ffmpeg), "-hide_banner", "-loglevel", "error", "-nostdin", *arguments,
                "-f", "null", "-")
     try:
-        result = subprocess.run(
+        result = run_task_process(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, timeout=PROBE_TIMEOUT_SECONDS,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning("转码硬件探测失败 %s：%s", label, exc)
+        logger.warning("Transcode hardware probe failed %s: %s", label, exc)
         return False
     if result.returncode:
-        logger.warning("转码硬件探测失败 %s：%s", label,
+        logger.warning("Transcode hardware probe failed %s: %s", label,
                        result.stderr.decode("utf-8", "replace")[-1000:])
     return result.returncode == 0
 
@@ -62,6 +147,15 @@ def _run_probe(ffmpeg: Path, label: str, arguments: tuple[str, ...]) -> bool:
 def _d3d11va_ready(ffmpeg: str) -> bool:
     """这份 FFmpeg 在这台机器上建得出 D3D11 设备。没有显卡的虚拟机或远程桌面会失败。"""
     return _run_probe(Path(ffmpeg), "d3d11va", ("-init_hw_device", "d3d11va", *_SYNTHETIC_FRAME))
+
+
+@lru_cache(maxsize=8)
+def _vaapi_device(ffmpeg: str, configured: str) -> str:
+    """第一个这份 FFmpeg 建得出 VAAPI 设备的渲染节点；容器没映射 `/dev/dri` 时为空。"""
+    for device in vaapi_devices(configured):
+        if _run_probe(Path(ffmpeg), f"vaapi {device}", ("-init_hw_device", f"vaapi=va:{device}", *_SYNTHETIC_FRAME)):
+            return device
+    return ""
 
 
 @lru_cache(maxsize=128)
@@ -76,14 +170,18 @@ def _frame_codec(ffprobe: str, source: str, size: int, modified: int) -> str:
 def frame_decode_options(ffmpeg: str, source: str) -> tuple[str, ...]:
     """本机抽帧按文件世代复用编码探测，解码初始化失败由调用方回退。
 
-    Windows 只给名单内的编码开 D3D11VA，编码探测不到就软件解码。
+    Windows 与 Linux 只给名单内的编码开 D3D11VA／VAAPI，编码探测不到就软件解码。
     """
-    if sys.platform not in ("darwin", "win32") or not Path(ffmpeg).is_file():
+    linux = sys.platform.startswith("linux")
+    if not (linux or sys.platform in ("darwin", "win32")) or not Path(ffmpeg).is_file():
         return ()
     from .media_processing_policy import acceleration
     if acceleration(purpose="preview") == "software" or os.environ.get("PEACH_TRANSCODE_BACKEND") == "software":
         return ()
     if sys.platform == "win32" and not _d3d11va_ready(ffmpeg):
+        return ()
+    device = _vaapi_device(ffmpeg, os.environ.get("PEACH_VAAPI_DEVICE", "").strip()) if linux else ""
+    if linux and not device:
         return ()
     codec = ""
     ffprobe = Path(ffmpeg).with_name("ffprobe" + Path(ffmpeg).suffix)
@@ -96,6 +194,8 @@ def frame_decode_options(ffmpeg: str, source: str) -> tuple[str, ...]:
         pass
     if sys.platform == "win32":
         return d3d11va_decode_options(codec)
+    if linux:
+        return vaapi_decode_options(codec, device)
     return videotoolbox_decode_options(codec)
 
 
@@ -110,48 +210,72 @@ class HardwareAttempt:
 class HardwareEncoder:
     backend: str
     device: str = ""
+    #: QSV 整链探测通过：解码、缩放与编码都在 Intel 显卡上。
+    gpu_frames: bool = False
 
-    def attempts(self, codec: str) -> tuple[HardwareAttempt, ...]:
+    def attempts(self, codec: str, max_height: int = 0) -> tuple[HardwareAttempt, ...]:
         """依次尝试的命令片段；最后一项总是软件解码，探测靠它喂合成画面。
 
         `d3d11va` 只解码不编码，这里只给探测用的建设备命令，解码参数见
         `HardwareTranscoder.decode_options`。
+
+        `max_height` 是画质上限（`QUALITY_BITRATES` 的一档，0 为原画）：帧在显存里的路径
+        （CUDA、VAAPI）用各自的显卡缩放滤镜，其余解出的帧在内存里，接软件 `scale`；码率按档压峰值。
         """
+        capped = max_height in QUALITY_BITRATES
+        scale = f"scale={scale_size(max_height)}" if capped else ""
+        software_scale = ("-vf", scale) if capped else ()
         if self.backend == "d3d11va":
             return (HardwareAttempt("d3d11va", ("-init_hw_device", "d3d11va"), ()),)
         if self.backend in _WINDOWS_ENCODER_OUTPUT:
-            output = _WINDOWS_ENCODER_OUTPUT[self.backend]
+            output = (_capped_windows_output(self.backend, max_height) if capped
+                      else _WINDOWS_ENCODER_OUTPUT[self.backend])
             software_decode = HardwareAttempt(self.backend, (), output)
+            if self.backend == "qsv":
+                if codec not in D3D11_DECODE_CODECS:
+                    return (software_decode,)
+                fallback = (HardwareAttempt("d3d11va-qsv", d3d11va_decode_options(codec), output), software_decode)
+                if not self.gpu_frames:
+                    return fallback
+                return (HardwareAttempt("qsv-full", _QSV_FULL_DECODE, _qsv_full_output(max_height)), *fallback)
             decode = d3d11va_decode_options(codec, self.device) if self.device else ()
             if not decode:
                 return (software_decode,)
             return (HardwareAttempt(f"d3d11va-{self.backend}", decode, output), software_decode)
         if self.backend == "videotoolbox":
-            output = ("-c:v", "h264_videotoolbox", "-allow_sw", "0", "-b:v", "6M", "-pix_fmt", "yuv420p")
+            bitrate = QUALITY_BITRATES[max_height][0] if capped else "6M"
+            output = software_scale + ("-c:v", "h264_videotoolbox", "-allow_sw", "0", "-b:v", bitrate,
+                                       "-pix_fmt", "yuv420p")
             software_decode = HardwareAttempt("videotoolbox-encode", (), output)
             if codec not in VIDEOTOOLBOX_DECODE_CODECS:
                 return (software_decode,)
             return (HardwareAttempt("videotoolbox", videotoolbox_decode_options(codec), output), software_decode)
         if self.backend == "nvenc":
             output = ("-c:v", "h264_nvenc", "-preset", "p1", "-tune", "hq",
-                      "-rc", "vbr", "-cq", "21", "-b:v", "0")
-            software_decode = HardwareAttempt("nvenc", (), output + ("-pix_fmt", "yuv420p"))
+                      "-rc", "vbr", "-cq", "21", "-b:v", "0", *rate_limit(max_height))
+            software_decode = HardwareAttempt("nvenc", (), software_scale + output + ("-pix_fmt", "yuv420p"))
             if codec not in CUDA_DECODE_CODECS:
                 return (software_decode,)
+            cuda_scale = f"scale_cuda={scale_size(max_height)}:format=nv12" if capped else "scale_cuda=format=nv12"
             return (HardwareAttempt(
                 "cuda-nvenc", ("-hwaccel", "cuda", "-hwaccel_output_format", "cuda"),
-                ("-vf", "scale_cuda=format=nv12") + output,
+                ("-vf", cuda_scale) + output,
             ), software_decode)
         device = ("-vaapi_device", self.device)
-        output = ("-c:v", "h264_vaapi", "-qp", "21")
+        if capped:
+            target, peak = QUALITY_BITRATES[max_height]
+            output = ("-c:v", "h264_vaapi", "-rc_mode", "VBR", "-b:v", target, "-maxrate", peak)
+        else:
+            output = ("-c:v", "h264_vaapi", "-qp", "21")
+        vaapi_scale = f"scale_vaapi={scale_size(max_height)}:format=nv12" if capped else "scale_vaapi=format=nv12"
         return (
             HardwareAttempt(
                 "vaapi", device + ("-hwaccel", "vaapi", "-hwaccel_device", self.device,
                                     "-hwaccel_output_format", "vaapi"),
-                ("-vf", "scale_vaapi=format=nv12") + output,
+                ("-vf", vaapi_scale) + output,
             ),
             HardwareAttempt("vaapi-encode", device,
-                            ("-vf", "format=nv12,hwupload") + output),
+                            ("-vf", f"{scale + ',' if capped else ''}format=nv12,hwupload") + output),
         )
 
 
@@ -167,7 +291,7 @@ class HardwareTranscoder:
         self.state_root = state_root
         self.backend = os.environ.get("PEACH_TRANSCODE_BACKEND", "auto").strip().lower()
         if self.backend not in BACKENDS:
-            raise ValueError("PEACH_TRANSCODE_BACKEND 必须为 " + "、".join(BACKENDS))
+            raise UserValueError("errors.hardwareTranscode.backendInvalid", {"backends": list(BACKENDS)})
         self.device = os.environ.get("PEACH_VAAPI_DEVICE", "").strip()
         self._encoders: dict[Path, tuple[HardwareEncoder, ...]] = {}
         self._lock = threading.Lock()
@@ -187,8 +311,7 @@ class HardwareTranscoder:
         if windows:
             candidates.append(HardwareEncoder("d3d11va"))
         if self.backend == "vaapi" or (self.backend == "auto" and sys.platform.startswith("linux")):
-            devices = [self.device] if self.device else sorted(p.as_posix() for p in Path("/dev/dri").glob("renderD*"))
-            candidates.extend(HardwareEncoder("vaapi", device) for device in devices)
+            candidates.extend(HardwareEncoder("vaapi", device) for device in vaapi_devices(self.device))
         return tuple(candidates)
 
     def active(self) -> bool:
@@ -198,10 +321,23 @@ class HardwareTranscoder:
             return False
         return self.enabled and self.backend != "software"
 
+    def max_height(self) -> int:
+        """设置页「画质上限」，0 为原画。整片与分片共用这一个实例，每次现读，改设置不用重启。"""
+        from .media_processing_policy import playback_max_height
+        return playback_max_height(self.state_root) if self.state_root is not None else 0
+
     def diagnostic_snapshot(self) -> dict:
-        """读取当前硬件策略与已有探测结果，不启动新的硬件探测。"""
-        with self._lock:
+        """读取当前硬件策略与已有探测结果，不启动新的硬件探测，也不等正在跑的那次。
+
+        首次探测持锁逐个候选跑 ffmpeg（本机约 2 秒，每个候选最多 10 秒）；起播计划要记这份诊断，
+        等锁就是让播放陪着别人的探测等，所以拿不到锁就报「探测中」。"""
+        if not self._lock.acquire(blocking=False):
+            return {'backend': self.backend, 'enabled': self.active(),
+                    'probe_status': 'probing', 'available_backends': []}
+        try:
             results = [sorted({encoder.backend for encoder in encoders}) for encoders in self._encoders.values()]
+        finally:
+            self._lock.release()
         return {'backend': self.backend, 'enabled': self.active(),
                 'probe_status': 'cached' if results else 'not-probed', 'available_backends': results}
 
@@ -215,12 +351,14 @@ class HardwareTranscoder:
                     if self._probe(ffmpeg, encoder):
                         if encoder.backend == "amf":
                             encoder = self._amf_adapter(ffmpeg, encoder)
+                        elif encoder.backend == "qsv" and self._qsv_gpu_frames(ffmpeg):
+                            encoder = HardwareEncoder("qsv", gpu_frames=True)
                         available.append(encoder)
                         # 一个可用 VAAPI 节点足以服务这条链，避免重复尝试同类设备。
                         if encoder.backend == "vaapi":
                             break
                 self._encoders[ffmpeg] = tuple(available)
-                logger.info("转码硬件后端：%s", ", ".join(
+                logger.info("Transcode hardware backend: %s", ", ".join(
                     item.backend + (f" ({item.device})" if item.device else "")
                     for item in available) or "software")
             return self._encoders[ffmpeg]
@@ -247,6 +385,15 @@ class HardwareTranscoder:
                     *_SYNTHETIC_FRAME, "-vf", "format=nv12,hwupload", *output)):
                 return HardwareEncoder("amf", str(index))
         return encoder
+
+    @staticmethod
+    def _qsv_gpu_frames(ffmpeg: Path) -> bool:
+        """在 Intel 显卡上建得出 D3D11 派生的 QSV 设备。
+
+        Windows 服务与 SSH 所在的 Session 0 里会报 `MFX session: -9`，只剩解码回内存的写法可用。
+        """
+        return _run_probe(ffmpeg, "qsv d3d11va", (
+            *_QSV_FULL_DEVICES, *_SYNTHETIC_FRAME, *_WINDOWS_ENCODER_OUTPUT["qsv"]))
 
     @staticmethod
     def _probe(ffmpeg: Path, encoder: HardwareEncoder) -> bool:

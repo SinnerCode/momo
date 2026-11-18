@@ -3,7 +3,7 @@ import { QueryClientProvider, notifyManager, useQuery } from '@tanstack/react-qu
 import { afterEach, expect, it, vi } from 'vitest';
 
 import { createResultRefresher, ResultUpdates } from '../../src/react/result-updates';
-import { TASKS_KEY } from '../../src/react/activity/tasks';
+import { RESULT_UPDATES_KEY } from '../../src/react/activity/tasks';
 import { queryClient } from '../../src/react/query';
 import { mount, pending, settle } from './render';
 
@@ -20,9 +20,9 @@ it('未显示页面的后台预取继续读取，不阻塞当前页面的版本�
 });
 
 it('运行中的任务发布确认结果时更新列表，状态与凭据查询保持原值', async () => {
-  const data = { available: true, running: [{ id: 1, status: 'running' }], finished: [], skipped: [],
+  const data = { busy: true,
     result_versions: { follow: '1' } };
-  queryClient.setQueryData(TASKS_KEY, data);
+  queryClient.setQueryData(RESULT_UPDATES_KEY, data);
   queryClient.setQueryData(['follow-feed'], '首项');
   queryClient.setQueryData(['follow-manage', 'check'], 'running');
   queryClient.setQueryData(['follow-manage', 'credentials'], '凭据');
@@ -34,12 +34,12 @@ it('运行中的任务发布确认结果时更新列表，状态与凭据查询�
     const feed = useQuery({ queryKey: ['follow-feed'], queryFn: read });
     return <p>{feed.data}</p>;
   }
-  const host = await mount(<QueryClientProvider client={queryClient}><ResultUpdates /><Feed /></QueryClientProvider>);
+  const host = await mount(<QueryClientProvider client={queryClient}><ResultUpdates openItem={vi.fn()} /><Feed /></QueryClientProvider>);
   await settle();
   expect(read).not.toHaveBeenCalled();
   await act(async () => {
     current = '首项、次项';
-    queryClient.setQueryData(TASKS_KEY, { ...data, result_versions: { follow: '2' } });
+    queryClient.setQueryData(RESULT_UPDATES_KEY, { ...data, result_versions: { follow: '2' } });
   });
   await settle();
   expect(host.textContent).toBe('首项、次项');
@@ -95,4 +95,51 @@ it('缓慢读取期间的下一项结果排队刷新，不取消读取且不遗�
   await act(async () => { await completed!; });
   expect(reads).toBe(2);
   expect(host.textContent).toBe('最终标题');
+});
+
+it('入库通知：首轮只记基线；新到的逐部弹 toast 并可打开，一轮超过 3 部合成一条，服务重启后不补弹', async () => {
+  const toaster = await import('../../src/react/toaster');
+  const shown = vi.spyOn(toaster, 'showToast').mockImplementation(() => {});
+  const go = vi.fn();
+  const { announceIngests } = await import('../../src/react/result-updates');
+  const notice = (id: number, kind: 'download' | 'discovered' = 'download', label = `SSIS-${id}`) =>
+    ({ id, kind, asset_id: 100 + id, label, at: 0 });
+  let seen = announceIngests(null, { epoch: 'a', items: [notice(1), notice(2)] }, go);
+  expect(shown).not.toHaveBeenCalled();
+  seen = announceIngests(seen, { epoch: 'a', items: [notice(1), notice(2), notice(3), notice(4, 'discovered', '<b>x</b>')] }, go);
+  expect(shown.mock.calls.map(([, request]) => request.html)).toEqual(
+    ['「SSIS-3」已入库并整理完成', '新文件已入库：「&#60;b&#62;x&#60;/b&#62;」']);
+  shown.mock.calls[0]![1].action!.run(document.createElement('button'));
+  expect(go).toHaveBeenCalledWith(103);
+  shown.mockClear();
+  seen = announceIngests(seen, { epoch: 'a', items: [5, 6, 7, 8].map(id => notice(id)) }, go);
+  expect(shown.mock.calls.map(([, request]) => [request.html, request.action])).toEqual([['4 部作品已入库', null]]);
+  shown.mockClear();
+  announceIngests(seen, { epoch: 'b', items: [notice(1)] }, go);
+  expect(shown).not.toHaveBeenCalled();
+  shown.mockRestore();
+});
+
+it('设置里关掉入库通知时不弹，基线照样往前记；再打开只弹之后新到的', async () => {
+  const toaster = await import('../../src/react/toaster');
+  const shown = vi.spyOn(toaster, 'showToast').mockImplementation(() => {});
+  const { appSettingsStore } = await import('../../src/appearance/settings');
+  const settings = appSettingsStore();
+  const notice = (id: number) => ({ id, kind: 'download' as const, asset_id: 100 + id, label: `SSIS-${id}`, at: 0 });
+  const poll = (ids: number[]) => ({ result_versions: { catalog: '1' }, busy: false,
+    ingest_notices: { epoch: 'a', items: ids.map(notice) } });
+  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => poll([1]) })));
+  settings.value.ingestNotices = false;
+  try {
+    await mount(<QueryClientProvider client={queryClient}><ResultUpdates openItem={vi.fn()} /></QueryClientProvider>);
+    await settle();
+    await act(async () => { queryClient.setQueryData(RESULT_UPDATES_KEY, poll([1, 2])) });
+    expect(shown).not.toHaveBeenCalled();
+    settings.value.ingestNotices = true;
+    await act(async () => { queryClient.setQueryData(RESULT_UPDATES_KEY, poll([1, 2, 3])) });
+    expect(shown.mock.calls.map(([, request]) => request.html)).toEqual(['「SSIS-3」已入库并整理完成']);
+  } finally {
+    settings.value.ingestNotices = true;
+    shown.mockRestore();
+  }
 });

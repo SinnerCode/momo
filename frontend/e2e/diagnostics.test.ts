@@ -17,7 +17,7 @@ describe('配置中的系统诊断', () => {
             action: '检查媒体目录', target: '/settings/library', details: {} };
           report.library.groups.cover = { label: '缺封面', status: 'ok', count: 31, truncated: false,
             items: Array.from({ length: 31 }, (_, index) => ({ id: index + 1, code: null,
-              title: `演示条目 ${index + 1}`, name: `演示文件 ${index + 1}.mp4`,
+              title: index === 1 ? `演示条目 2 ${'很长的片名'.repeat(40)}` : `演示条目 ${index + 1}`, name: `演示文件 ${index + 1}.mp4`,
               path: `R:\\Media\\演示文件 ${index + 1}.mp4`, location: 'local', duration: 123, size: 1048576 })) };
           await route.fulfill({ json: report });
         });
@@ -37,6 +37,17 @@ describe('配置中的系统诊断', () => {
         assert.ok((await table.innerText()).includes('演示文件 1.mp4'));
         assert.ok((await table.innerText()).includes('R:\\Media\\演示文件 1.mp4'));
         await verifyColumnContentWidth(table, 'path', '[data-middle-truncate]');
+        // 长标题折到第二行截尾，全名在悬停提示里；媒体库格带图标。
+        const longTitle = table.locator('[data-health-title]').nth(1);
+        assert.ok((await longTitle.getAttribute('title'))?.endsWith('很长的片名'));
+        const clamp = await longTitle.evaluate(node => {
+          const text = node.querySelector('span > span')!;
+          return { height: text.getBoundingClientRect().height, line: parseFloat(getComputedStyle(text).lineHeight),
+            clipped: text.scrollHeight > text.clientHeight };
+        });
+        assert.ok(clamp.clipped, '长标题没有被截断');
+        assert.ok(clamp.height <= clamp.line * 2 + 1, `标题高 ${clamp.height}px，超过两行`);
+        assert.equal(await table.getByRole('row').nth(1).locator('[data-source-mark]').count(), 1);
         const pagination = page.getByRole('navigation', { name: '缺封面分页' });
         await pagination.getByRole('button', { name: '下一页', exact: true }).click();
         assert.equal(await table.getByRole('row').count(), 12);
@@ -78,20 +89,24 @@ describe('配置中的系统诊断', () => {
         const { page } = opened;
         await page.route('**/api/diagnostics', async route => { await gate; await route.continue(); });
         await page.goto(new URL('/settings/diagnostics', page.url()).href);
-        const skeleton = page.locator('[data-skeleton="board/settings/diagnostics"]');
+        const panel = page.locator('.ui-board-group-active');
+        const skeleton = panel.locator('[data-skeleton="diagnostics"]');
         await skeleton.waitFor();
-        assert.equal(await skeleton.locator('.ui-board-local-nav [aria-selected="true"]').textContent(), '系统诊断');
-        assert.equal(await skeleton.locator('section[aria-label="媒体库与目录"]').count(), 0);
-        assert.equal(await skeleton.locator('[data-skeleton="diagnostics"]').count(), 1);
-        const pending = await skeleton.locator('.ui-configpage').evaluate(element => {
-          const body = element.lastElementChild!.getBoundingClientRect();
-          return { x: body.x, width: body.width };
+        await page.getByRole('tab', { name: '系统诊断', selected: true }).waitFor();
+        assert.equal(await panel.locator('section[aria-label="媒体库与目录"]').count(), 0);
+        assert.equal(await skeleton.getAttribute('aria-busy'), 'true');
+        assert.equal(await panel.locator('article[data-diagnostic-source]').count(), 0);
+        const pending = await panel.evaluate(element => {
+          const body = element.getBoundingClientRect();
+          return { x: body.x, width: body.width, height: body.height };
         });
+        assert.ok(pending.width > 0 && pending.height > 0, `诊断分区等待态不可见：${JSON.stringify(pending)}`);
         release();
         await page.getByRole('tab', { name: '系统诊断', selected: true }).waitFor();
         await page.locator('article[data-diagnostic-source]').first().waitFor();
         await settle(page);
-        const ready = await page.locator('.ui-board-group-active').boundingBox();
+        await skeleton.waitFor({ state: 'detached' });
+        const ready = await panel.boundingBox();
         assert.ok(Math.abs(ready!.x - pending.x) <= 1, JSON.stringify({ pending, ready }));
         assert.ok(Math.abs(ready!.width - pending.width) <= 1, JSON.stringify({ pending, ready }));
         assert.deepEqual(opened.problems, []);

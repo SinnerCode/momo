@@ -75,3 +75,22 @@ class MediaBuildCacheTests(unittest.TestCase):
             self.assertNotEqual(first, cache.input_identity(root, "macos", "arm64", toolchain={"sdk": "two"}))
             (root / cache.INPUTS[0]).write_text("different source revision")
             self.assertNotEqual(first, cache.input_identity(root, "macos", "arm64", toolchain={"sdk": "one"}))
+
+    def test_actions_cache_identity_tracks_toolchain_and_source_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for name in cache.INPUTS:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("input")
+            first = cache.input_identity(root, "macos", "arm64", toolchain={"sdk": "one", "clang": "one"})
+            key = cache.github_cache_key(first)
+            reordered = cache.input_identity(root, "macos", "arm64", toolchain={"clang": "one", "sdk": "one"})
+            self.assertEqual(key, cache.github_cache_key(reordered))
+            for target, arch, tools in (("macos", "x86_64", first["toolchain"]),
+                                         ("macos", "arm64", {"sdk": "two", "clang": "one"}),
+                                         ("windows", "x86_64", first["toolchain"])):
+                with self.subTest(target=target, arch=arch, tools=tools):
+                    self.assertNotEqual(key, cache.github_cache_key(cache.input_identity(root, target, arch, toolchain=tools)))
+            (root / cache.INPUTS[0]).write_text("new source")
+            self.assertNotEqual(key, cache.github_cache_key(cache.input_identity(root, "macos", "arm64", toolchain=first["toolchain"])))

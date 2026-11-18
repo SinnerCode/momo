@@ -5,7 +5,8 @@
  * 守自己的宿主。页内状态都在这里：当前视图、名册还是作品、照片墙的种子与翻页；筛选与媒体视图读
  * 地址栏（壳推进来的 `filters`／`media`），改它们只调 `actions.route`。 */
 import { useInfiniteQuery, useMutation, useQuery } from '@tanstack/react-query';
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { appSettingsStore } from '@peach/appearance';
 import { createPortal } from 'react-dom';
 import { api } from '@peach/legacy/core';
 import { tagLabel } from '@peach/legacy/tags';
@@ -17,6 +18,8 @@ import { EntityFolderWorkspace } from '../catalog-folders/catalog-folders-page';
 import { errorMessage } from '../../api';
 import type { MediaCardLayout } from '../catalog-grid/types';
 import { EmptyState } from '../components/empty-state';
+import { runBulkAction } from '../components/bulk-action';
+import { deleteProfilesAction } from '../index/roster-actions';
 import { RetryNote } from '../components/grid-reveal';
 import { spriteGlyph } from '../components/sprite-glyph';
 import type { EntityBodyActions, EntityPhotos, EntityRoster } from '../entity-body/entity-body';
@@ -30,15 +33,31 @@ import type { EntityHeroActions, EntityHeroHelpers } from '../entity-hero/entity
 import { EntityHeroPage } from '../entity-hero/entity-hero-page';
 import { feedNewKey, feedNewOptions, postFeedAction } from '../feed-new/feed-new';
 import { queryClient } from '../query';
+import { pageNavigationReady, rememberPageState } from '../../history/page-navigation';
 import {
   EMPTY_MEDIA, codeSetsOf, entityKey, entityOptions, entityPhotosKey, fetchItems, itemsOptions,
-  photosOptions, tagList, tagPressed, type EntityPageData, type EntityPageProps, type PhotoPage,
+  mergeSides, photosOptions, tagList, tagPressed, type EntityAliasWriteResult, type EntityMergeResult,
+  type EntityPageData, type EntityPageProps, type PhotoPage,
 } from './entity-page';
+import { MergeDialog } from './merge-dialog';
+import { NameContributionDialog } from './name-contribution-dialog';
 import { useEntityOnline } from './use-entity-online';
+import { PENDING_REFETCH_MS, usePendingWorkRefetch } from '../components/pending-work';
+import { pollUntil } from '../../polling';
+import { t } from '../../i18n';
+import { codedText } from '../../core/server-text';
+
+/** 订上新作后等服务端那一轮拉取：几秒问一次，最多等两分钟。 */
+const FEED_CHECK_POLL_MS = 3000;
+const FEED_CHECK_LIMIT_MS = 120_000;
+
+/** 能两两合并的种类，与服务端 `web_entity.MERGE_KINDS` 一致；标签走标签管理里的合并。 */
+const MERGE_KINDS = new Set(['performer', 'studio', 'creator', 'series', 'agency']);
 
 export function EntityPage(props: EntityPageProps) {
   const { kind, name } = props;
   const entity = useQuery(entityOptions(kind, name));
+  usePendingWorkRefetch(entity.data?.pending_work, entityKey(kind, name));
   /* 名字对不上任何一位时 `/api/entity` 回 `{error}`：整块换成壳里那一屏空态，骨架不留着闪。空态是
      遗留层的标记，不放进 React 子树的样式范围。 */
   const missing = !!entity.data?.error;
@@ -72,10 +91,12 @@ const newSeed = () => String(((Date.now() ^ (Math.random() * 1e9 | 0)) >>> 0) % 
 
 /** 照片一屏的读数：本地图片与样张各数各的；只有样张时不写「0 张」。 */
 function photoReadout(page: PhotoPage, codeSets: number) {
-  return `照片 · ${[
-    page.total || !codeSets ? `${(page.total || 0).toLocaleString()} 张` : '',
-    codeSets ? `样张 ${(page.sample_total || 0).toLocaleString()} 张 · ${codeSets.toLocaleString()} 部作品` : '',
-  ].filter(Boolean).join(' · ')}`;
+  return [
+    t('catalog:entityFilter.photos'),
+    page.total || !codeSets ? t('catalog:entityPhotos.imageCount', { count: page.total || 0 }) : '',
+    codeSets ? t('catalog:entityPage.sampleCount', { count: page.sample_total || 0 }) : '',
+    codeSets ? t('catalog:entityPage.sampleWorks', { count: codeSets }) : '',
+  ].filter(Boolean).join(' · ');
 }
 
 function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
@@ -96,7 +117,7 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
      视频键不出，进页就落在在线。 */
   const followKey = kind === 'creator' ? entity.follow?.key || '' : '';
   const onlineOnly = !!followKey && !entity.asset_count;
-  const mediaNow = media.media === 'photos' && photosAvailable ? media
+  const mediaNow = media.media === 'photos' && (base.isPending || base.isError || basePage?.error || photosAvailable) ? media
     : (media.media === 'online' || onlineOnly) && followKey ? { media: 'online' as const, set: 0 } : EMPTY_MEDIA;
 
   /* 名册与媒体不共用地址栏：地址栏只认 `media`，名册是事务所页与片商页的默认视图，进页就在那里。
@@ -121,14 +142,36 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
      重建），重取到新数据还不够，得换键重建，新图地址里的版本才落得到页面上。 */
   const [avatarEpoch, setAvatarEpoch] = useState(0);
 
+  /* 资料还在补全时资料卡每隔几秒重取一次（`entityOptions` 的 `refetchInterval`）。每补完一项，头像、
+     作品署名与照片都可能换了：同换头像那样作废作品、照片与新作，换键重建，不用刷新页面。 */
+  const pendingCount = entity.pending_work?.length || 0;
+  const lastPending = useRef(pendingCount);
+  useEffect(() => {
+    const finished = pendingCount < lastPending.current;
+    lastPending.current = pendingCount;
+    if (!finished) return;
+    actions.avatarChanged();
+    setAvatarEpoch((epoch) => epoch + 1);
+    void queryClient.invalidateQueries({ queryKey: ['entity-items', kind, name] });
+    void queryClient.invalidateQueries({ queryKey: ['entity-photos', kind, name] });
+    if (entityId) void queryClient.invalidateQueries({ queryKey: feedNewKey(entityId) });
+    if (pendingCount) return;
+    /* 全部补完、轮询停下之后再取一次：最后一项结算与它顺手写进的别名、外链可能差一两秒才落地。 */
+    const settle = window.setTimeout(() => {
+      void queryClient.invalidateQueries({ queryKey: entityKey(kind, name) });
+    }, PENDING_REFETCH_MS);
+    return () => window.clearTimeout(settle);
+  }, [actions, entityId, kind, name, pendingCount]);
+
   /* ── 作品 ── */
   const itemsQuery = itemsOptions(props);
   const items = useQuery(itemsQuery);
   const itemsRevision = useRevision(JSON.stringify([itemsQuery.queryKey, avatarEpoch]));
   /* 直达或刷新资料页时 URL 没有 `jav=1`：以第一页作品的真实 `is_jav` 恢复女优／厂牌语境，版式开关
      不是只在从 JAV 首页点进来时才偶然存在。只看进页那一份，页内换筛选不改语境。 */
-  const [javPage] = useState(() => (kind === 'performer' || kind === 'studio')
-    && (props.jav || (items.data?.items || []).some((item) => item.is_jav)));
+  const [initialJav, setInitialJav] = useState<boolean | null>(() => props.jav || props.layout.active ? true : null);
+  if (initialJav === null && items.data) setInitialJav((items.data.items || []).some((item) => item.is_jav));
+  const javPage = (kind === 'performer' || kind === 'studio') && !!(initialJav ?? props.jav);
   useLayoutEffect(() => { actions.javContext(javPage) }, [actions, javPage]);
   const layout = useMemo<MediaCardLayout>(() => (props.layout.active === javPage ? props.layout
     : { ...props.layout, active: javPage }), [props.layout, javPage]);
@@ -162,7 +205,11 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
   const fetchNextPhotos = wall.fetchNextPage;
 
   /* ── 新作 ── */
-  const feed = useQuery({ ...feedNewOptions(entityId, helpers.feedRowHtml), enabled: !!entityId });
+  /* 设置「首页与人物页显示新作」关掉时不取这一行、宿主收起；在这一页上切换当场跟上。 */
+  const settings = appSettingsStore();
+  const feedRows = useSyncExternalStore(settings.subscribe, () => settings.value.feedNewRows !== false);
+  const feed = useQuery({ ...feedNewOptions(entityId, helpers.feedRowHtml), enabled: !!entityId && feedRows });
+  useLayoutEffect(() => { if (!feedRows) hosts.feed.hidden = true }, [feedRows, hosts.feed]);
   const feedRevision = useRef(props.feedRevision);
   useEffect(() => {
     if (feedRevision.current === props.feedRevision) return;
@@ -174,10 +221,19 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
   const hasItems = !!items.data;
   useEffect(() => { actions.painted(view, photoWall) },
     [actions, view, photoWall, itemsRevision, photos?.revision, hasItems, online.key]);
+  useEffect(() => {
+    if (!hosts.body.isConnected || document.getElementById('index')?.hidden) return;
+    rememberPageState('entity', { seed: props.seed, revision: props.revision, jav: props.jav });
+    if (!items.isPending && !wall.isPending) {
+      void pageNavigationReady(() => hosts.body.isConnected && !document.getElementById('index')?.hidden, hosts.filter);
+    }
+  }, [hosts, props.seed, props.revision, props.jav, items.isPending, wall.isPending, filterKey, view]);
 
   /* ── 写操作 ── */
   const alive = useRef(true);
-  useEffect(() => () => { alive.current = false }, []);
+  /** 页面卸下时中止还在等的状态循环（`refreshFeedAfterCheck`）。 */
+  const lifetime = useRef<AbortController | null>(null);
+  useEffect(() => () => { alive.current = false; lifetime.current?.abort() }, []);
   const refreshEntity = useCallback(async () => {
     await queryClient.invalidateQueries({ queryKey: ['entity-route'] });
     await queryClient.invalidateQueries({ queryKey: entityKey(kind, name) });
@@ -185,7 +241,12 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
   }, [kind, name]);
   const alias = useMutation({
     mutationFn: (payload: { alias: string; remove?: boolean }) => api('/api/entity-alias',
-      { method: 'POST', body: JSON.stringify({ kind, name: entity.canonical_name, ...payload }) }) as Promise<{ added?: boolean; alias?: string }>,
+      { method: 'POST', body: JSON.stringify({ kind, name: entity.canonical_name, ...payload }) }) as Promise<EntityAliasWriteResult>,
+    onSuccess: () => refreshEntity(),
+  });
+  const merge = useMutation({
+    mutationFn: ({ target_id, source_id }: { target_id: number; source_id: number }) => api('/api/entity-merge',
+      { method: 'POST', body: JSON.stringify({ kind, target_id, source_id }) }) as Promise<EntityMergeResult>,
     onSuccess: () => refreshEntity(),
   });
   const rename = useMutation({
@@ -206,48 +267,90 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
       { method: 'POST', body: JSON.stringify({ entity_id: entityId, key }) }),
   });
 
+  const [merging, setMerging] = useState(false);
+  const [contributingName, setContributingName] = useState(false);
+  /* 合并成了：回执，再打开保留的那一份（当前页可能就是被并掉的那份）。 */
+  const merged = useCallback((done: EntityMergeResult) => {
+    helpers.receipt(t('shell:entityMerge.done', { source: done.source.canonical_name, target: done.target.canonical_name }));
+    void refreshEntity();
+    actions.openEntity(kind, done.target.canonical_name, true);
+  }, [actions, helpers, kind, refreshEntity]);
   const heroActions = useMemo<EntityHeroActions>(() => ({
     openEntity: actions.openEntity,
+    ...(kind === 'performer' ? { contributeName: () => setContributingName(true) } : {}),
     /* 换统称要重写整条实体的扁平投影，先把代价说清再问。确认键、标题和成功回执共用「更改统称」这一个
        动词；写入失败时弹层留在原地，原因写在正文下方等重试。地址换成新名字，由壳重进这一页。 */
     chooseName: (chosen) => {
       const current = entity.canonical_name;
       if (chosen === current) return;
       void confirmModal({
-        title: '更改统一名称',
-        body: `「${chosen}」将成为这份档案显示的名称，「${current}」留作别名。作品上的署名、搜索和标签都会跟着改写。`,
-        confirmLabel: '更改统一名称',
+        title: t('catalog:entityPage.changePrimaryName'),
+        body: t('catalog:entityPage.changePrimaryNameBody', { chosen, current }),
+        confirmLabel: t('catalog:entityPage.changePrimaryName'),
         onConfirm: () => rename.mutateAsync({ from: current, to: chosen }),
       }).then(({ confirmed, result }) => {
         const done = result as { changed?: boolean; canonical_name?: string; previous_name?: string } | undefined;
         if (!confirmed || !done?.changed) return;
-        helpers.receipt(`已把统一名称更改为 ${done.canonical_name}`, { undo: async () => {
+        helpers.receipt(t('catalog:entityPage.primaryNameChanged', { name: done.canonical_name }), { undo: async () => {
           await rename.mutateAsync({ from: done.canonical_name || '', to: done.previous_name || '' });
           actions.openEntity(kind, done.previous_name || '');
         } });
         actions.openEntity(kind, done.canonical_name || '');
       });
     },
-    addAlias: () => { void helpers.aliasForm(entity.user_aliases || [], (payload) => alias.mutateAsync(payload)) },
+    addAlias: () => {
+      void (async () => {
+        const outcome = await helpers.aliasForm(
+          entity.user_aliases || [], (payload) => alias.mutateAsync(payload));
+        const conflict = outcome?.conflict;
+        if (!conflict) return;
+        /* 撞上另一份同类档案：撞的是对方的名字时别名没写，撞的是对方的别名时已经写了（`shared`），
+           两种都问要不要合并。保留哪一份按 `mergeSides`。 */
+        const { keep, absorb } = mergeSides(conflict);
+        void confirmModal({
+          title: t('shell:entityMerge.title'),
+          body: t(conflict.shared ? 'shell:entityMerge.bodyShared' : 'shell:entityMerge.bodyTaken', {
+            alias: conflict.alias, other: conflict.other.canonical_name, keep: keep.canonical_name, keepWorks: keep.works,
+            absorb: absorb.canonical_name, absorbWorks: absorb.works,
+          }),
+          confirmLabel: t('shell:entityMerge.confirm'),
+          danger: true,
+          onConfirm: () => merge.mutateAsync({ target_id: keep.id, source_id: absorb.id }),
+        }).then(({ confirmed, result }) => {
+          if (confirmed && result) merged(result as EntityMergeResult);
+        });
+      })();
+    },
+    ...(MERGE_KINDS.has(kind) && entityId ? { mergeDuplicate: () => setMerging(true) } : {}),
+    ...(MERGE_KINDS.has(kind) && entityId ? { deleteProfile: () => {
+      const action = deleteProfilesAction(async result => {
+        actions.avatarChanged();
+        if (result.entity_ids.includes(entityId)) actions.openIndex();
+        await queryClient.invalidateQueries();
+      });
+      void runBulkAction(action, [{ entity_id: entityId, k: entity.canonical_name, n: entity.asset_count || 0 }],
+        { receipt: helpers.receipt }).catch(error => helpers.failure(action.label, error));
+    } } : {}),
     follow: async (on) => {
       try {
         await follow.mutateAsync(on);
       } catch (error) {
-        helpers.failure(on ? '订阅新作' : '取消订阅新作', error);
+        helpers.failure(on ? t('catalog:entityHero.subscribeNewReleases') : t('catalog:entityPage.unsubscribeNewReleases'), error);
         throw error;
       }
     },
-    /* 「订阅新作」打开时服务端当场在后台拉一轮：等那一轮跑完再把新作那一行重取一次。等的上限是
-       那一轮自己的时长量级，页面换走了就不再等。 */
+    /* 「订阅新作」打开时服务端当场在后台拉一轮：等那一轮跑完再把新作那一行重取一次。三秒问一次，
+       读失败退避，页面不可见时暂停；等的上限是那一轮自己的时长量级，页面换走了就不再等。 */
     refreshFeedAfterCheck: () => {
-      void (async () => {
-        for (let tries = 0; tries < 40 && alive.current; tries += 1) {
-          await new Promise((resolve) => { setTimeout(resolve, 3000) });
-          const job = await (api('/api/feeds/check') as Promise<{ status?: string }>).catch(() => null);
-          if (!job || job.status !== 'running') break;
-        }
-        if (alive.current) await queryClient.invalidateQueries({ queryKey: feedNewKey(entityId) });
-      })();
+      lifetime.current ??= new AbortController();
+      void pollUntil<{ status?: string }>({
+        signal: lifetime.current.signal, everyMs: FEED_CHECK_POLL_MS, limitMs: FEED_CHECK_LIMIT_MS,
+        read: () => api('/api/feeds/check') as Promise<{ status?: string }>,
+        apply: () => {},
+        done: (job) => job.status !== 'running',
+      }).then(() => {
+        if (alive.current) void queryClient.invalidateQueries({ queryKey: feedNewKey(entityId) });
+      });
     },
     feedAction: postFeedAction,
     /* 圆框角上那个加号：头像索引在服务端已经换过。资料与作品列表一起重取（作品卡署名里也是
@@ -257,6 +360,7 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
       void refreshEntity().then(() => {
         if (alive.current) setAvatarEpoch((epoch) => epoch + 1);
       });
+      void queryClient.invalidateQueries({ queryKey: feedNewKey(entityId) });
     },
     /* 资料卡那句「N 项更新」：这位名下的就在这一页的在线视图里，不离开；别的作者键才去关注页。 */
     openFollowAuthor: (key) => {
@@ -268,13 +372,13 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
       try {
         await bindFollow.mutateAsync(key);
       } catch (error) {
-        helpers.failure('关联关注中的创作者', error);
+        helpers.failure(t('catalog:entityPage.linkFollowedCreator'), error);
         throw error;
       }
-      helpers.receipt(`已把关注里的 ${author} 记到 ${entity.canonical_name} 名下`);
+      helpers.receipt(t('catalog:entityPage.followedCreatorLinked', { author, name: entity.canonical_name }));
       await refreshEntity();
     },
-  }), [actions, alias, bindFollow, entity, entityId, filters, follow, followKey, helpers, kind, name, refreshEntity, rename]);
+  }), [actions, alias, bindFollow, entity, entityId, filters, follow, followKey, helpers, kind, merge, merged, name, refreshEntity, rename]);
   const heroHelpers = useMemo<EntityHeroHelpers>(() => ({
     portraitImg: () => helpers.portraitImg(kind, entity),
     wireScroller: helpers.wireDrag,
@@ -329,8 +433,8 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
   /* 艺人名册、视频、照片与在线是这一页的互斥视图，共用一组圆键；只有一类东西时不出这一组。 */
   const viewKinds = [roster.length, !onlineOnly, photoCount, followKey].filter(Boolean).length;
   const views: EntityViewKeys | null = viewKinds > 1 ? {
-    label: roster.length ? '页面视图' : '媒体类型',
-    people: roster.length ? { label: kind === 'studio' ? '厂牌' : '艺人', count: roster.length,
+    label: roster.length ? t('catalog:entityPage.pageView') : t('catalog:entityPage.mediaType'),
+    people: roster.length ? { label: kind === 'studio' ? t('catalog:shared.labels') : t('catalog:shared.performers'), count: roster.length,
       icon: kind === 'studio' ? 'clapperboard' : 'user-round' } : null,
     videos: onlineOnly ? null : { count: entity.asset_count || 0 },
     photos: photoCount ? { count: photoCount } : null,
@@ -355,19 +459,22 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
     { ...filters, state: '', tag: '', creator: '', studio: '', owner: '' }, EMPTY_MEDIA);
   let readout = '';
   let busy = false;
-  if (view === 'people') readout = `${kind === 'studio' ? '厂牌' : '艺人'} · ${roster.length.toLocaleString()}`;
+  if (view === 'people') readout = `${kind === 'studio' ? t('catalog:shared.labels') : t('catalog:shared.performers')} · ${roster.length.toLocaleString()}`;
   else if (view === 'online') {
     busy = online.busy;
-    readout = `在线 · ${(online.total ?? entity.follow?.n ?? 0).toLocaleString()} 项更新`;
+    readout = t('catalog:entityPage.onlineUpdates', { count: online.total ?? entity.follow?.n ?? 0 });
   }
   else if (view === 'videos') {
-    busy = !items.data;
+    busy = items.isPending;
     /* 选了哪几枚标签由上面那条交集条一枚一枚列着，读数只报个数：标签名再列一遍，几枚长标签
        就能把这一行撑出页面。 */
     const picked = tagList(filters.tag).length;
-    readout = `视频 · ${(items.data?.work_total ?? items.data?.total ?? 0).toLocaleString()}${picked ? ` · 已选 ${picked.toLocaleString()} 个标签` : ''}`;
+    readout = items.data ? [
+      `${t('catalog:shared.videos')} · ${(items.data.work_total ?? items.data.total ?? 0).toLocaleString()}`,
+      picked ? t('catalog:tagFilters.selectedCount', { count: picked }) : '',
+    ].filter(Boolean).join(' · ') : '';
   } else if (wallPage && !wallPage.error) {
-    readout = inSet ? `${wallPage.title} · ${(wallPage.total || 0).toLocaleString()} 张`
+    readout = inSet ? t('catalog:entityPage.setImageCount', { title: codedText(wallPage, 'title'), count: wallPage.total || 0 })
       : photoReadout(wallPage, codeSetsOf(wallPage).length);
   } else busy = wall.isPending;
 
@@ -387,7 +494,11 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
   return (
     <>
       <EntityHeroPage key={avatarEpoch} kind={kind} name={name} entity={entity} feedNew={feed.data ?? null}
-        feedHost={entityId ? hosts.feed : null} jav={javPage} actions={heroActions} helpers={heroHelpers} />
+        feedError={!feed.data && feed.isError ? errorMessage(feed.error) : undefined} retryFeed={() => { void feed.refetch() }}
+        feedHost={entityId && feedRows ? hosts.feed : null} jav={javPage} actions={heroActions} helpers={heroHelpers} />
+      {merging && entityId ? <MergeDialog kind={kind} currentId={Number(entityId)} close={() => setMerging(false)} onMerged={merged} /> : null}
+      {contributingName && entityId ? <NameContributionDialog entityId={Number(entityId)} close={() => setContributingName(false)}
+        saved={() => helpers.receipt(t('catalog:seedName.saved'))} /> : null}
       {createPortal(
         <EntityFilterPage kind={kind} name={name} view={view} views={views} state={filters.state || ''}
           states={props.states} tags={tags} combo={combo} readout={readout} busy={busy}
@@ -396,18 +507,27 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
         hosts.filter)}
       {createPortal(
         <EntityFolderWorkspace enabled={view === 'videos'}>{view === 'online'
-          ? <EntityOnline key={online.key} view={online.view} media={online.media} result={online.result}
+          ? <EntityOnline view={online.view} media={online.media} result={online.result}
             data={online.data} visible={online.visible} context={online.context} photoSize={props.photoSize}
             photoLayout={props.photoLayout} imagesOnly={props.followImagesOnly} helpers={props.follow.helpers}
-            actions={props.follow.actions} canLoadMore={props.canLoadMore} clearFilters={online.clearFilters} />
+            actions={props.follow.actions} canLoadMore={props.canLoadMore} clearFilters={online.clearFilters}
+            selectMode={props.selectMode} selected={props.followSelected} />
           : view === 'videos' && items.isError
           ? <RetryNote message={errorMessage(items.error)} onRetry={() => { void items.refetch() }} />
+          : view === 'photos' && (wall.isError || wallPage?.error)
+          ? <RetryNote message={wallPage?.error || errorMessage(wall.error)} onRetry={() => { void wall.refetch() }} />
+          : view === 'photos' && !photos
+          ? <div data-photo-wall="" data-size={props.photoSize} data-layout={props.photoLayout} role="status" aria-busy="true" aria-label={t('catalog:entityPage.loadingPhotos')}>
+              {Array.from({ length: 8 }, (_, index) => <button key={index} data-photo-cell="" disabled aria-hidden className="skeleton-sheen" />)}
+            </div>
           : worksEmpty ? <WorksEmpty filtered={filtered} onShowAll={showAll}
             onOnline={followKey ? () => filterActions.setView('online') : undefined} />
           : (
             <EntityBodyPage kind={kind} name={name} view={view} roster={rosterProps} items={items.data ?? null}
               revision={itemsRevision} fetchPage={fetchPage}
               listScope={JSON.stringify([kind, name, filters, props.jav, filters.sort === 'seed' ? props.seed : ''])}
+              filters={filters} facetScope={{ scope_kind: kind, scope_name: name, jav: props.jav ? '1' : '' }}
+              restoreNavigation={props.restoreNavigation}
               photos={photos} photoSize={props.photoSize}
               photoLayout={props.photoLayout} helpers={props.card.helpers} actions={bodyActions} layout={layout}
               selectMode={props.selectMode} selected={props.selected} seekSeconds={props.seekSeconds}
@@ -422,15 +542,15 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
 /** 作品区一部也没有。筛完一部不剩时给一条回到全部视频的路：观看状态与交集条上的筛选一起撤掉。 */
 function WorksEmpty({ filtered, onShowAll, onOnline }: { filtered: boolean; onShowAll(): void; onOnline?: () => void }) {
   return filtered ? (
-    <EmptyState icon={spriteGlyph('search')} title="没有符合条件的视频"
-      actions={<Button size="small" onClick={onShowAll}>清除筛选</Button>}>
-      清除筛选后查看名下全部视频。
+    <EmptyState icon={spriteGlyph('search')} title={t('catalog:entityPage.noMatchingVideos')}
+      actions={<Button size="small" onClick={onShowAll}>{t('catalog:shared.clearFilters')}</Button>}>
+      {t('catalog:entityPage.noMatchingVideosHint')}
     </EmptyState>
   ) : (
-    <EmptyState icon={spriteGlyph('film')} title="还没有视频"
-      actions={onOnline ? <Button size="small" onClick={onOnline}>查看在线作品</Button>
-        : <ButtonLink size="small" href="/">浏览馆藏</ButtonLink>}>
-      署上这个名字的视频入库后会显示在这里。
+    <EmptyState icon={spriteGlyph('film')} title={t('catalog:entityPage.noVideos')}
+      actions={onOnline ? <Button size="small" onClick={onOnline}>{t('catalog:entityPage.viewOnline')}</Button>
+        : <ButtonLink size="small" href="/">{t('catalog:entityPage.browseCollection')}</ButtonLink>}>
+      {t('catalog:entityPage.noVideosHint')}
     </EmptyState>
   );
 }

@@ -5,13 +5,11 @@
  * （`@peach/shell` 的 `pageOpens` 加一）各一次；`pageOpens` 还是 0 时壳没开始路由，元素只挂着；那一刻被详情压着
  * （页面组按背景匹配）就不动，关掉详情时这一页没画着才打开。
  *
- * 关注页不按代次挂 key，「回到」与「重新进入」都是同一个元素再开一次，交壳按地址读一遍筛选（`refresh`）：
- * - 关注页还画在 `#stats` 里（资料页压过来时壳只藏起它）就铺开它，就地推筛选、取样种子与一个新的刷新代次：列表
- *   重取、回到顶上，页头、两排与那块玻璃不撤。
- * - 没画着才整页打开：铺骨架、取齐首屏后照离开时记下的位置滚回去（`followScrollY`），没记就回到顶上。刷新代次
- *   没变时首屏命中缓存，列表不重取。
- * 重新进入（已在关注页再点侧栏、检查更新之后去看）由壳决定：重掷取样种子、滚动清零、回到干净的 `/follow`，再
- * 要求重开。关掉关注详情回列表由壳认领写地址、只推筛选，元素不动。深链直接进关注详情时页面组没有背景，不挂这个
+ * 关注页不按代次挂 key，回来时交壳按地址恢复筛选、取样种子与刷新代次（`refresh`）：
+ * - 关注页还画在 `#stats` 里就铺开它，就地推属性，不因进入页面增加刷新代次。
+ * - 没画着时，缓存已有内容就直接提交，不铺加载骨架；首次取数才铺骨架。已加载分页沿用同一标签页里的缓存，
+ *   共用导航入口平滑恢复保存的位置，首次进入回到顶上。
+ * 主动重新进入才由壳换种子和刷新代次。关掉关注详情回列表由壳认领写地址、只推筛选，元素不动。深链直接进关注详情时页面组没有背景，不挂这个
  * 元素，列表等关掉详情才打开。后退前进落到压在列表上的关注详情、列表却没画着（中间去过别的页）时，交壳让出
  * `#stats`（`ShellActions.follow.ground`），不画列表。
  *
@@ -23,10 +21,12 @@
 import { useContext, useEffect, useRef, useSyncExternalStore } from 'react';
 
 import { managedEntry, openManagedRoute, peachHistory, updateManagedRoute } from '@peach/history';
-import { revealSkeleton } from '@peach/legacy/ui';
-import { followScrollY, playlistsRevision, subscribeShell } from '@peach/shell';
-
+import { playlistsRevision, subscribeShell } from '@peach/shell';
+import { pageNavigationReady, rememberPageState, restoredPageState } from '../../../history/page-navigation';
+import { followFeedQuery, type FollowFeedProps } from '../../follow-feed/follow-feed';
+import { queryClient } from '../../query';
 import { managementSkeletonHtml, paintManagementPlaceholder } from '../../../management-placeholder';
+
 import { ShellActionsContext, useOpenEpoch } from '../router';
 import type { ShellActions } from '../shell-actions';
 import { usePageOpen } from './index-entity';
@@ -34,27 +34,26 @@ import { usePageOpen } from './index-entity';
 const statsHost = () => document.getElementById('stats');
 const readPlaylistsRevision = () => playlistsRevision;
 
-/* 取齐首屏时骨架不一次清空：骨架抬成一层淡出，新宿主同时从模糊里清晰起来，同目录网格。宿主放进去之后页面
-   当场画进去，仍在同一个任务里，骨架与整页之间没有空帧。 */
-function reveal(container: Element): HTMLElement {
-  const host = document.createElement('div');
-  host.className = 'peach-react';
-  revealSkeleton(container, () => { container.textContent = ''; container.append(host) });
-  return host;
-}
-
 /* ── 关注 ── */
 
 async function openFollow(actions: ShellActions, live: () => boolean) {
   const stats = statsHost();
   const shell = actions.follow;
   if (!stats || !shell) return;
-  if (shell.refresh()) return;
-  const restoreY = followScrollY;
-  actions.surfaceChanged('follow', '/follow');
-  paintManagementPlaceholder(stats, shell.skeleton());
-  await openManagedRoute('/follow', shell.props(), { container: stats, isCurrent: live, place: reveal });
-  if (live()) window.scrollTo(restoreY ? { top: restoreY, behavior: 'instant' } : { top: 0, behavior: 'smooth' });
+  const restored = restoredPageState<Pick<FollowFeedProps, 'view' | 'seed' | 'revision'>>('follow');
+  const shown = shell.refresh(restored);
+  const props = shell.props();
+  rememberPageState('follow', { view: props.view, seed: props.seed, revision: props.revision });
+  if (shown) return;
+  const cached = queryClient.getQueryData(followFeedQuery(props.view, props.revision).queryKey) !== undefined;
+  if (!cached) {
+    actions.surfaceChanged('follow', '/follow');
+    paintManagementPlaceholder(stats, shell.skeleton());
+    void pageNavigationReady(live, stats, { pending: true });
+  }
+  await openManagedRoute('/follow', props, { container: stats, isCurrent: live,
+    beforePlace: cached ? () => actions.surfaceChanged('follow', '/follow') : undefined });
+  if (live()) void pageNavigationReady(live, stats.querySelector('[data-filter-frame]'));
 }
 
 /* `#stats` 里画着、露着的是关注页。 */
@@ -91,8 +90,9 @@ async function openPlaylists(actions: ShellActions, live: () => boolean) {
   if (!stats) return;
   actions.surfaceChanged('playlists', '/playlists');
   paintManagementPlaceholder(stats, managementSkeletonHtml('/playlists', { followLayout: '', followSort: '', followDir: '' }));
+  void pageNavigationReady(live, stats, { pending: true });
   await openManagedRoute('/playlists', { revision: playlistsRevision }, { container: stats, isCurrent: live });
-  if (live()) window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (live()) void pageNavigationReady(live);
 }
 
 /** 播放列表页的元素。 */

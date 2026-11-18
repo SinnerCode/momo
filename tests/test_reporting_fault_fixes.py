@@ -26,6 +26,40 @@ class FaultFixTests(unittest.TestCase):
             service.scheduler.add_job(service.tick, 'interval', seconds=1)
             self.assertEqual(len(service.scheduler.get_jobs()), 1)
 
+    def test_a_stuck_recovery_records_its_step_and_thread_stacks_once(self):
+        """接回中断任务卡住时，日志里要能看出卡在哪个任务、停在哪一行；同一次只记一次。"""
+        import threading
+        import time
+        from peach import web_job_recovery
+        service = web_job_recovery.RecoveryService(mock.Mock(), available=True)
+        started, release = threading.Event(), threading.Event()
+
+        def stuck_in_processing(*_args, **_kwargs):
+            started.set()
+            release.wait(5)
+
+        with mock.patch('peach.update_tasks.is_pausing', return_value=False), \
+                mock.patch.object(web_job_recovery, 'resume',
+                                  side_effect=lambda _db, handlers: handlers['library-processing']({})), \
+                mock.patch.object(web_job_recovery, 'w_library_processing', side_effect=stuck_in_processing), \
+                mock.patch('peach.error_reporting.local_event') as event:
+            worker = threading.Thread(target=service.tick)
+            worker.start()
+            self.assertTrue(started.wait(5))
+            service.watch(now=time.monotonic() + 5)
+            event.assert_not_called()
+            service.watch(now=time.monotonic() + web_job_recovery.STUCK_SECONDS + 1)
+            service.watch(now=time.monotonic() + web_job_recovery.STUCK_SECONDS * 2)
+            release.set()
+            worker.join(5)
+            service.watch(now=time.monotonic() + 1000)
+        event.assert_called_once()
+        self.assertEqual(event.call_args.args, ('job-recovery-stuck',))
+        self.assertEqual(event.call_args.kwargs['step'], 'library-processing')
+        frames = [line for stack in event.call_args.kwargs['stacks'].values() for line in stack]
+        self.assertTrue(any(line.endswith(' stuck_in_processing') for line in frames), frames)
+        self.assertFalse(any('\\' in line or '/' in line for line in frames), '只留文件名，不带本机路径')
+
     def test_early_disconnect_returns_without_a_server_exception(self):
         async def exercise(path):
             async def inner(scope, receive, send):
@@ -139,15 +173,18 @@ class FaultFixTests(unittest.TestCase):
             self.assertEqual(event['tags']['media_failure'], 'decoder_unavailable')
             self.assertNotIn('private_input', json.dumps(event))
 
-    def test_expected_media_inputs_and_cancellation_stay_local(self):
+    def test_bad_media_input_is_counted_and_cancellation_stays_local(self):
         from peach.transcodes import TranscodeCancelled
-        for error in (TranscodeUnavailable('synthetic', diagnostics={'stderr': 'Invalid data found', 'returncode': 1}),
-                      TranscodeCancelled('synthetic')):
-            with self.subTest(error=type(error).__name__), mock.patch.object(remote_reporting, 'send') as send:
-                remote_reporting.capture('logging', error, logger='peach.routes_media', level='ERROR')
-            send.assert_not_called()
+        with mock.patch.object(remote_reporting, 'send') as send:
+            remote_reporting.capture('logging', TranscodeCancelled('synthetic'), logger='peach.routes_media', level='ERROR')
+        send.assert_not_called()
+        error = TranscodeUnavailable('synthetic', diagnostics={'stderr': 'Invalid data found', 'returncode': 1})
+        with mock.patch.object(remote_reporting, 'send') as send:
+            remote_reporting.capture('logging', error, logger='peach.routes_media', level='ERROR')
+        self.assertEqual(send.call_args.kwargs, {'count_only': True})
+        self.assertEqual(send.call_args.args[1]['tags']['condition'], 'invalid_media')
 
-    def test_transcode_input_failure_is_local_after_real_pipeline_frames(self):
+    def test_transcode_input_failure_is_counted_after_real_pipeline_frames(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve()
             source = root / 'synthetic.avi'
@@ -165,4 +202,5 @@ class FaultFixTests(unittest.TestCase):
                         remote_reporting.capture('logging', error, logger='peach.routes_media', level='ERROR')
                     else:
                         self.fail('坏输入必须保留转码失败状态')
-                send.assert_not_called()
+                self.assertEqual(send.call_args.kwargs, {'count_only': True})
+                self.assertEqual(send.call_args.args[1]['tags']['condition'], 'invalid_media')

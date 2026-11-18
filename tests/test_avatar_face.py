@@ -10,6 +10,10 @@ from peach.avatar_face import (
     FaceProbe, drop_sidecar, face_px_width, face_share, read_sidecar,
     sidecar_path, write_sidecar,
 )
+from peach.face_detect import FaceModelUnavailable
+
+#: 模型取不到时 `FaceDetector` 抛的那一个：联网下载模型失败（`face_detect.ensure_model`）。
+MODEL_UNAVAILABLE = FaceModelUnavailable("errors.faceDetect.faceModelFetchFailed", {"error": "network is unreachable"})
 
 
 def record(width=640, height=960, face_w=0.105):
@@ -93,9 +97,9 @@ class FaceProbeTests(unittest.TestCase):
         """取不到模型会把「今天没网」变成「所有人都没有头像」，所以只记原因。"""
         probe = FaceProbe()
         with unittest.mock.patch("peach.avatar_face.FaceDetector",
-                                 side_effect=RuntimeError("模型未取得")):
+                                 side_effect=MODEL_UNAVAILABLE):
             self.assertIsNone(probe(Path("/tmp/a.img")))
-        self.assertEqual(probe.unavailable, "模型未取得")
+        self.assertEqual(probe.unavailable, "取人脸模型失败：network is unreachable")
 
     def test_a_failed_model_load_waits_out_the_retry_window_then_recovers(self):
         """服务启动时恰好没网，联网后圆标要自己恢复取景；窗口内不在请求线程里反复重下。"""
@@ -105,10 +109,10 @@ class FaceProbeTests(unittest.TestCase):
         probe = FaceProbe(clock=lambda: now[0])
         with unittest.mock.patch(
                 "peach.avatar_face.FaceDetector",
-                side_effect=[RuntimeError("模型未取得"), unittest.mock.MagicMock()]) as detector, \
+                side_effect=[MODEL_UNAVAILABLE, unittest.mock.MagicMock()]) as detector, \
                 unittest.mock.patch("peach.avatar_face.face_record", return_value=record()):
             self.assertIsNone(probe(Path("/tmp/a.img")))
-            self.assertEqual(probe.unavailable, "模型未取得")
+            self.assertEqual(probe.unavailable, "取人脸模型失败：network is unreachable")
             now[0] += avatar_face.RETRY_SECONDS - 1
             self.assertIsNone(probe(Path("/tmp/a.img")))
             self.assertEqual(detector.call_count, 1)
@@ -124,7 +128,7 @@ class FaceProbeTests(unittest.TestCase):
         probe = FaceProbe(clock=lambda: 1000.0)
         with unittest.mock.patch(
                 "peach.avatar_face.FaceDetector",
-                side_effect=[RuntimeError("模型未取得"), unittest.mock.MagicMock()]) as detector, \
+                side_effect=[MODEL_UNAVAILABLE, unittest.mock.MagicMock()]) as detector, \
                 unittest.mock.patch("peach.avatar_face.face_record", return_value=record()):
             self.assertIsNone(probe(Path("/tmp/a.img")))
             self.assertIsNone(probe(Path("/tmp/a.img")))
@@ -137,7 +141,7 @@ class FaceProbeTests(unittest.TestCase):
         probe = FaceProbe()
         with unittest.mock.patch("peach.avatar_face.FaceDetector"):
             with unittest.mock.patch("peach.avatar_face.face_record",
-                                     side_effect=ValueError("解不开")):
+                                     side_effect=ValueError("cannot decode image")):
                 self.assertIsNone(probe(Path("/tmp/a.img")))
         self.assertEqual(probe.unavailable, "")
 
@@ -166,9 +170,64 @@ class FaceProbeTests(unittest.TestCase):
     def test_without_a_model_bytes_get_no_record_either(self):
         probe = FaceProbe()
         with unittest.mock.patch("peach.avatar_face.FaceDetector",
-                                 side_effect=RuntimeError("模型未取得")):
+                                 side_effect=MODEL_UNAVAILABLE):
             self.assertIsNone(probe.on_bytes(b"\xff\xd8\xff"))
-        self.assertEqual(probe.unavailable, "模型未取得")
+        self.assertEqual(probe.unavailable, "取人脸模型失败：network is unreachable")
+
+    def test_an_offline_probe_never_downloads_the_model(self):
+        with unittest.mock.patch("peach.avatar_face.FaceDetector") as detector, \
+                unittest.mock.patch("peach.avatar_face.face_record", return_value=record()):
+            FaceProbe(allow_download=False)(Path("/tmp/a.img"))
+        detector.assert_called_once_with(allow_download=False)
+
+
+class _Probe:
+    """补测用的假探针：按图的实际尺寸给一份记录，或者装作模型用不了。"""
+
+    def __init__(self, unavailable=""):
+        self.unavailable, self.seen = unavailable, []
+
+    def __call__(self, image_path):
+        from peach.images import measure_image_file
+        self.seen.append(Path(image_path).name)
+        if self.unavailable:
+            return None
+        width, height = measure_image_file(image_path)
+        return {**record(width, height), "px": [width, height]}
+
+
+class BackfillTests(unittest.TestCase):
+    """人脸模型不可用时装上的头像：没有记录、记录比图旧、`px` 对不上的补测。"""
+
+    def setUp(self):
+        import os
+        from PIL import Image
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        for name in ("missing", "current", "resized", "replaced"):
+            Image.new("RGB", (40, 60)).save(self.root / f"performer-{name}.img", format="PNG")
+        write_sidecar(self.root / "performer-current.img", record(40, 60))
+        write_sidecar(self.root / "performer-resized.img", record(80, 120))
+        write_sidecar(self.root / "performer-replaced.img", record(40, 60))
+        old = (self.root / "performer-replaced.img").stat().st_mtime - 60
+        os.utime(sidecar_path(self.root / "performer-replaced.img"), (old, old))
+
+    def test_only_avatars_without_a_current_record_are_probed_and_written(self):
+        from peach.avatar_face import backfill
+        probe = _Probe()
+        self.assertEqual(backfill(self.root, probe), {"checked": 3, "written": 3})
+        self.assertEqual(sorted(probe.seen), ["performer-missing.img", "performer-replaced.img",
+                                              "performer-resized.img"])
+        for name in ("missing", "resized", "replaced"):
+            self.assertEqual(read_sidecar(self.root / f"performer-{name}.img")["px"], [40, 60])
+        self.assertEqual(backfill(self.root, _Probe()), {"checked": 0, "written": 0})
+
+    def test_without_the_model_nothing_is_written_and_the_caller_retries_later(self):
+        from peach.avatar_face import backfill
+        self.assertIsNone(backfill(self.root, _Probe(unavailable="取人脸模型失败")))
+        self.assertIsNone(read_sidecar(self.root / "performer-missing.img"))
+        self.assertEqual(read_sidecar(self.root / "performer-resized.img")["px"], [80, 120])
 
 
 if __name__ == "__main__":

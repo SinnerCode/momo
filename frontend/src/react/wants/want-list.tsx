@@ -1,11 +1,12 @@
 /* JAV 想要：按状态分组的作品卡，复用资源链接查询与查找资源弹层。 */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Radio } from 'react-aria-components';
 import type { KeyboardEvent, ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { RiStarLine, RiExternalLinkLine, RiDeleteBinLine } from '@remixicon/react';
+import { RiStarLine, RiExternalLinkLine, RiDeleteBinLine, RiSearchLine } from '@remixicon/react';
 
 import { Button, ButtonLink } from '@/components/base/buttons/button';
+import { Checkbox } from '@/components/base/checkbox/checkbox';
 import { Input } from '@/components/base/input/input';
 
 import { apiGet, errorMessage } from '../../api';
@@ -13,26 +14,36 @@ import { javContentSkeleton } from '../../jav-skeleton';
 import type { DownloadsSnapshot } from '../bundle';
 import { CloudDownloadDialog, type DownloadPrefill } from '../activity/cloud-download-dialog';
 import { DOWNLOADS_KEY, DOWNLOADS_URL } from '../activity/downloads-panel';
+import type { BulkAction, Receipt } from '../components/bulk-action';
 import { cardClass } from '../components/card';
+import { SelectionDock } from '../components/selection-dock';
+import { JavBatchResources } from '../jav/jav-batch-resources';
+import { useJavSelection } from '../jav/jav-selection';
+import type { Discovery } from '../jav/jav';
 import { EmptyState, EmptyFocusButton } from '../components/empty-state';
 import { Note } from '../components/note';
-import { Pagination } from '../follow-manage/source-list';
+import { DataTableFooter } from '../components/table-controls';
 import { pageWindow } from '../follow-manage/follow-manage';
 import { ErrorLine } from '../follow-manage/source-view';
-import { Help } from '../settings/section';
-import { WantMagnets } from './want-magnets';
+import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
+import { WantMagnets, type ResourceSourcePage } from './want-magnets';
+import { ScrapeSourceLabel } from '../components/source-label';
+import { resourceSourceKey } from './resource-display';
 import { cachedMagnetStates } from './resource-cache';
 import { SEGMENT, SEGMENTED_TRACK, SegmentedRadioGroup } from '../components/segmented';
 import { busyProps, useAction } from '../settings/use-action';
+import { composingKey } from '../components/ime';
 import {
-  addWant, fetchWants, invalidateWants, PHASES, removeWants, resetWants, searchNote, wantName,
-  WANTS_KEY, type Want,
+  addWant, fetchWants, invalidateWants, lastSearchNote, PHASES, removeWants, resetWants, restoreWants, searchNote, wantName,
+  WANTS_KEY, wantsInterval, type Want,
 } from './wants';
+import { t } from '../../i18n';
 
-const ORIGINS: Record<Want['origin'], string> = { code: '手动添加', feed: '订阅新作', follow: '关注' };
+const ORIGINS: Record<Want['origin'], string> = { code: t('catalog:wants.originManual'), feed: t('catalog:entityHero.subscribeNewReleases'), follow: t('catalog:entityHero.following') };
 /** 每一段一页摆多少张：一张卡二十来个节点，上千条一次摆开就是十几万像素高的一页。 */
 export const WANT_PAGE_SIZE = 20;
-const MAGNET_FILTERS = [['all', '全部'], ['available', '有磁链'], ['missing', '没磁链']] as const;
+const MAGNET_FILTERS = [['all', t('catalog:shared.all')], ['available', t('catalog:wants.hasMagnet')], ['missing', t('catalog:wants.noMagnet')]] as const;
 
 
 /** 资料那一行：发行日、厂牌、女优、从哪儿加进来的。 */
@@ -41,8 +52,8 @@ const facts = (want: Want) => [want.release_date, want.studio, want.performers, 
 
 function Cover({ want }: { want: Want }) {
   return (
-    <span className="relative inline-grid w-card-cover shrink-0 aspect-card-cover place-items-center overflow-hidden rounded-2lg bg-background-tertiary-default max-sm:w-24">
-      <span className="text-caption-1-regular text-text-secondary">无封面</span>
+    <span className="relative inline-grid w-card-cover shrink-0 aspect-card-cover place-items-center overflow-hidden rounded-2lg bg-media-placeholder max-sm:w-24">
+      <span className="text-caption-1-regular text-text-secondary">{t('catalog:shared.noCover')}</span>
       {want.cover ? (
         <img src={want.cover} alt="" loading="lazy" referrerPolicy={want.remote_cover ? 'no-referrer' : undefined}
           onError={(event) => event.currentTarget.remove()} className="absolute inset-0 size-full object-cover" />
@@ -51,16 +62,27 @@ function Cover({ want }: { want: Want }) {
   );
 }
 
-function WantRow({ want, readOnly, busy, onReset, onRemove, onCloudDownload, downloads, provider, toast }: {
+function WantRow({ want, readOnly, busy, onReset, onRemove, onCloudDownload, downloads, provider, toast, picked }: {
   want: Want; readOnly: boolean; busy: string; downloads?: DownloadsSnapshot; provider: string; toast(message: string): void;
   onReset(): void; onRemove(): void; onCloudDownload(): void;
+  /** 多选模式下这一条的勾选；不在多选模式时为空，不画勾选框。 */
+  picked?: { on: boolean; toggle(on: boolean): void };
 }) {
-  const [resolvedSource, setResolvedSource] = useState('');
-  const source = want.link || resolvedSource || (want.code ? `https://javdb.com/search?q=${encodeURIComponent(want.code)}&f=all` : '');
+  const [resourcePages, setResourcePages] = useState<ResourceSourcePage[]>([]);
+  const original = want.link || (!resourcePages.length && want.code ? `https://javdb.com/search?q=${encodeURIComponent(want.code)}&f=all` : '');
+  const host = original && URL.canParse(original) ? new URL(original).hostname.replace(/^www\./, '') : '';
+  const originalKey = resourceSourceKey(want.follow_provider || host.split('.')[0] || '');
+  const originalLabel = originalKey === 'javdb' ? 'JavDB' : originalKey === 'javbus' ? 'JavBus' : host;
+  const pages = original && host && !resourcePages.some(page => page.source === originalKey)
+    ? [{ source: originalKey, label: originalLabel, url: original }, ...resourcePages] : resourcePages;
+  // 有番号还在找的，资源区自己说明查到了什么，这里只给上次定时查找的结果。
+  const note = want.code && want.phase === 'searching' ? lastSearchNote(want) : searchNote(want);
   return (
     <li data-want-id={want.id}
-      className={cardClass({ bordered: 'soft', className: 'flex flex-col gap-4 max-sm:p-4' })}>
+      className={cardClass({ className: 'flex flex-col gap-4 max-sm:p-4' })}>
       <div className="flex min-w-0 items-start gap-4 max-sm:gap-3">
+      {picked ? <Checkbox slot={null} className="mt-1 shrink-0 self-start" aria-label={t('catalog:wants.selectRow', { name: wantName(want) })}
+        isSelected={picked.on} onChange={picked.toggle} /> : null}
       <Cover want={want} />
       <div className="flex min-w-0 flex-1 flex-col gap-1">
         <p className="flex min-w-0 flex-wrap items-baseline gap-x-2">
@@ -70,42 +92,43 @@ function WantRow({ want, readOnly, busy, onReset, onRemove, onCloudDownload, dow
           ) : null}
         </p>
         {facts(want) ? <p className="text-body-2-regular text-text-secondary">{facts(want)}</p> : null}
-        {!want.code || want.phase === 'unreleased' || want.phase === 'acquired' ?
-          <p data-want-note="" className="text-caption-1-regular text-text-secondary">{searchNote(want)}</p> : null}
-        {want.scrape_error ? <ErrorLine text={want.scrape_error} prefix="资料未取得：" tone="muted" /> : null}
-        <div className="mt-1 flex flex-wrap items-center gap-2">
-          {source ? <ButtonLink data-button-link="" variant="secondary" size="small" trailingIcon={RiExternalLinkLine} href={source} target="_blank" rel="noopener noreferrer">来源页</ButtonLink> : null}
-          <Button variant="secondary" size="small" leadingIcon={RiDeleteBinLine} disabled={readOnly} {...busyProps(busy === `remove:${want.id}`)}
-            onClick={onRemove}>移除</Button>
+        {note ? <p data-want-note="" className="text-caption-1-regular text-text-secondary">{note}</p> : null}
+        {want.scrape_error ? <ErrorLine text={want.scrape_error} prefix={t('catalog:wants.metadataNotFound')} tone="muted" /> : null}
+        <div data-want-actions="" className="mt-1 flex flex-wrap items-center gap-2">
+          {pages.map(page => <ButtonLink key={page.source} data-button-link="" variant="secondary" size="small" trailingIcon={RiExternalLinkLine}
+            href={page.url} target="_blank" rel="noopener noreferrer"><ScrapeSourceLabel source={page.source} label={page.label} /></ButtonLink>)}
           {want.phase === 'given_up' ? (
             <Button variant="secondary" size="small" disabled={readOnly} {...busyProps(busy === `reset:${want.id}`)}
-              onClick={onReset}>重新查找</Button>
+              onClick={onReset}>{t('catalog:wants.searchAgain')}</Button>
           ) : null}
           {/* 还在找的两段才给云下载：未发售的没有资源可下，已入库的已经到手。 */}
           {want.phase === 'searching' || want.phase === 'given_up' ? (
-            <Button variant="secondary" size="small" onClick={onCloudDownload}>查找资源</Button>
+            <Button variant="primary" size="small" leadingIcon={RiSearchLine} onClick={onCloudDownload}>{t('catalog:shared.searchTorrents')}</Button>
           ) : null}
+          <Button variant="danger" size="small" leadingIcon={RiDeleteBinLine} disabled={readOnly} {...busyProps(busy === `remove:${want.id}`)}
+            onClick={onRemove}>{t('catalog:shared.remove')}</Button>
         </div>
       </div>
       </div>
       {want.code && (want.phase === 'searching' || want.phase === 'given_up')
-        ? <WantMagnets want={want} readOnly={readOnly} downloads={downloads} provider={provider} toast={toast} onSource={setResolvedSource} /> : null}
+        ? <WantMagnets want={want} readOnly={readOnly} downloads={downloads} provider={provider} toast={toast} onSources={setResourcePages} /> : null}
     </li>
   );
 }
 
-/** 一段（待找、未发售……）：标题带这一段的总数，多于一页时分页，页码各段各记各的。 */
+/** 一段（待找、未发售……）：标题带总数，各段独立保存页码与每页数量。 */
 function WantPhase({ phase, label, rows, row }: {
   phase: string; label: string; rows: Want[]; row(want: Want): ReactNode;
 }) {
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(WANT_PAGE_SIZE);
   const [magnetFilter, setMagnetFilter] = useState('all');
   const cached = cachedMagnetStates(rows);
   const hasMagnet = (want: Want) => want.has_magnets ?? cached.get(want.code || '') ?? false;
   const available = rows.filter(hasMagnet);
   const filtered = phase !== 'searching' || magnetFilter === 'all' ? rows
     : rows.filter(want => hasMagnet(want) === (magnetFilter === 'available'));
-  const win = pageWindow(filtered.length, WANT_PAGE_SIZE, page);
+  const win = pageWindow(filtered.length, pageSize, page);
   return (
     <section aria-label={label} data-want-phase={phase} className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -113,7 +136,7 @@ function WantPhase({ phase, label, rows, row }: {
         {label}
         <span className="text-body-2-regular tabular-nums text-text-secondary">{rows.length.toLocaleString()}</span>
       </h3>
-      {phase === 'searching' ? <SegmentedRadioGroup name="want-magnet-filter" aria-label="待找磁链筛选"
+      {phase === 'searching' ? <SegmentedRadioGroup name="want-magnet-filter" aria-label={t('catalog:wants.magnetFilter')}
         orientation="horizontal" value={magnetFilter} className={SEGMENTED_TRACK} onChange={value => { setMagnetFilter(value); setPage(1) }}>
         {MAGNET_FILTERS.map(([value, text]) => <Radio key={value} value={value} aria-label={text} className={SEGMENT}>
           {text}<span className="text-caption-1-regular tabular-nums text-text-tertiary">{
@@ -122,24 +145,20 @@ function WantPhase({ phase, label, rows, row }: {
         </Radio>)}
       </SegmentedRadioGroup> : null}
       </div>
-      {!filtered.length ? <EmptyState size="compact" icon={RiStarLine} title="暂无符合条件的作品"
-        actions={<Button size="small" onClick={() => { setMagnetFilter('all'); setPage(1) }}>查看全部</Button>}>{null}</EmptyState> : null}
+      {!filtered.length ? <EmptyState size="compact" icon={RiStarLine} title={t('catalog:wants.noFilterMatches')}
+        actions={<Button size="small" onClick={() => { setMagnetFilter('all'); setPage(1) }}>{t('catalog:shared.viewAll')}</Button>}>{null}</EmptyState> : null}
       <ul className="flex flex-col gap-4">{filtered.slice(win.start, win.end).map(row)}</ul>
-      {win.pages > 1 ? (
-        <div data-want-pager="" className="flex flex-wrap items-center justify-between gap-3">
-          <span className="text-body-2-regular tabular-nums text-text-secondary">
-            {`${(win.start + 1).toLocaleString()}–${win.end.toLocaleString()} / ${win.total.toLocaleString()} 条`}
-          </span>
-          <Pagination label={`${label}分页`} page={win.page} pages={win.pages} onPage={setPage} />
-        </div>
-      ) : null}
+      <div data-want-pager="">
+        <DataTableFooter label={label} total={win.total} pagination={{ pageIndex: win.page - 1, pageSize }}
+          onChange={next => { setPageSize(next.pageSize); setPage(next.pageIndex + 1) }} unit={t('catalog:wants.itemUnit')} />
+      </div>
     </section>
   );
 }
 
 export interface WantListProps {
   readOnly: boolean;
-  toast(message: string): void;
+  toast: Receipt;
   query?: string;
   clearQuery?(): void;
 }
@@ -151,31 +170,30 @@ export function WantList({ readOnly, toast, query = '', clearQuery }: WantListPr
   const wants = useQuery({
     queryKey: WANTS_KEY, queryFn: ({ signal }) => fetchWants(signal),
     staleTime: 30_000,
-    // 刚登记的那几条还在取资料：跑着就隔几秒再读一次，取完了就停。
-    refetchInterval: (query) => (query.state.data?.scraping ? 3000 : false),
+    refetchInterval: wantsInterval,
   });
 
   const add = () => {
     const text = code.trim();
     if (!text || readOnly) return;
     void action.run('add', (signal) => addWant({ code: text }, signal), (done) => {
-      toast(done.created ? `已加入想要：${wantName(done.want)}` : `${wantName(done.want)} 已经在想要里`);
+      toast(done.created ? t('catalog:wants.added', { name: wantName(done.want) }) : t('catalog:wants.alreadyAdded', { name: wantName(done.want) }));
       setCode('');
       void invalidateWants();
     });
   };
   const onKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); add() }
+    if (event.key === 'Enter' && !composingKey(event.nativeEvent)) { event.preventDefault(); add() }
   };
   const remove = (want: Want) => {
     void action.run(`remove:${want.id}`, (signal) => removeWants([want.id], signal), () => {
-      toast(`已移除：${wantName(want)}`);
+      toast(t('catalog:wants.removed', { name: wantName(want) }));
       void invalidateWants();
     });
   };
   const reset = (want: Want) => {
     void action.run(`reset:${want.id}`, (signal) => resetWants([want.id], signal), () => {
-      toast(`${wantName(want)} 回到待找`);
+      toast(t('catalog:wants.backToSearching', { name: wantName(want) }));
       void invalidateWants();
     });
   };
@@ -183,6 +201,37 @@ export function WantList({ readOnly, toast, query = '', clearQuery }: WantListPr
   const data = wants.data;
   const items = (data?.items || []).filter(want => !query || [want.code, want.title, want.performers]
     .join(' ').toLocaleLowerCase().includes(query.toLocaleLowerCase()));
+
+  /* 多选：右上角开关（JAV 页的多选外壳）打开后每条显示勾选框，浮条给移除、重新查找与查找资源。 */
+  const selection = useJavSelection();
+  const selecting = Boolean(selection?.mode);
+  const [picked, setPicked] = useState<ReadonlySet<number>>(new Set());
+  const [resources, setResources] = useState<Discovery[] | null>(null);
+  useEffect(() => { if (!selecting) setPicked(new Set()) }, [selecting]);
+  const chosen = items.filter((want) => picked.has(want.id));
+  const allPicked = items.length > 0 && chosen.length === items.length;
+  const host = { receipt: toast };
+  const removeMany: BulkAction<Want> = {
+    key: 'remove', label: t('catalog:shared.remove'), reversal: 'undo', danger: true,
+    confirm: (rows) => ({ title: t('catalog:wants.removeMany'), body: t('catalog:wants.removeManyBody', { count: rows.length }) }),
+    run: async (rows) => {
+      const { previous } = await removeWants(rows.map((want) => want.id));
+      await invalidateWants();
+      return async () => { await restoreWants(previous); await invalidateWants() };
+    },
+    receipt: (rows) => t('catalog:wants.removedMany', { count: rows.length }),
+  };
+  const resetMany: BulkAction<Want> = {
+    key: 'reset', label: t('catalog:wants.searchAgain'), reversal: 'undo',
+    confirm: (rows) => ({ title: t('catalog:wants.searchAgainMany'), body: t('catalog:wants.searchAgainManyBody', { count: rows.length }) }),
+    run: async (rows) => {
+      const { previous } = await resetWants(rows.map((want) => want.id));
+      await invalidateWants();
+      return async () => { await restoreWants(previous); await invalidateWants() };
+    },
+    receipt: (rows) => t('catalog:wants.searchAgainDone', { count: rows.length }),
+  };
+  const searchable = chosen.filter((want) => want.code && (want.phase === 'searching' || want.phase === 'given_up'));
   const downloads = useQuery({
     queryKey: DOWNLOADS_KEY,
     queryFn: ({ signal }) => apiGet<DownloadsSnapshot>(`${DOWNLOADS_URL}?limit=100`, signal),
@@ -193,30 +242,31 @@ export function WantList({ readOnly, toast, query = '', clearQuery }: WantListPr
   return (
     <div aria-busy={wants.isPending} className="flex flex-col gap-8">
       <div className={cardClass({ padding: 'none', className: 'flex flex-col gap-4 px-6 py-5 max-sm:px-4' })}>
-        <h3 className="text-title-2-medium text-text-primary">按番号添加</h3>
+        <h3 className="text-title-2-medium text-text-primary">{t('catalog:wants.addByCode')}</h3>
         <div className="flex flex-wrap items-end gap-2">
           <div className="min-w-64 grow max-sm:min-w-0">
-            <Input aria-label="番号" placeholder="输入番号，例如 SSIS-950" value={code}
+            <Input aria-label={t('catalog:shared.code')} placeholder={t('catalog:wants.codePlaceholder')} value={code}
               isDisabled={readOnly} onChange={setCode} onKeyDown={onKeyDown} />
           </div>
           <Button variant="primary" disabled={readOnly || !code.trim()} {...busyProps(action.busy === 'add')}
-            onClick={add}>添加</Button>
+            onClick={add}>{t('catalog:shared.add')}</Button>
         </div>
-        {action.error ? <Note tone="error" title="这一次没有完成">{action.error}</Note> : null}
+        {action.error ? <Note tone="error" title={t('catalog:wants.actionFailed')}>{action.error}</Note> : null}
       </div>
 
-      {wants.error ? <Note tone="error" title="想要清单读取失败">{errorMessage(wants.error)}</Note> : null}
-      {wants.isPending ? <div role="status" aria-label="正在读取想要" dangerouslySetInnerHTML={{ __html: javContentSkeleton('wants') }} /> : null}
-      {data?.scraping ? <Help role="status">正在给刚加入的番号取资料与封面。</Help> : null}
-      {downloads.error ? <Note tone="error" title="下载配置未取得">{errorMessage(downloads.error)}</Note> : null}
-      {downloads.data && !configured.length ? <Note tone="neutral">尚未配置下载渠道。<a href={'/settings/library?section=' + encodeURIComponent('下载渠道')}>下载渠道设置</a></Note> : null}
-      {downloads.data && !downloads.data.available ? <Note tone="neutral">云下载只在允许修改数据库的设备上可用。</Note> : null}
+      {wants.error ? <Note tone="error" title={t('catalog:wants.loadFailed')}>{errorMessage(wants.error)}</Note> : null}
+      {wants.isPending ? <div role="status" aria-label={t('catalog:wants.loading')} dangerouslySetInnerHTML={{ __html: javContentSkeleton('wants') }} /> : null}
+      {data?.scraping ? <TaskProgress embedded kind={activityKind('want-scrape')} label={t('catalog:wants.fetchingNew')} /> : null}
+      {data?.searching ? <TaskProgress embedded kind={activityKind('want-search')} label={t('catalog:wants.searchingResources')} /> : null}
+      {downloads.error ? <Note tone="error" title={t('catalog:wants.downloadSettingsFailed')}>{errorMessage(downloads.error)}</Note> : null}
+      {downloads.data && !configured.length ? <Note tone="neutral">{t('shell:downloadChannels.notConfigured')}{t('shell:format.sentenceGap')}<a href="/settings/downloads">{t('shell:downloadChannels.settingsLink')}</a></Note> : null}
+      {downloads.data && !downloads.data.available ? <Note tone="neutral">{t('catalog:wants.cloudPrimaryOnly')}</Note> : null}
 
       {data && !items.length ? (
-        <EmptyState size="compact" icon={RiStarLine} title={query ? '没有符合条件的作品' : '还没有想要的作品'}
-          actions={query && clearQuery ? <Button size="small" onClick={clearQuery}>清除搜索</Button>
-            : !query && !readOnly ? <EmptyFocusButton target='input[aria-label="番号"]'>添加作品</EmptyFocusButton> : undefined}>
-          {query ? '试试其他番号、女优或标题。' : '输入番号，添加想看的作品。'}
+        <EmptyState size="compact" icon={RiStarLine} title={query ? t('catalog:wants.noSearchMatches') : t('catalog:wants.empty')}
+          actions={query && clearQuery ? <Button size="small" onClick={clearQuery}>{t('catalog:shared.clearSearch')}</Button>
+            : !query && !readOnly ? <EmptyFocusButton target={`input[aria-label="${t('catalog:shared.code')}"]`}>{t('catalog:wants.addWork')}</EmptyFocusButton> : undefined}>
+          {query ? t('catalog:wants.tryOtherSearch') : t('catalog:wants.emptyHint')}
         </EmptyState>
       ) : null}
 
@@ -227,6 +277,11 @@ export function WantList({ readOnly, toast, query = '', clearQuery }: WantListPr
           <WantPhase key={phase} phase={phase} label={label} rows={rows} row={(want) => (
             <WantRow key={want.id} want={want} readOnly={readOnly} busy={action.busy}
               downloads={downloads.data} provider={selected} toast={toast}
+              picked={selecting ? { on: picked.has(want.id), toggle: (on) => setPicked((current) => {
+                const next = new Set(current);
+                if (on) next.add(want.id); else next.delete(want.id);
+                return next;
+              }) } : undefined}
               onReset={() => reset(want)} onRemove={() => remove(want)}
               onCloudDownload={() => setDownload({
                 code: want.code || '', title: want.title || '', origin: `wishlist:${want.id}`,
@@ -236,6 +291,20 @@ export function WantList({ readOnly, toast, query = '', clearQuery }: WantListPr
         );
       })}
       <CloudDownloadDialog prefill={download} close={() => setDownload(null)} receipt={toast} provider={selected} />
+      <SelectionDock visible={selecting} label={t('catalog:wants.dockLabel')} count={t('catalog:javSelection.selectedCount', { count: chosen.length })}
+        actions={[
+          { action: removeMany, items: chosen, host, disabled: readOnly, done: () => setPicked(new Set()) },
+          { action: resetMany, items: chosen.filter((want) => want.phase === 'given_up'), host, disabled: readOnly, done: () => setPicked(new Set()) },
+        ]}
+        leading={<Button size="small" variant="secondary" disabled={!items.length}
+          onClick={() => setPicked(allPicked ? new Set() : new Set(items.map((want) => want.id)))}>
+          {allPicked ? t('catalog:javSelection.deselectPage') : t('catalog:wants.selectAll')}</Button>}>
+        <Button size="small" variant="secondary" disabled={!searchable.length}
+          onClick={() => setResources(searchable.map((want) => ({ id: want.id, code: want.code!, title: want.title || '',
+            release_date: want.release_date || undefined }) as Discovery))}>{t('catalog:shared.searchTorrents')}</Button>
+        <Button size="small" variant="ghost" onClick={() => selection?.close()}>{t('catalog:javSelection.exit')}</Button>
+      </SelectionDock>
+      <JavBatchResources items={resources} close={() => setResources(null)} readOnly={readOnly} receipt={toast} />
     </div>
   );
 }

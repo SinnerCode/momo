@@ -46,13 +46,13 @@ describe('关注域地址与会话控制', () => {
     expect(readFollowView(followViewPath(target).split('?')[1]!, 0, () => 1)).toEqual(target);
   });
 
-  it('换媒体保滚动，改变服务端筛选才滚到顶，props 动作身份固定且选择快照独立', () => {
+  it('筛选提交不提前定位，props 动作身份固定且选择快照独立', () => {
     const { controller, ports, selected } = setup();
     const first = controller.props();
     controller.route(view({ media: 'images' }));
     expect(ports.scrollTop).not.toHaveBeenCalled();
     controller.route(view({ media: 'images', tags: ['x'] }));
-    expect(ports.scrollTop).toHaveBeenCalledOnce();
+    expect(ports.scrollTop).not.toHaveBeenCalled();
     expect(controller.props().actions).toBe(first.actions);
     expect(controller.props().helpers).toBe(first.helpers);
     selected.add(14);
@@ -71,7 +71,7 @@ describe('关注域地址与会话控制', () => {
     expect(ports.push).not.toHaveBeenCalled();
   });
 
-  it('返回关注页保留会话与滚动，重新进入才清滚动并按宿主推进代次', () => {
+  it('普通进入保留会话与滚动，主动重新进入才换种子并推进代次', () => {
     const { controller, ports, location, live } = setup();
     controller.route(view({ author: 'one' }));
     location('/performers');
@@ -80,14 +80,15 @@ describe('关注域地址与会话控制', () => {
     expect(ports.session()).toEqual({ discoverySeed: 11, revision: 2, scrollY: 600 });
     location('/follow');
     controller.enter();
-    expect(ports.session()).toEqual({ discoverySeed: 41, revision: 2, scrollY: 0 });
+    expect(ports.session()).toEqual({ discoverySeed: 11, revision: 2, scrollY: 600 });
     live(false);
     controller.enter(true);
     expect(ports.session().revision).toBe(3);
+    expect(ports.session().discoverySeed).toBe(41);
     expect(ports.openPage).toHaveBeenLastCalledWith('/follow');
   });
 
-  it('refresh 总是按 URL 读筛选，仅当前关注宿主接收重取与滚动', () => {
+  it('refresh 按 URL 恢复筛选，当前宿主复用原有代次', () => {
     const { controller, ports, location, live } = setup();
     location('/follow', '?tag=one&media=images');
     live(false);
@@ -96,9 +97,9 @@ describe('关注域地址与会话控制', () => {
     expect(ports.session().revision).toBe(2);
     live(true);
     expect(controller.refresh()).toBe(true);
-    expect(ports.session().revision).toBe(3);
+    expect(ports.session().revision).toBe(2);
     expect(ports.revealFeed).toHaveBeenCalledOnce();
-    expect(ports.scrollTop).toHaveBeenCalledOnce();
+    expect(ports.scrollTop).not.toHaveBeenCalled();
   });
 
   it('索引作者重置题材，在线标签保持题材，资料页在线卡不接管页级操作', () => {
@@ -115,8 +116,8 @@ describe('关注域地址与会话控制', () => {
     expect(followManageParams('?page=-4&tab=invalid')).toEqual({ tab: 'list', page: 1, sort: '', dir: '' });
     expect(followManageParams('?page=3.9&tab=feeds&sort=added&dir=asc')).toEqual({ tab: 'list', page: 3, sort: 'added', dir: 'asc' });
     expect(followManageEntry('?tab=feeds')).toBe('/subscriptions');
-    expect(followManageParams('?tab=tags').tab).toBe('tags');
-    expect(followManageEntry('?tab=tags')).toBe('/subscriptions?tab=tags');
+    expect(followManageParams('?tab=tags').tab).toBe('list');
+    expect(followManageEntry('?tab=tags')).toBe('/tags?scope=online');
     expect(followManagePath({ tab: 'list', page: 1, sort: '', dir: '' })).toBe('/subscriptions');
     expect(followManageEntry('?tab=wants&page=4&sort=x')).toBe('/jav?tab=wants');
     expect(followManageEntry('?tab=wants', 'add')).toBe('/subscriptions?tab=add');
@@ -127,14 +128,17 @@ describe('关注域地址与会话控制', () => {
     const calls: string[] = [];
     const ports = { view: () => current, adoptView: (next: FollowView) => { current = next },
       rememberReturn: (path: string) => { calls.push(path) }, close: () => { calls.push('close') },
-      open: vi.fn(), openAuthor: vi.fn(), drawer: vi.fn() };
-    const actions = createFollowDetailActions(ports, { toast: vi.fn(), failure: vi.fn() });
+      open: vi.fn(), openAuthor: vi.fn(), drawer: vi.fn(), presented: vi.fn() };
+    const actions = createFollowDetailActions(ports, { toast: vi.fn(), failure: vi.fn(), canFlip: () => false });
     actions.openTag('two'); actions.openTag('one');
     expect(calls).toEqual(['/follow?tag=one%2Ctwo', 'close', '/follow?tag=two', 'close']);
     actions.openItem(17, 2);
     expect(ports.open).toHaveBeenCalledWith(17, 2, true);
     actions.openAuthor('Kou');
     expect(ports.openAuthor).toHaveBeenCalledWith('Kou');
+    const item = { id: 3, title: '新作预告', tags: [] } as unknown as Parameters<typeof actions.present>[0];
+    actions.present(item, 'video');
+    expect(ports.presented).toHaveBeenCalledWith(item);
     expect(followWorkMark(['none', '甲乙丙', 1])).toBe('甲乙');
     const host = document.createElement('div'); host.innerHTML = followWorkMark(['a/b', '甲', 1, 11]);
     expect(new URL(host.querySelector('img')!.src).searchParams.get('work')).toBe('a/b');

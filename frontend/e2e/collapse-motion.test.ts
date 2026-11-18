@@ -6,10 +6,17 @@ import { launch, settle, visit, VIEWPORTS } from './harness.ts';
 
 async function motion(page: Page, trigger: Locator) {
   await page.emulateMedia({ reducedMotion: 'no-preference' });
+  const body = page.locator(`[id="${await trigger.getAttribute('aria-controls')}"]`);
+  if (await trigger.getAttribute('aria-expanded') !== 'true') {
+    await trigger.click();
+    await page.waitForFunction(node => (node as HTMLElement).classList.contains('ui-fcollapse-settled'),
+      await body.elementHandle());
+  }
   const result = await trigger.evaluate(async button => {
     const body = document.getElementById(button.getAttribute('aria-controls')!)!;
-    const arrow = button.querySelector('svg')!;
-    const initialTransform = getComputedStyle(arrow).transform;
+    const arrow = button.querySelector(':scope > svg')!;
+    const initialStyle = getComputedStyle(arrow);
+    const initialTransform = [initialStyle.transform, initialStyle.rotate];
     const height = body.getBoundingClientRect().height;
     (button as HTMLElement).click();
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
@@ -21,20 +28,23 @@ async function motion(page: Page, trigger: Locator) {
     }
     const middle = body.getBoundingClientRect().height;
     const inert = body.inert;
-    const stableArrow = button.querySelector('svg') === arrow;
+    const stableArrow = button.querySelector(':scope > svg') === arrow;
     const duration = getComputedStyle(arrow).transitionDuration;
     for (const animation of [...body.getAnimations(), ...arrow.getAnimations()]) animation.finish();
+    const finalStyle = getComputedStyle(arrow);
     return { height, middle, inert, transitioned: Boolean(transition), stableArrow,
-      duration, transform: getComputedStyle(arrow).transform, initialTransform };
+      duration, transform: [finalStyle.transform, finalStyle.rotate], initialTransform };
   });
   assert.ok(result.height > 0 && result.middle > 0 && result.middle < result.height, JSON.stringify(result));
   assert.equal(result.transitioned, true);
   assert.equal(result.inert, true);
-  const body = page.locator(`[id="${await trigger.getAttribute('aria-controls')}"]`);
-  await page.waitForFunction(node => (node as HTMLElement).hidden, await body.elementHandle());
+  await page.waitForFunction(node => (node as HTMLElement).hidden || node!.closest('details')?.open === false,
+    await body.elementHandle());
+  assert.equal(await trigger.getAttribute('aria-expanded'), 'false');
+  assert.equal(await body.isVisible(), false);
   assert.equal(result.stableArrow, true);
   assert.notEqual(result.duration, '0s');
-  assert.notEqual(result.transform, result.initialTransform);
+  assert.notDeepEqual(result.transform, result.initialTransform);
   await trigger.click();
   await page.waitForTimeout(40);
   await trigger.click();
@@ -43,9 +53,10 @@ async function motion(page: Page, trigger: Locator) {
   await page.waitForFunction(node => (node as HTMLElement).classList.contains('ui-fcollapse-settled'),
     await body.elementHandle());
   assert.equal(await trigger.getAttribute('aria-expanded'), 'true');
+  assert.equal(await body.isVisible(), true);
   assert.equal(await body.evaluate(node => (node as HTMLElement).inert || (node as HTMLElement).hidden), false);
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  assert.equal(await trigger.locator('svg').evaluate(node => getComputedStyle(node).transitionDuration), '0s');
+  assert.equal(await trigger.locator(':scope > svg').evaluate(node => getComputedStyle(node).transitionDuration), '0s');
 }
 
 describe('折叠正文与箭头共用动画', () => {
@@ -83,15 +94,9 @@ describe('折叠正文与箭头共用动画', () => {
         const taskButtons = '[data-library-completion] [data-split-button] > button[aria-busy="true"]';
         await settle(opened.page, 'body', { except: taskButtons });
         await motion(opened.page, opened.page.locator('#toasts [data-processing-dock] button[aria-controls]'));
-        await opened.page.evaluate(() => {
-          localStorage.setItem('peach.post-setup-tutorial.v1', 'pending');
-          localStorage.removeItem('peach.post-setup-tutorial-collapsed.v1');
-          localStorage.removeItem('peach.post-setup-tutorial-skipped.v1');
-        });
-        await opened.page.reload({ waitUntil: 'load' });
-        await opened.page.locator('#postSetupTutorial .post-setup-notification').waitFor();
-        await settle(opened.page, 'body', { except: taskButtons });
-        await motion(opened.page, opened.page.locator('[data-tutorial-collapse]'));
+        await opened.page.locator('#tutorialBtn').click();
+        await opened.page.locator('label').filter({ has: opened.page.getByRole('radio', { name: '界面导览', exact: true }) }).click();
+        await motion(opened.page, opened.page.locator('[data-guide-topic="browse"] > details > summary'));
         assert.deepEqual(opened.problems, []);
       } finally { await opened.close() }
     });

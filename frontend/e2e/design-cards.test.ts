@@ -1,13 +1,41 @@
 /* 设计决定：作品卡、管理页与复核。读 `getComputedStyle` 断言用户定过的外观；共用的桩与浏览器生命周期在 `design-fixture.ts`。 */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import type { Browser, Locator } from 'playwright-core';
+import type { Browser, Locator, Page } from 'playwright-core';
 import { expectBody, settle, visit } from './harness.ts';
 import {
   DESKTOP, MOBILE, tokenColor, openReview, REVIEW_ROW, lightness, WIDE, JUNK_COUNT, openJunk, junkItem, openJunkWith,
   openCatalog, openCatalogFixture, openFollowManage, stubFollowManage, holdApi, controlFaces, disabledTokens,
   waitingActionFaces, assertDisabledFace, installDesignBrowser, PIXEL,
 } from './design-fixture.ts';
+
+/** 每个视口从未阅读的进度开始；账本跨设备持久化由 API 回归验证。 */
+async function freshTutorial(page: Page) {
+  const state = { version: 1, campaign: 'browser-tutorial', invited: false, completed: false,
+    chapters: {} as Record<string, { next: number; read: string[]; skipped: string[] }> };
+  await page.route('**/api/tutorial-progress', async route => {
+    if (route.request().method() === 'POST') {
+      const action = route.request().postDataJSON();
+      if (action.action === 'dismiss') state.invited = true;
+      else if (action.action === 'complete' || action.action === 'reopen') {
+        state.invited = true;
+        state.completed = action.action === 'complete';
+      } else {
+        const row = state.chapters[action.chapter] ??= { next: 0, read: [], skipped: [] };
+        row.next = action.next;
+        if (action.action === 'step') {
+          row.read = row.read.filter(step => step !== action.step);
+          row.skipped = row.skipped.filter(step => step !== action.step);
+          row[action.skipped ? 'skipped' : 'read'].push(action.step);
+        }
+      }
+    }
+    await route.fulfill({ json: state });
+  });
+}
+
+// 监视器只保留框架异步收尾异常的调用栈，错误仍由 Node 判为失败。
+process.on('uncaughtExceptionMonitor', error => console.error(error.stack));
 
 describe('设计决定：作品卡、管理页与复核', () => {
   let browser: Browser;
@@ -64,11 +92,45 @@ describe('设计决定：作品卡、管理页与复核', () => {
     }
   });
 
+  it('长悬浮主控在窄卡同步缩小，两颗角落按钮保持同档且不覆盖主控', { timeout: 60_000 }, async () => {
+    const opened = await openCatalog(browser);
+    try {
+      const card = opened.page.locator('#grid [data-media-card]:has([data-media-seek])').first();
+      for (const [width, main, corner] of [[470, 58, 36], [200, 36, 30]]) {
+        await card.evaluate((node, size) => {
+          const element = node as HTMLElement;
+          element.style.width = `${size}px`;
+          element.style.minWidth = `${size}px`;
+          element.style.maxWidth = `${size}px`;
+          element.dataset.longhover = '';
+        }, width!);
+        await opened.page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+        const geometry = await card.evaluate(node => {
+          const primary = [...node.querySelectorAll('[data-media-seek] button')];
+          const corners = [...node.querySelectorAll('[data-media-preview], [data-media-later] button')];
+          const sizes = (nodes: Element[]) => nodes.map(button => {
+            const style = getComputedStyle(button);
+            return [parseFloat(style.width), parseFloat(style.height)];
+          });
+          const overlaps = corners.some(corner => primary.some(button => {
+            const a = corner.getBoundingClientRect(), b = button.getBoundingClientRect();
+            return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+          }));
+          return { primary: sizes(primary), corners: sizes(corners), overlaps };
+        });
+        assert.deepEqual(geometry.primary, Array.from({ length: 3 }, () => [main, main]));
+        assert.deepEqual(geometry.corners, [[corner, corner], [corner, corner]]);
+        assert.equal(geometry.overlaps, false, JSON.stringify({ width, geometry }));
+      }
+    } finally { await opened.close() }
+  });
+
   it('馆藏卡片的字取页面正文那一档，角标、悬停控件、进度条、竖屏带、Mix 与回收站卡面按定下的样子画', { timeout: 90_000 }, async () => {
     /* 演示库凑不出回收站里的非视频资源：回收站那一页把第二条换成一个压缩包。
        目录那一页给前三条挂半程观看进度，量进度条的颜色。 */
     const opened = await openCatalogFixture(browser, (payload, url) => {
       if (url.searchParams.get('state') !== 'trash') {
+        if (!url.searchParams.has('orient')) assert.ok(payload.items.length >= 8, 'Mix 外观夹具至少提供八张作品');
         for (const item of payload.items.slice(0, 3)) Object.assign(item, { duration: 600, play_seconds: 300 });
         return;
       }
@@ -76,7 +138,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
       if (!item) throw new Error('演示目录不够两条');
       Object.assign(item, { medium: 'archive', name: '演示资料.zip', disposal: 'trash' });
       Object.assign(payload.items[0], { disposal: 'trash', is_jav: false, has_cover: false, has_thumb: true });
-    });
+    }, { completeFirstPage: true });
     const { page } = opened;
     await page.route('**/poster**', (route) => route.fulfill({
       status: 200, contentType: 'image/png', body: Buffer.from(PIXEL, 'base64'),
@@ -113,6 +175,8 @@ describe('设计决定：作品卡、管理页与复核', () => {
     try {
       await page.locator('#grid [data-shorts-strip]').first().waitFor({ timeout: 10_000 });
       await page.locator('#grid [data-media-grid] > [data-media-card] [data-media-progress]').first().waitFor({ timeout: 10_000 });
+      // 本例检查外观，夹具提供完整首页，Mix 按累计八张的真实规则插入。
+      await page.locator('#grid [data-mix-glyph]').first().waitFor({ state: 'attached' });
       const catalog = await readStyles({
         card: '[data-media-grid] > [data-media-card]',
         badge: '[data-media-grid] > [data-media-card] [data-media-badge]',
@@ -180,9 +244,8 @@ describe('设计决定：作品卡、管理页与复核', () => {
       assert.equal(catalog.progress?.background, catalog.tungsten.background, '观看进度条不是钨丝蓝');
       assert.deepEqual([catalog.mixGlyph?.background, catalog.mixGlyph?.borderWidth, catalog.mixGlyph?.borderColor],
         [catalog.overlay.background, '1px', catalog.overlay.borderColor], 'Mix 署名位那枚字形不是半透明底加细边');
-      /* 居中的快退快进和右下角「稍后看」是同一种控件，只是尺寸不同：58px 配 34px 图标；稍后看是卡片悬浮动作，
-         取紧凑档 32px 配 18px 图标。 */
-      assert.deepEqual([catalog.seekGlyph?.width, catalog.laterButton?.width, catalog.laterGlyph?.width], ['34px', '32px', '18px'],
+      /* 主控保持 58px 配 34px 图标；角落动作取同一档 36px 配 18px 图标。 */
+      assert.deepEqual([catalog.seekGlyph?.width, catalog.laterButton?.width, catalog.laterGlyph?.width], ['34px', '36px', '18px'],
         '悬停控件的尺寸和图标比例变了');
       const denseShort = await page.evaluate(() => {
         document.body.dataset.density = 'dense';
@@ -209,17 +272,21 @@ describe('设计决定：作品卡、管理页与复核', () => {
         glyph: '[data-variant="resource"] [data-media-glyph]',
         kind: '[data-variant="resource"] [data-media-kind-glyph]',
       });
-      /* 回收站卡的标题统一两行，头像对齐标题顶部，归入原因与边框保留间距。 */
+      /* 回收站卡是 JAV 探索卡那一副：卡面不描边，头像与封面左缘齐平；标题统一两行、头像对齐标题顶部，
+         归入原因在标签行，下面隔开一段才是卡底那颗「还原」，键行贴着卡的下缘。 */
       const inset = await page.locator('#grid [data-media-card][data-variant="resource"]').first().evaluate((card) => {
         const box = (selector: string) => card.querySelector(selector)!.getBoundingClientRect();
         const frame = card.getBoundingClientRect();
-        const [pic, avatar, title, reason] = ['[data-media-pic]', '[data-media-avatar]', '[data-media-title]', '[data-media-disposal-reason]'].map(box);
-        return { left: avatar.left - frame.left, top: title.top - pic.bottom, bottom: frame.bottom - reason.bottom,
+        const [pic, avatar, title, reason, actions] = ['[data-media-pic]', '[data-media-avatar]', '[data-media-title]',
+          '[data-media-disposal-reason]', '[data-jav-actions]'].map(box);
+        return { left: avatar.left - frame.left, top: title.top - pic.bottom, gap: actions.top - reason.bottom,
+          bottom: Math.abs(frame.bottom - actions.bottom), edge: getComputedStyle(card).borderTopWidth,
           title: title.height, lineHeight: parseFloat(getComputedStyle(card.querySelector('[data-media-title]')!).lineHeight),
           skew: Math.abs(avatar.top - title.top) };
       });
-      assert.ok(inset.left >= 10 && inset.top >= 8 && inset.bottom >= 10,
-        `回收站卡的元信息区贴着边框或封面：左 ${inset.left}、上 ${inset.top}、下 ${inset.bottom}`);
+      assert.deepEqual([inset.edge, inset.left], ['0px', 0], `回收站卡描了边或头像没和封面左缘齐平：${JSON.stringify(inset)}`);
+      assert.ok(inset.top >= 8 && inset.gap >= 8 && inset.bottom < 1,
+        `回收站卡的标题贴着封面、归入原因贴着键行，或键行没落在卡底：${JSON.stringify(inset)}`);
       assert.ok(Math.abs(inset.title - inset.lineHeight * 2) < 1, `回收站标题未预留两行：${JSON.stringify(inset)}`);
       assert.ok(inset.skew <= 3, `头像没有位于标题区顶部，偏 ${inset.skew}px`);
       assert.deepEqual([trash.glyph?.display, trash.glyph?.place, trash.glyph?.color], ['grid', 'center center', trash.muted.color],
@@ -237,14 +304,14 @@ describe('设计决定：作品卡、管理页与复核', () => {
           return filter;
         });
       assert.match(scan, /grayscale\(0\.9\)/, '待删卡的悬停扫视层没有跟着灰化');
-      /* 待删卡的封面、补底和元信息一起压暗。 */
+      /* 待删卡的封面与补底压暗；元信息区同探索卡照常画，不跟着压暗。 */
       const pending = await page.locator('#grid [data-media-card][data-pending-delete]:not([data-variant="resource"])')
         .first().evaluate((card) => ({
           meta: getComputedStyle(card.querySelector('[data-media-meta]')!).opacity,
           backdrop: getComputedStyle(card.querySelector('[data-media-pic]')!, '::before').filter,
           image: getComputedStyle(card.querySelector('[data-media-pic] img')!).filter,
         }));
-      assert.equal(pending.meta, '0.58', '待删卡的元信息区没有压暗');
+      assert.equal(pending.meta, '1', '待删卡的元信息区被压暗了，读不清标题与归入原因');
       assert.match(pending.backdrop, /blur\(26px\) grayscale\(0\.9\) brightness\(0\.27\)/, '待删卡的模糊补底跟随封面灰化');
       assert.match(pending.image, /grayscale\(0\.9\) brightness\(0\.54\)/, '待删卡封面没有跟着灰化');
     } finally {
@@ -252,7 +319,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
     }
   });
 
-  it('回收站的骨架和落地同一副几何，计数栏在两种主题下都和页面底色分得开', { timeout: 90_000 }, async () => {
+  it('回收站的骨架和落地同一副几何，筛选浮层在两种主题下都和页面底色分得开', { timeout: 90_000 }, async () => {
     /* 回收站多是图片与压缩包，骨架照资源卡排：夹具把回收站那一页全换成图片。 */
     const opened = await openCatalogFixture(browser, (payload, url) => {
       if (url.searchParams.get('state') !== 'trash') return;
@@ -267,66 +334,69 @@ describe('设计决定：作品卡、管理页与复核', () => {
         const rect = element.getBoundingClientRect();
         return [Math.round(rect.top), Math.round(rect.height)];
       };
-      const lede = document.querySelector<HTMLElement>('[data-manage-lede]');
-      const card = document.querySelector('#grid .catalog-skeleton .skeletoncard')
-        || document.querySelector('#grid [data-media-card][data-variant="resource"]');
-      /* 读数与「清空回收站」各自的竖直中线：两者说的是同一批文件，同在说明行一行里。 */
+      const frame = document.querySelector<HTMLElement>('#trashFilter [data-catalog-frame]');
+      /* 落地后骨架那一层藏着留在网格里，量的是看得见的那一张。 */
+      const card = [...document.querySelectorAll(
+        '#grid [data-jav-skeleton-card], #grid [data-media-card][data-variant="resource"]',
+      )].find(node => !node.closest('[data-content-skeleton][aria-hidden="true"], [data-content-current][aria-hidden="true"]')
+        && getComputedStyle(node).visibility === 'visible') ?? null;
+      /* 读数与「清空回收站」各自的竖直中线：两者说的是同一批文件，同在浮层下排一行里。 */
       const middle = (element: Element | null | undefined) => {
         if (!element) return null;
         const rect = element.getBoundingClientRect();
         return Math.round(rect.top + rect.height / 2);
       };
-      return { lede: box(lede), card: box(card),
-        cells: [...lede?.querySelectorAll<HTMLElement>('[data-trash-lede-skeleton]') ?? []].map((cell) => cell.dataset.trashLedeSkeleton),
-        text: lede?.querySelector('[data-lede-text]')?.textContent ?? null,
-        row: [middle(lede?.querySelector('[data-lede-text]')), middle(lede?.querySelector('[data-empty-trash]'))] };
+      const readout = frame?.querySelector('[data-catalog-readout]');
+      return { frame: box(frame), card: box(card),
+        placeholder: readout?.querySelectorAll('[data-skeleton="count"]').length ?? 0,
+        text: readout?.textContent ?? null,
+        row: [middle(readout), middle(frame?.querySelector('[data-empty-trash]'))] };
     });
     try {
       const release = await holdApi(page);
       await page.goto(new URL('/trash', page.url()).href, { waitUntil: 'load' });
-      await page.locator('#grid .catalog-skeleton .skeletoncard').first().waitFor({ timeout: 15_000 });
+      await page.locator('#grid [data-jav-skeleton-card]').first().waitFor({ timeout: 15_000 });
       const waiting = await measure();
       release();
       await page.locator('#grid [data-media-card][data-variant="resource"]').first().waitFor({ timeout: 15_000 });
       await settle(page);
       const landed = await measure();
-      assert.ok(waiting.lede, '回收站骨架期间没有计数栏，读数到了才冒出来把网格往下推');
-      assert.deepEqual([waiting.cells, waiting.text], [['text', 'action'], null], `骨架期间说明行不是两格占位：${JSON.stringify(waiting)}`);
-      assert.match(landed.text ?? '', /个符合 · 显示 \d+/, `读数没有落进说明行：${JSON.stringify(landed)}`);
-      assert.deepEqual(landed.cells, [], '读数落地后占位还在');
+      assert.ok(waiting.frame, '回收站骨架期间没有筛选浮层，读数到了才冒出来把网格往下推');
+      assert.equal(waiting.placeholder, 1, `骨架期间读数那一格不是占位：${JSON.stringify(waiting)}`);
+      assert.match(landed.text ?? '', /个符合 · 显示 \d+/, `读数没有落进浮层：${JSON.stringify(landed)}`);
+      assert.equal(landed.placeholder, 0, '读数落地后占位还在');
       const [textMiddle, buttonMiddle] = landed.row;
       assert.ok(textMiddle != null && buttonMiddle != null && Math.abs(textMiddle - buttonMiddle) <= 1,
-        `读数和清空键没并在说明行同一行：${JSON.stringify(landed.row)}`);
-      assert.deepEqual(waiting.lede, landed.lede, `计数栏落地时位置或高度跳了：${JSON.stringify({ waiting, landed })}`);
+        `读数和清空键没并在浮层下排同一行：${JSON.stringify(landed.row)}`);
+      assert.deepEqual(waiting.frame, landed.frame, `筛选浮层落地时位置或高度跳了：${JSON.stringify({ waiting, landed })}`);
       assert.deepEqual(waiting.card, landed.card, `回收站首张卡落地时位置或高度跳了：${JSON.stringify({ waiting, landed })}`);
-      /* 同一页重画（前进后退回到同一条 /trash）：读数接口还在路上时说明行留着上一次的读数，不再铺占位。 */
+      /* 同一历史条目保留读数和卡片，不重取也不重新铺占位。 */
       await page.evaluate(() => {
         const flags = window as unknown as { trashLedeFlashed?: boolean };
         flags.trashLedeFlashed = false;
         new MutationObserver(() => {
-          if (document.querySelector('[data-trash-lede-skeleton]')) flags.trashLedeFlashed = true;
-        }).observe(document.querySelector('[data-manage-header]')!, { childList: true, subtree: true });
+          if (document.querySelector('#trashFilter [data-skeleton="count"]')) flags.trashLedeFlashed = true;
+        }).observe(document.querySelector('#trashFilter')!, { childList: true, subtree: true });
       });
-      const again = await holdApi(page);
-      const reread = page.waitForRequest((request) => {
+      const rereads: string[] = [];
+      page.on('request', request => {
         const url = new URL(request.url());
-        return url.pathname === '/api/items' && url.searchParams.get('state') === 'trash';
-      }, { timeout: 15_000 });
+        if (url.pathname === '/api/items' && url.searchParams.get('state') === 'trash') rereads.push(url.href);
+      });
       await page.evaluate(() => dispatchEvent(new PopStateEvent('popstate')));
-      await reread;
-      const holding = await measure();
-      again();
       await page.locator('#grid [data-media-card][data-variant="resource"]').first().waitFor({ timeout: 15_000 });
       await settle(page);
-      assert.deepEqual([holding.cells, holding.text], [[], landed.text], `同页重画时说明行回到了占位：${JSON.stringify(holding)}`);
+      const holding = await measure();
+      assert.deepEqual(rereads, [], '同一历史条目重复取数');
+      assert.deepEqual([holding.placeholder, holding.text], [0, landed.text], `同页重画时读数回到了占位：${JSON.stringify(holding)}`);
       assert.equal(await page.evaluate(() => (window as unknown as { trashLedeFlashed?: boolean }).trashLedeFlashed), false,
-        '同页重画期间说明行闪回了占位');
+        '同页重画期间读数闪回了占位');
       const surfaces = await page.evaluate(() => {
         const root = document.documentElement;
         const before = root.dataset.theme;
         const read = (theme: string) => {
           root.dataset.theme = theme;
-          return [getComputedStyle(document.querySelector('[data-manage-lede]')!).backgroundColor,
+          return [getComputedStyle(document.querySelector('#trashFilter [data-catalog-frame]')!).backgroundColor,
             getComputedStyle(document.body).backgroundColor];
         };
         const result = { light: read('light'), dark: read('dark') };
@@ -334,8 +404,8 @@ describe('设计决定：作品卡、管理页与复核', () => {
         else root.dataset.theme = before;
         return result;
       });
-      for (const [theme, [lede, ground]] of Object.entries(surfaces)) {
-        assert.notEqual(lede, ground, `${theme} 主题下回收站计数栏和页面同一个底色：${lede}`);
+      for (const [theme, [frame, ground]] of Object.entries(surfaces)) {
+        assert.notEqual(frame, ground, `${theme} 主题下回收站筛选浮层和页面同一个底色：${frame}`);
       }
     } finally {
       await opened.close();
@@ -352,7 +422,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
       await page.goto(new URL('/trash', page.url()).href, { waitUntil: 'load' });
       const cards = page.locator('#grid [data-media-card][data-id]');
       await cards.nth(1).waitFor({ timeout: 15_000 });
-      await page.locator('[data-manage-lede] [data-empty-trash]').waitFor({ timeout: 15_000 });
+      await page.locator('#trashFilter [data-empty-trash]').waitFor({ timeout: 15_000 });
       for (const at of [0, 1]) await cards.nth(at).click({ modifiers: ['Control'], position: { x: 20, y: 20 } });
       await page.locator('[data-batch-dock] [data-selection-dock]').waitFor({ timeout: 10_000 });
       await settle(page);
@@ -367,7 +437,14 @@ describe('设计决定：作品卡、管理页与复核', () => {
           node.remove();
           return value;
         };
-        const paint = (key: Element) => [getComputedStyle(key).backgroundImage, getComputedStyle(key, '::before').backgroundImage];
+        /* 渐变里各个色标换成像素再比：BoardUI 危险键用 oklch 写、`--board-red` 用 rgb 写，字面不同不等于颜色不同。 */
+        const stops = (gradient: string) => (gradient.match(/(?:rgba?|oklch|oklab|hsla?)\([^)]*\)/g) ?? []).map((color) => {
+          const context = document.createElement('canvas').getContext('2d')!;
+          context.fillStyle = color;
+          context.fillRect(0, 0, 1, 1);
+          return [...context.getImageData(0, 0, 1, 1).data].join(',');
+        });
+        const paint = (key: Element) => [getComputedStyle(key).backgroundImage, getComputedStyle(key, '::before').backgroundImage].map(stops);
         return {
           // 与文字同行的字形取 `--icon-inline`（1.2em），按所在文字字号算出应有的边长。
           glyphs: [...dock.querySelectorAll('button svg')].map((svg) => {
@@ -377,13 +454,15 @@ describe('设计决定：作品卡、管理页与复核', () => {
           }),
           count: getComputedStyle(dock.querySelector('[role="status"]')!).color,
           batch: paint(dock.querySelector('[data-batch-action="delete"]')!),
-          empty: paint(document.querySelector('[data-manage-lede] [data-empty-trash]')!),
-          tokens: [probe('--board-red'), probe('--board-red-hover')],
+          empty: paint(document.querySelector('#trashFilter [data-empty-trash]')!),
+          raw: probe('--board-red'),
+          tokens: [probe('--board-red'), probe('--board-red-hover')].map(stops),
         };
       });
       assert.deepEqual(read.glyphs, [[true, true], [true, true], [true, true]], `批量条的字形没按行内字号缩放：${JSON.stringify(read.glyphs)}`);
       assert.equal(read.count, await tokenColor(page, 'body', '--ink-2'), '批量条的计数不是次级墨色');
-      assert.match(read.tokens[0], /^linear-gradient/, `--board-red 没解析成渐变：${read.tokens[0]}`);
+      assert.match(read.raw, /^linear-gradient/, `--board-red 没解析成渐变：${read.raw}`);
+      assert.ok(read.tokens[0]!.length >= 2, `--board-red 的色标没读出来：${JSON.stringify(read.tokens)}`);
       assert.deepEqual(read.batch, read.tokens, `批量条「彻底删除」的红不是 --board-red 那一组：${JSON.stringify(read)}`);
       assert.deepEqual(read.empty, read.tokens, `「清空回收站」的红不是 --board-red 那一组：${JSON.stringify(read)}`);
     } finally {
@@ -549,7 +628,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
       assert.ok((narrow[0]?.x || 0) >= 0 && (narrow[0]?.x || 0) + (narrow[0]?.width || 0) <= 390,
         '390px 下视频卡越出视口');
 
-      const nested = card.locator('[data-media-tag]:not(:disabled)').first();
+      const nested = card.locator('button[data-media-tag]').first();
       const tag = await nested.getAttribute('data-tag');
       assert.ok(tag, '演示卡没有可操作的内部标签');
       await nested.focus();
@@ -563,73 +642,174 @@ describe('设计决定：作品卡、管理页与复核', () => {
     }
   });
 
-  for (const [label, viewport, inset] of [['390px', MOBILE, 12], ['宽屏', DESKTOP, 24]] as const) {
-    it(`${label} 下教程浮窗贴着右下角，Toast 让到它上方，批量选择条盖在它上面`, { timeout: 60_000 }, async () => {
-      const opened = await visit(browser, '/', viewport);
+  for (const [label, viewport] of [['390px', MOBILE], ['宽屏', DESKTOP]] as const) {
+    it(`${label} 下教程中心可阅读、关闭与重开，不提交业务写入`, { timeout: 60_000 }, async () => {
+      const opened = await visit(browser, '/', viewport, freshTutorial);
       try {
-        await opened.page.evaluate(() => {
-          localStorage.setItem('peach.post-setup-tutorial.v1', 'pending');
-          localStorage.removeItem('peach.post-setup-tutorial-collapsed.v1');
-          localStorage.removeItem('peach.post-setup-tutorial-skipped.v1');
+        const page = opened.page;
+        await expectBody(page, '/', [page.locator('#grid')]);
+        await settle(page);
+        const writes: string[] = [];
+        const streams: string[] = [];
+        page.on('request', request => {
+          if (/^\/(?:stream|api\/stream-plan)/.test(new URL(request.url()).pathname)) streams.push(request.url());
+          if (new URL(request.url()).pathname === '/api/diagnostics/client-error' && request.postDataJSON()?.kind === 'context') return;
+          if (new URL(request.url()).pathname.startsWith('/api/') && new URL(request.url()).pathname !== '/api/tutorial-progress' && !['GET', 'HEAD'].includes(request.method())) {
+            writes.push(`${request.method()} ${new URL(request.url()).pathname}`);
+          }
         });
-        await opened.page.reload({ waitUntil: 'load' });
-        /* 目录网格画出来时 paintSelection 已经按当前页收好批量条的按钮；教程卡取数期间的
-           占位带 aria-busy，settle 等到的是最终那张卡。 */
-        await expectBody(opened.page, '/', [
-          opened.page.locator('#grid [data-media-card][data-id]').first(),
-          opened.page.locator('#postSetupTutorial .post-setup-notification'),
-        ]);
-        await settle(opened.page);
-        /* 批量条只在有选中项时才画：Ctrl 点两张卡进多选，再在浮条中心点取最上层元素。窄屏上它
-           横跨整行，一定落在教程卡上；宽屏上两者不在同一处，这一条只在窄屏量。 */
-        const cards = opened.page.locator('#grid [data-media-card][data-id]');
-        for (const at of [0, 1]) await cards.nth(at).click({ modifiers: ['Control'], position: { x: 20, y: 20 } });
-        await opened.page.locator('[data-batch-dock] [data-selection-dock]').waitFor({ timeout: 10_000 });
-        await settle(opened.page);
-        const probe = await opened.page.evaluate(() => {
-          const dock = document.querySelector('[data-batch-dock] [data-selection-dock]')!;
-          const tutorial = document.querySelector('#postSetupTutorial .post-setup-notification')!;
-          const card = tutorial.getBoundingClientRect();
-          const box = dock.getBoundingClientRect();
-          const x = box.left + box.width / 2;
-          const y = box.top + box.height / 2;
-          const top = document.elementFromPoint(x, y);
-          return { top: card.top, bottom: card.bottom, left: card.left, right: card.right,
-            dock: { overlaps: x >= card.left && x <= card.right && y >= card.top && y <= card.bottom,
-              tutorialOnTop: !!top && tutorial.contains(top) } };
-        });
-        assert.ok(Math.abs(probe.bottom - (viewport.height - inset)) <= 1,
-          `教程浮窗没有贴着右下角：下沿 ${probe.bottom}，应为 ${viewport.height - inset}`);
-        if (viewport.mobile) {
-          assert.ok(probe.dock.overlaps, '批量选择条的中心没落在教程浮窗上，这条判据没有量到重叠');
-          assert.ok(!probe.dock.tutorialOnTop, '教程浮窗盖住了批量选择条');
+        const opener = page.locator('#tutorialBtn');
+        await page.locator('.peach-guide-popover').getByRole('heading', { name: '从这里打开新手教程' }).waitFor();
+        assert.ok(await opener.evaluate(node => node.classList.contains('driver-active-element')));
+        await opener.click();
+        const dialog = page.getByRole('dialog', { name: '新手教程', exact: true });
+        await dialog.waitFor();
+        const tabTops = new Set<number>();
+        for (const name of ['开始使用', '界面导览', '设置导览']) {
+          await dialog.locator('label').filter({ has: page.getByRole('radio', { name, exact: true }) }).click();
+          // 窗口高度跟着这一页的内容走：没到上限时正文不滚也不留空；顶边不动，页签不跟着跳。
+          const fit = await page.locator('.peach-guide-center').evaluate((surface) => {
+            const body = surface.querySelector('.peach-guide-body')!;
+            return { capped: surface.getBoundingClientRect().height >= parseFloat(getComputedStyle(surface).maxHeight) - 1,
+              slack: body.clientHeight - body.scrollHeight };
+          });
+          if (!fit.capped) assert.ok(Math.abs(fit.slack) <= 1, `${name} 窗口没贴合内容：空出 ${fit.slack}px`);
+          tabTops.add(Math.round((await dialog.getByRole('radiogroup', { name: '教程路径' }).boundingBox())!.y));
+          assert.equal(await dialog.locator('[data-guide-banner]').count(), 1, `${name} 缺少共用引导区`);
+          assert.equal(await dialog.locator('[data-guide-banner] .peach-guide-topic-icon svg').count(), 1, `${name} 缺少图标`);
+          const indent = (await dialog.locator('[data-guide-banner] .peach-guide-topic-icon').boundingBox())!.x
+            - (await dialog.getByRole('radiogroup', { name: '教程路径' }).boundingBox())!.x;
+          assert.ok(Math.abs(indent) <= 1, `${name} 引导区比页签缩进 ${indent}px`);
+          const action = (await dialog.locator('[data-guide-banner] button').first().boundingBox())!.x
+            - (await dialog.locator('[data-guide-banner] .peach-guide-topic-icon').boundingBox())!.x;
+          assert.ok(Math.abs(action) <= 1, `${name} 引导区的行动键没有靠左：偏 ${action}px`);
         }
-        assert.ok(probe.top >= 0 && probe.left >= 0 && probe.right <= viewport.width,
-          `教程浮窗越出了 ${viewport.width}px 视口`);
-
-        /* 回执走真的入口发一条不会自己消失的，等栈里每一条都进场停稳再量。演示库刚跑完扫描，
-           「扫描与资料采集已完成」随时可能也进栈，所以判据是栈里每一条都在卡上沿之上。 */
-        await opened.page.evaluate(async () => {
-          const entry = '/dist/peach-app.js';
-          const ui = await import(entry);
-          ui.showToast(document.getElementById('toasts'), { success: '', error: '' }, 'e2e-tutorial-lift',
-            { html: '已保存配置', alert: false, timeout: 0, action: null });
+        assert.equal(tabTops.size, 1, `切页签时页签上下跳动：${[...tabTops].join(', ')}`);
+        const box = await dialog.boundingBox();
+        assert.ok(box && box.x >= 0 && box.y >= 0 && box.x + box.width <= viewport.width && box.y + box.height <= viewport.height,
+          '教程中心越出视口');
+        await dialog.locator('label').filter({ has: page.getByRole('radio', { name: '设置导览', exact: true }) }).click();
+        const segments = await dialog.getByRole('radiogroup', { name: '教程路径' }).evaluate(node => {
+          const surface = node.querySelector('[data-moving-surface]')!;
+          const first = node.querySelector('label')!;
+          return { position: getComputedStyle(surface).position, inset: first.getBoundingClientRect().left - node.getBoundingClientRect().left };
         });
-        await opened.page.locator('#toasts [data-sonner-toast]').first().waitFor();
-        await opened.page.waitForFunction(() => [...document.querySelectorAll('#toasts [data-sonner-toast]')]
-          .every((node) => node.getAttribute('data-mounted') === 'true' && node.getAnimations().length === 0));
-        const stack = await opened.page.evaluate(() => {
-          const card = document.querySelector('#postSetupTutorial .post-setup-notification')!.getBoundingClientRect();
-          const boxes = [...document.querySelectorAll('#toasts [data-sonner-toast]')].map((node) => node.getBoundingClientRect());
-          return { cardTop: card.top, lowest: Math.max(...boxes.map((box) => box.bottom)),
-            highest: Math.min(...boxes.map((box) => box.top)) };
+        assert.equal(segments.position, 'absolute', '选中底板不应占据分段器的排列空间');
+        assert.ok(segments.inset <= 8, `首个选项前出现 ${segments.inset}px 空白`);
+        const scroller = dialog.locator('.peach-guide-body');
+        assert.equal(await scroller.evaluate(node => getComputedStyle(node).scrollbarWidth), 'none', '正文应使用共享覆盖式滚动条');
+        const headerTop = (await dialog.locator('header').boundingBox())!.y;
+        await scroller.evaluate(node => { node.scrollTop = node.scrollHeight });
+        assert.equal((await dialog.locator('header').boundingBox())!.y, headerTop, '标题栏随正文滚走了');
+        await dialog.getByRole('searchbox', { name: '搜索教程' }).fill('不存在的功能xyz');
+        await dialog.getByRole('heading', { name: '没有匹配的教程', exact: true }).waitFor();
+        await dialog.getByRole('button', { name: '关闭新手教程', exact: true }).click();
+        await dialog.waitFor({ state: 'hidden' });
+        await page.waitForFunction(() => document.activeElement === document.getElementById('tutorialBtn'));
+        await opener.click();
+        await dialog.waitFor();
+        const inside = (await dialog.locator('header').boundingBox())!;
+        await page.mouse.move(inside.x + 40, inside.y + 20);
+        await page.mouse.down();
+        await page.mouse.move(2, 2);
+        await page.mouse.up();
+        assert.ok(await dialog.isVisible(), '从正文拖到遮罩不应关闭教程');
+        await page.mouse.click(2, 2);
+        await dialog.waitFor({ state: 'hidden' });
+        await page.waitForFunction(() => document.activeElement === document.getElementById('tutorialBtn'));
+        await opener.click();
+        await dialog.waitFor();
+        await dialog.locator('label').filter({ has: page.getByRole('radio', { name: '界面导览', exact: true }) }).click();
+        assert.equal(await dialog.locator('[data-guide-topic]').count(), 4);
+        await dialog.locator('[data-guide-topic="browse"] > details > summary').click();
+        await dialog.getByRole('button', { name: /找到并播放/ }).click();
+        await page.locator('.peach-guide-popover').waitFor();
+        assert.equal(await dialog.isVisible(), false, '章节点击后仍停留在中间介绍页');
+        const playbackGuide = page.locator('.peach-guide-popover');
+        for (let step = 0; step < 4; step += 1) await playbackGuide.getByRole('button', { name: '下一步', exact: true }).click();
+        await page.locator('#stage .vjs-control-bar.driver-active-element').waitFor();
+        assert.deepEqual(await page.locator('#stage video.vjs-tech').evaluate(video => ({ paused: (video as HTMLVideoElement).paused, src: (video as HTMLVideoElement).currentSrc })), { paused: true, src: '' });
+        await playbackGuide.getByRole('button', { name: '下一步', exact: true }).click();
+        await page.locator('#stage [data-player-subtitles].driver-active-element').waitFor();
+        await playbackGuide.locator('#driver-popover-description').click();
+        assert.equal(await page.locator('#stage .vjs-peach-settings-toggle').getAttribute('aria-expanded'), 'true', '点击说明关闭了正在讲解的菜单');
+        await page.waitForFunction(() => {
+          const panel = document.querySelector('.peach-guide-popover')?.getBoundingClientRect();
+          return document.querySelector('.driver-overlay')?.parentElement?.id === 'stage'
+            && panel && panel.left >= 0 && panel.right <= innerWidth && panel.top >= 0 && panel.bottom <= innerHeight;
         });
-        assert.ok(stack.lowest <= stack.cardTop,
-          `Toast 压在教程浮窗上：Toast 下沿 ${stack.lowest}，教程上沿 ${stack.cardTop}`);
-        assert.ok(stack.highest >= 0, `Toast 被顶出了视口：上沿 ${stack.highest}`);
-      } finally {
-        await opened.close();
-      }
+        await playbackGuide.getByRole('button', { name: '下一步', exact: true }).click();
+        await page.locator('#stage [data-local-playback-row].driver-active-element').waitFor();
+        await playbackGuide.getByRole('button', { name: '完成本章', exact: true }).click();
+        await page.locator('#stage[open]').waitFor({ state: 'hidden' });
+        assert.deepEqual(streams, [], '导览请求了视频正片');
+        await dialog.waitFor();
+        await dialog.getByRole('button', { name: '开始快速导览', exact: true }).click();
+        const guide = page.locator('.peach-guide-popover');
+        await guide.waitFor();
+        await settle(page, '.peach-guide-popover');
+        const guideBox = (await guide.boundingBox())!;
+        assert.ok(guideBox.x >= 8 && guideBox.x + guideBox.width <= viewport.width - 8, '导览说明卡贴住了视口边缘');
+        assert.ok(await guide.evaluate(node => node.contains(document.activeElement)), '导览焦点未停留在说明卡内');
+        const resized = viewport.width === 390 ? { width: 1280, height: 800 } : { width: 390, height: 844 };
+        await page.setViewportSize(resized);
+        await page.waitForFunction(() => {
+          const box = document.querySelector('.peach-guide-popover')?.getBoundingClientRect();
+          const target = document.querySelector('.driver-active-element')?.getBoundingClientRect();
+          return box && target && box.left >= 0 && box.right <= innerWidth && box.top >= 0 && box.bottom <= innerHeight
+            && target.width > 0 && target.right > 0 && target.left < innerWidth;
+        });
+        await page.setViewportSize({ width: viewport.width, height: viewport.height });
+        await page.mouse.click(2, viewport.height - 2);
+        await guide.waitFor({ state: 'hidden' });
+        await dialog.waitFor();
+        await dialog.getByRole('button', { name: '继续快速导览', exact: true }).click();
+        await guide.waitFor();
+        await page.keyboard.press('Escape');
+        await guide.waitFor({ state: 'hidden' });
+        await dialog.waitFor();
+        await dialog.getByRole('button', { name: '继续快速导览', exact: true }).click();
+        await guide.getByRole('button', { name: '跳过本章', exact: true }).click();
+        await dialog.waitFor();
+        assert.equal(await guide.isVisible(), false, '跳过本章后仍停在步骤中');
+        assert.equal(await dialog.locator('[data-guide-banner][data-guide-completed]').count(), 0, '跳过误记为完成');
+        await dialog.locator('label').filter({ has: page.getByRole('radio', { name: '设置导览', exact: true }) }).click();
+        await dialog.getByRole('button', { name: '了解常用设置', exact: true }).click();
+        await guide.waitFor();
+        for (let step = 0; step < 4; step += 1) await guide.getByRole('button', { name: '下一步', exact: true }).click();
+        await guide.getByRole('button', { name: '完成本章', exact: true }).click();
+        await dialog.waitFor();
+        await page.locator('#settingsPanel').waitFor({ state: 'hidden' });
+        assert.equal(new URL(page.url()).pathname, '/', '设置导览完成后未返回开始前的页面');
+        assert.ok(await dialog.getByRole('radio', { name: '设置导览', exact: true }).isChecked());
+        await dialog.getByRole('searchbox', { name: '搜索教程' }).fill('媒体库');
+        await dialog.getByRole('button', { name: /媒体库与入库 媒体库/ }).click();
+        await guide.waitFor();
+        for (let step = 0; step < 8; step += 1) await guide.getByRole('button', { name: '下一步', exact: true }).click();
+        await guide.getByRole('button', { name: '完成本章', exact: true }).click();
+        await dialog.waitFor();
+        assert.equal(new URL(page.url()).pathname, '/', '页面导览完成后未返回开始前的页面');
+        assert.ok(await dialog.getByRole('searchbox', { name: '搜索教程' }).isVisible());
+        await dialog.locator('label').filter({ has: page.getByRole('radio', { name: '界面导览', exact: true }) }).click();
+        await dialog.getByRole('button', { name: '继续快速导览', exact: true }).click();
+        for (let step = 0; step < 3; step += 1) await guide.getByRole('button', { name: '下一步', exact: true }).click();
+        await guide.getByRole('button', { name: '完成本章', exact: true }).click();
+        await dialog.waitFor();
+        await opener.waitFor({ state: 'hidden' });
+        assert.ok(await dialog.getByRole('button', { name: '再看一遍', exact: true }).isVisible());
+        assert.equal(await dialog.locator('[data-guide-banner][data-guide-completed]').count(), 1);
+        await page.reload();
+        await page.locator('#grid').waitFor();
+        assert.equal(await opener.isVisible(), false, '完成快速导览后刷新又显示了教程按钮');
+        assert.deepEqual(writes, [], '只读教程触发了业务写入');
+        await page.goto(new URL('/settings/maintenance', page.url()).href);
+        await page.getByRole('region', { name: '新手教程', exact: true }).getByRole('button', { name: '重新打开', exact: true }).click();
+        await dialog.waitFor();
+        assert.equal(await opener.evaluate(node => (node as HTMLElement).hidden), false, '设置重新打开后没有恢复右上角入口');
+        assert.ok(writes.every(write => write === 'POST /api/configuration/storage/measure'),
+          `正常进入维护页只允许自动统计占用：${JSON.stringify(writes)}`);
+        assert.deepEqual(opened.problems, []);
+      } finally { await opened.close() }
     });
   }
 
@@ -916,9 +1096,9 @@ describe('设计决定：作品卡、管理页与复核', () => {
     const opened = await openReview(browser);
     try {
       /* 量的是 token 对而不是某一条线：`separator-border` 画在哪种面上由各处自己决定，
-         复核卡的外框和候选块之间那条线落在 `primary`，脚注带那条落在 `secondary`。逐条去点名，
+         复核卡页头与候选块之间那条线落在 `primary`，脚注带那条落在 `secondary`。逐条去点名，
          新加一处就得记得再补一条用例，而漏补和「这处本来就没线」在屏幕上看不出区别。
-         末尾再核一次复核卡自己的框线确实取的就是这个 token，免得两档都合格却根本没落到现场。 */
+         末尾再核一次复核卡里的分隔线确实取的就是这个 token，免得两档都合格却根本没落到现场。 */
       const read = () => opened.page.locator('section[data-review-key]').first()
         .evaluate((node) => {
           const context = document.createElement('canvas').getContext('2d')!;
@@ -934,7 +1114,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
             line: token('--color-separator-border'),
             card: token('--color-background-primary-default'),
             filled: token('--color-background-secondary-default'),
-            edge: paint(style.borderTopColor),
+            edge: paint(getComputedStyle(node.querySelector('.border-separator-border')!).borderBottomColor),
           };
         });
       const before = await read();
@@ -950,17 +1130,17 @@ describe('设计决定：作品卡、管理页与复核', () => {
         assert.ok(dark >= light,
           `暗色下分隔线压在${label}上只差 ${dark.toFixed(1)} 个明度，浅色下有 ${light.toFixed(1)}`);
       }
-      assert.deepEqual(after.edge, after.line, '复核卡的框线没走 separator-border');
+      assert.deepEqual(after.edge, after.line, '复核卡里的分隔线没走 separator-border');
       assert.deepEqual(opened.problems, []);
     } finally {
       await opened.close();
     }
   });
 
-  it('垃圾文件的计数行与正文同宽，标题位于内容左上角', { timeout: 60_000 }, async () => {
+  it('垃圾文件的筛选浮层与正文同宽，标题位于内容左上角', { timeout: 60_000 }, async () => {
     const opened = await openJunk(browser);
     try {
-      /* 标题对齐内容左边缘；摘要、分类切换与网格共用正文宽度。 */
+      /* 标题对齐内容左边缘；筛选浮层（上排分类、下排读数与排序）与网格共用正文宽度。 */
       const box = await opened.page.evaluate(() => {
         // 浅色是两块面最容易消失的那一档：深色下 primary 本来就比页面亮一级。
         document.documentElement.dataset.theme = 'light';
@@ -974,23 +1154,19 @@ describe('设计决定：作品卡、管理页与复核', () => {
         return {
           title: span('[data-manage-title]'),
           main: span('#main'),
-          summary: span('#count [data-collection-summary]'),
           filters: span('#count [data-junk-filters-frame]'),
+          readout: span('#count [data-junk-filters-frame] [data-catalog-readout]'),
           grid: span('#grid'),
-          summaryFace: face('#count [data-collection-summary]'),
           filtersFace: face('#count [data-junk-filters-frame]'),
           page: getComputedStyle(document.body).backgroundColor,
         };
       });
-      assert.ok(box.filters.width > 0, '分类切换被摘要挤成 0 宽，整条在宽屏上看不见');
+      assert.ok(box.readout.width > 0, '读数被挤成 0 宽，宽屏上看不见');
       assert.deepEqual(box.title, box.grid);
       assert.equal(box.title.width, box.grid.width);
-      for (const [label, measured] of [['摘要', box.summary], ['分类切换', box.filters]] as const) {
-        assert.deepEqual(measured, box.grid,
-          `${label}和正文网格不同宽：${measured.left}+${measured.width} 对 ${box.grid.left}+${box.grid.width}`);
-      }
-      assert.notEqual(box.summaryFace, box.page, '摘要那块面和页面底色同色，整块看不见');
-      assert.notEqual(box.filtersFace, box.page, '分类切换那块面和页面底色同色，整块看不见');
+      assert.deepEqual(box.filters, box.grid,
+        `筛选浮层和正文网格不同宽：${box.filters.left}+${box.filters.width} 对 ${box.grid.left}+${box.grid.width}`);
+      assert.notEqual(box.filtersFace, box.page, '筛选浮层和页面底色同色，整块看不见');
       assert.deepEqual(opened.problems, []);
     } finally {
       await opened.close();
@@ -1001,8 +1177,8 @@ describe('设计决定：作品卡、管理页与复核', () => {
     const opened = await visit(browser, '/junk-files', WIDE);
     try {
       /* 把等待态停在屏幕上：让这一页唯一那次取数挂着不回。等的只有读数，分类切换由
-         URL 决定、此刻就画得出最终样子；画成目录那条的话，等待期间摆着一排这一页根本
-         没有的换批与排序键，数据到货整行再换成另一种东西。 */
+         URL 决定、此刻就画得出最终样子；画成目录那条的话，等待期间摆着一个这一页根本
+         没有的「换一批」，数据到货整行再换成另一种东西。 */
       await opened.page.route('**/api/ads?**', () => {});
       await opened.page.reload({ waitUntil: 'load' });
       // 等 island 接管：壳铺的骨架和它等数据时那一版相同，接管之后仍是这一版才算数。
@@ -1010,13 +1186,13 @@ describe('设计决定：作品卡、管理页与复核', () => {
       const row = await opened.page.locator('#count').evaluate((node) => ({
         busy: node.getAttribute('aria-busy'),
         filters: node.querySelectorAll('[data-junk-filters] a').length,
-        placeholder: node.querySelectorAll('[data-collection-summary] [data-skeleton="count"]').length,
-        sorts: node.querySelectorAll('.sorts').length,
+        placeholder: node.querySelectorAll('[data-catalog-readout] [data-skeleton="count"]').length,
+        shuffle: node.querySelectorAll('[data-entity-batch]').length,
       }));
       assert.equal(row.busy, 'true', '等待态没有对辅助技术公开');
       assert.ok(row.filters > 0, '等待期间这一行没有分类切换');
       assert.equal(row.placeholder, 1, '占位没有落在读数那一格');
-      assert.equal(row.sorts, 0, '等待期间摆着这一页没有的排序键');
+      assert.equal(row.shuffle, 0, '等待期间摆着这一页没有的「换一批」');
     } finally {
       await opened.close();
     }
@@ -1030,7 +1206,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
       const page = opened.page;
       const cards = page.locator('#grid [data-junk-card]');
       assert.equal(await cards.count(), 3);
-      await cards.first().locator('[data-junk-action="dispose"]').click();
+      await cards.first().locator('[data-junk-action="dispose"]').press('Enter', { delay: 2100 });
       await page.waitForFunction(() => document.querySelectorAll('#grid [data-junk-card]').length === 2, null,
         { timeout: 10_000 });
       assert.deepEqual(opened.state.batches, [{ ids: [9101], operation: 'dispose', disposal_reason: 'junk' }]);
@@ -1050,7 +1226,7 @@ describe('设计决定：作品卡、管理页与复核', () => {
     }
   });
 
-  it('垃圾卡是一块有边的面：三颗键等宽居中，移入回收站静止就是实底红', { timeout: 90_000 }, async () => {
+  it('垃圾卡复用探索卡，键行同高居中，单击回收使用标准危险按钮', { timeout: 90_000 }, async () => {
     const opened = await openJunkWith(browser, [junkItem(9201, 'archive', '推广.zip'), junkItem(9202, 'url', '官网.url')]);
     try {
       const page = opened.page;
@@ -1060,9 +1236,10 @@ describe('设计决定：作品卡、管理页与复核', () => {
           const style = getComputedStyle(button);
           const rect = button.getBoundingClientRect();
           return {
-            action: (button as HTMLElement).dataset.junkAction, width: Math.round(rect.width), height: Math.round(rect.height),
-            justify: style.justifyContent, border: style.borderTopWidth, face: style.backgroundColor, ink: style.color,
-            label: getComputedStyle(button.querySelector('[data-junk-label]')!).display,
+            action: (button as HTMLElement).dataset.junkAction, height: Math.round(rect.height),
+            justify: style.justifyContent, paint: [style.backgroundImage, getComputedStyle(button, '::before').backgroundImage],
+            ink: style.color, background: style.backgroundColor, hold: button.hasAttribute('data-hold-confirm'),
+            before: getComputedStyle(button, '::before').content, text: button.textContent ?? '',
           };
         });
         const rect = (node: Element | null) => {
@@ -1077,47 +1254,64 @@ describe('设计决定：作品卡、管理页与复核', () => {
         // 计数徽标到货时玻璃带动画重新落位：跑完再量，量的是它停下的地方。
         document.querySelector('#count [data-view-glide]')?.getAnimations().forEach((one) => one.finish());
         const glide = rect(document.querySelector('#count [data-view-glide]:not([hidden])'));
-        // 卡在 island 里取 oklch，页面底是 rgb：各画一个像素再比，字面不同不等于颜色不同。
-        const pixel = (color: string) => {
+        /* 两颗危险键的静止面与悬停层各自读出来，再与直接解析 token 的探针比：同一份定义才会一致。 */
+        const probe = (token: string) => {
+          const node = document.createElement('div');
+          node.style.background = `var(${token})`;
+          document.body.append(node);
+          const value = getComputedStyle(node).backgroundImage;
+          node.remove();
+          return value;
+        };
+        /* 渐变里各个色标换成像素再比：BoardUI 危险键用 oklch 写、`--board-red` 用 rgb 写，字面不同不等于颜色不同。 */
+        const stops = (gradient: string) => (gradient.match(/(?:rgba?|oklch|oklab|hsla?)\([^)]*\)/g) ?? []).map((color) => {
           const context = document.createElement('canvas').getContext('2d')!;
           context.fillStyle = color;
           context.fillRect(0, 0, 1, 1);
           return [...context.getImageData(0, 0, 1, 1).data].join(',');
-        };
+        });
         const style = getComputedStyle(card);
-        const ground = [document.body, document.documentElement].map((el) => pixel(getComputedStyle(el).backgroundColor))
-          .find((value) => !value.endsWith(',0')) ?? '255,255,255,255';
-        return { edge: style.borderTopWidth, line: pixel(style.borderTopColor), page: ground, keys, links, glide };
+        return { edge: style.borderTopWidth, face: style.backgroundColor, keys: keys.map((key) => ({ ...key, paint: key.paint.map(stops) })),
+          links, glide, raw: probe('--board-red'),
+          red: [probe('--board-red'), probe('--board-red-hover')].map(stops),
+          actionsBottom: Math.abs(card.getBoundingClientRect().bottom - card.querySelector('[data-junk-actions]')!.getBoundingClientRect().bottom) };
       });
-      const red = await tokenColor(page, 'body', '--board-red');
       const wide = await read();
-      // 浅色下卡底与页面同为白，卡的轮廓全靠这圈边：边宽 1px、颜色不能跟页面底一样。
-      assert.equal(wide.edge, '1px', '垃圾卡没有描边');
-      assert.notEqual(wide.line, wide.page, '垃圾卡的边和页面底色同色');
-      assert.equal(new Set(wide.keys.map((key) => key.width)).size, 1, `三颗键不等宽：${wide.keys.map((key) => key.width)}`);
+      // 卡面同 JAV 探索卡：轮廓靠封面格，卡本身不描边、不铺底；键行落在卡底。
+      assert.deepEqual([wide.edge, wide.face], ['0px', 'rgba(0, 0, 0, 0)'], '垃圾卡描了边或铺了底，不是探索卡那一副');
+      assert.ok(wide.actionsBottom < 1, `键行没落在卡底：${wide.actionsBottom}`);
+      assert.deepEqual(wide.keys.map((key) => key.action), ['reveal', 'dismiss-junk', 'dispose']);
       for (const key of wide.keys) {
         assert.equal(key.justify, 'center', `${key.action} 的图标与标签没有居中`);
         assert.equal(key.height, 36, `${key.action} 高 ${key.height}`);
       }
       const dispose = wide.keys.find((key) => key.action === 'dispose')!;
-      assert.equal(dispose.face, red, '移入回收站静止态不是实底红');
-      assert.equal(dispose.ink, 'rgb(255, 255, 255)');
-      for (const key of wide.keys.filter((one) => one.action !== 'dispose')) assert.equal(key.border, '1px', `${key.action} 没有描边`);
+      assert.match(wide.raw, /^linear-gradient/, `--board-red 没解析成渐变：${wide.raw}`);
+      assert.ok(wide.red[0]!.length >= 2, `--board-red 的色标没读出来：${JSON.stringify(wide.red)}`);
+      assert.equal(dispose.hold, false);
+      assert.deepEqual(dispose.paint, wide.red);
+      assert.equal(dispose.ink, await tokenColor(page, '#grid [data-junk-card]', '--color-text-white'));
+      for (const key of wide.keys.filter((one) => one.action !== 'dispose')) {
+        assert.notDeepEqual(key.paint, wide.red, `${key.action} 也画成了红键`);
+      }
       const current = wide.links.filter((link) => link.current);
       assert.equal(current.length, 1);
       // 分类条是首页筛选条那一副：键自己不铺底，当前那一类底下垫的是那块滑动玻璃。
       assert.ok(wide.links.every((link) => link.face === 'rgba(0, 0, 0, 0)'), '分类键自己铺了底，不是首页那副滑动玻璃');
       assert.deepEqual(wide.glide, current[0]!.box, '滑动玻璃没有落在当前那一类上');
 
-      // 紧凑密度下键上只剩图标。
+      // 紧凑密度下键缩一档，「查看位置」只剩图标，判断与移入回收站仍写字。
       await page.evaluate(() => { document.body.dataset.density = 'dense' });
-      assert.ok((await read()).keys.every((key) => key.label === 'none'), '紧凑密度下键上还有字');
+      await page.waitForFunction(() => document.querySelector('#grid [data-junk-card] [data-junk-actions]')?.hasAttribute('data-compact'));
+      const dense = await read();
+      assert.deepEqual(dense.keys.map((key) => key.text.trim() === ''), [true, false, false], `紧凑密度下键上的字：${JSON.stringify(dense.keys)}`);
+      assert.ok(dense.keys.every((key) => key.height < 36), `紧凑密度下键没缩：${dense.keys.map((key) => key.height)}`);
       await page.evaluate(() => { delete document.body.dataset.density });
 
-      // 手机上够手指点：分类与三颗键都到 44px。
+      // 手机上分类够手指点，到 44px；卡底的键同探索卡，不比桌面矮。
       await page.setViewportSize({ width: MOBILE.width, height: MOBILE.height });
       const narrow = await read();
-      assert.ok(narrow.keys.every((key) => key.height >= 44), `手机上键高 ${narrow.keys.map((key) => key.height)}`);
+      assert.ok(narrow.keys.every((key) => key.height >= 36), `手机上键高 ${narrow.keys.map((key) => key.height)}`);
       assert.ok(narrow.links.every((link) => link.height >= 44), `手机上分类高 ${narrow.links.map((link) => link.height)}`);
       assert.deepEqual(opened.problems, []);
     } finally {

@@ -17,10 +17,11 @@ from unittest.mock import patch
 from types import SimpleNamespace
 from urllib.parse import parse_qs, quote, urlsplit
 
-from peach import __version__
+from peach import __version__, interface_text
 from support.amane import write_amane_metadata
 from support.ledger import fresh_ledger
 from support.mp4 import minimal_mp4
+from support.stalls import stalled_mount
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,7 +71,6 @@ if HAS_DEPS:
     from peach import routes_auth
     from peach import routes_jav_browser
     from peach.api import create_app
-    from peach.follow_covers import PLACEHOLDER_CONTENT_TYPE
     from peach.follow_secrets import credential_store_for
     from peach.config import PeachSettings
 
@@ -146,6 +146,9 @@ CREATE TABLE review_decision(
   category TEXT NOT NULL,item_key TEXT NOT NULL,status TEXT NOT NULL,
   reviewer TEXT NOT NULL DEFAULT 'local-default',note TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL,
   PRIMARY KEY(category,item_key));
+CREATE TABLE download_task(
+  id INTEGER PRIMARY KEY, code TEXT, state TEXT NOT NULL, ledger_path TEXT, asset_id INTEGER,
+  display_name TEXT NOT NULL DEFAULT '', remote_name TEXT);
 CREATE TABLE genre_decision(
   source_genre TEXT PRIMARY KEY, raw_genre TEXT NOT NULL, peach_tag TEXT, decided_at TEXT NOT NULL,
   CHECK(peach_tag IS NULL OR length(trim(peach_tag))>0));
@@ -185,6 +188,42 @@ class MediaCacheHeaderTests(unittest.TestCase):
         # `immutable` 只许出现在 /vendor/ 那条中间件里，它留在 api.py。这里不查
         # 字面量：常量上方那段注释正是在解释「为什么不加 immutable」。
         self.assertNotIn('"public, max-age=31536000, immutable"', source)
+
+
+@unittest.skipUnless(HAS_DEPS, "FastAPI/httpx 尚未安装")
+class ContractJsonTests(unittest.TestCase):
+    def test_contract_reads_encode_to_the_same_bytes_as_the_framework_default(self):
+        from dataclasses import dataclass
+        from datetime import datetime, timezone
+        from fastapi.encoders import jsonable_encoder
+        from fastapi.responses import JSONResponse
+        from peach.routes_api import _json
+
+        @dataclass
+        class Point:
+            x: int
+
+        payload = {"ok": True, 3: "整数键", "path": Path("covers") / "ABC-001.jpg",
+                   "at": datetime(2026, 11, 6, 4, 0, tzinfo=timezone.utc), "set": {"甲"},
+                   "tuple": (1, 2.5, None), "point": Point(4), "nested": [{"名": "值"}]}
+        response = _json(payload)
+        self.assertEqual(response.body, JSONResponse(jsonable_encoder(payload)).body)
+        self.assertEqual(response.media_type, "application/json")
+        with self.assertRaises(ValueError):
+            _json({"nan": float("nan")})
+
+    def test_contract_reads_preserve_framework_encoding_for_non_string_keys(self):
+        from datetime import date
+        from enum import Enum
+        from fastapi.encoders import jsonable_encoder
+        from fastapi.responses import JSONResponse
+        from peach.routes_api import _json
+
+        class Key(Enum):
+            DAY = "day"
+
+        payload = {date(2026, 11, 6): {Path("covers"): {Key.DAY: "今天"}}}
+        self.assertEqual(_json(payload).body, JSONResponse(jsonable_encoder(payload)).body)
 
 
 @unittest.skipUnless(HAS_DEPS, "FastAPI/httpx 尚未安装")
@@ -309,11 +348,18 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         con.executescript(BASE_SCHEMA)
         for migration in ("0018_online_follow.sql", "0034_feed_discovery.sql"):
             con.executescript((ROOT / "migrations" / migration).read_text(encoding="utf-8"))
+        # 0056 给这两张表加的失败原因 code 列；整份 0056 还要下载任务表，这里只加这两张表的。
+        for table in ("follow_source", "feed_source"):
+            con.executescript(f"ALTER TABLE {table} ADD COLUMN last_error_code TEXT;"
+                              f"ALTER TABLE {table} ADD COLUMN last_error_params TEXT;")
+        # 删除与清空回收站后的缓存清理按想要清单认封面的主人；整份 0042 迁移还要连带
+        # 修订号与账户表，这里只建清理读的两列。
+        con.execute("CREATE TABLE want_item(code_key TEXT, state TEXT NOT NULL)")
         con.execute(
             """INSERT INTO asset(id,location,path,name,medium,size,creator,studio,duration,
                                   width,height,ctx_orient,snapshot_path,first_seen)
                VALUES(1,'local',?,'one.mp4','video',100,
-                      'Alice','Studio A',100,1920,1080,'横屏',?,'2026-08-14')""",
+                      'Alice','Studio A',100,1920,1080,'landscape',?,'2026-08-14')""",
             (str(self.media_file), str(self.snapshot_file)),
         )
         con.execute("INSERT INTO asset_tag(asset_id,tag,source) VALUES(1,'Tag A','test')")
@@ -351,6 +397,7 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             taste_history_import_root=self.taste_import_root,
             taste_history_output_root=self.taste_output_root,
             taste_history_manifest=self.taste_manifest,
+            follow_state_root=self.root / 'state',
             entry_links_root=self.root / "state",
         )
         self.app = create_app(self.settings)
@@ -390,7 +437,9 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["attention"], [])
         checks = response.json()["checks"]
         self.assertEqual(set(checks), {"database", "schema", "configured", "ffmpeg", "media_mounts", "security"})
-        self.assertTrue(all(set(check) == {"status", "reason"} for check in checks.values()))
+        # 原因原文是 zh-CN，旁边带 code（`reason_code`／`reason_params`，几条并列时是 `reason_parts`）。
+        self.assertTrue(all({"status", "reason"} <= set(check) <= {"status", "reason", "reason_code", "reason_params",
+                                                                  "reason_parts"} for check in checks.values()))
         self.assertNotIn(str(self.media_root), json.dumps(checks))
 
     async def test_client_update_snapshot_is_authenticated_and_never_fetches_releases(self):
@@ -405,6 +454,46 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('minimum_version', value['userscript'])
         self.assertEqual(value['repairs']['state'], 'unavailable')
         self.assertEqual(self.db.read_bytes(), before)
+
+    async def test_startup_migration_answers_status_and_page_shell_but_holds_ledger_requests(self):
+        """启动迁移期间：状态与横幅接口、页面壳照常回应且不碰账本，需要账本的请求回 503 与迁移 code。"""
+        from peach import interface_text
+        untouched = AssertionError('迁移期间不得打开账本')
+        migration = self.app.state.ledger_migration
+        migration.begin()
+        migration.report('backup', 42)
+        try:
+            with (patch('peach.health.inspect_database', side_effect=untouched),
+                  patch('peach.diagnostics.inspect_database', side_effect=untouched),
+                  patch('peach.web_tutorial.q_tutorial_progress', side_effect=untouched),
+                  patch.object(self.app.state.upgrade_repairs, 'snapshot', side_effect=untouched)):
+                health = await self.client.get('/healthz')
+                ready = await self.client.get('/healthz?ready=1')
+                updates = await self.client.get('/api/client-updates?t=secret')
+                await self.client.post('/login', content='token=secret&next=%2F',
+                                       headers={'Content-Type': 'application/x-www-form-urlencoded'})
+                page = await self.client.get('/')
+                held = [await self.client.get('/api/items?t=secret'), await self.client.get('/thumb?id=1&t=secret'),
+                        await self.client.post('/api/tutorial-progress?t=secret', json={})]
+                migration.report('apply', None)
+                applying = await self.client.get('/api/client-updates?t=secret')
+        finally:
+            migration.state = 'idle'
+        self.assertEqual((health.status_code, health.json()['db'], health.json()['ledger_migration']),
+                         (200, 'migrating', {'state': 'running', 'stage': 'backup', 'progress': 42}))
+        self.assertEqual(health.json()['checks']['database']['reason_code'], 'labels.diagnostics.reason.databaseMigrating')
+        self.assertEqual((ready.status_code, ready.json()['ready'], ready.json()['ledger_migration']['state']),
+                         (503, False, 'running'))
+        self.assertEqual((updates.status_code, updates.json()['ledger_migration']),
+                         (200, {'state': 'running', 'stage': 'backup', 'progress': 42}))
+        self.assertEqual(applying.json()['ledger_migration'], {'state': 'running', 'stage': 'apply'})
+        self.assertEqual(page.status_code, 200)
+        for response in held:
+            self.assertEqual((response.status_code, response.json()['message_code']), (503, 'api.ledger.migrating'))
+            self.assertEqual(response.json()['error'], '正在更新本地数据库，完成后刷新页面即可使用。')
+        self.assertEqual(interface_text.text('server:api.ledger.migrating', None, 'en'),
+                         "Updating the local database. Refresh the page when it's done.")
+        self.assertEqual((await self.client.get('/api/client-updates?t=secret')).json()['ledger_migration'], {'state': 'idle'})
 
     async def test_userscript_update_snapshot_uses_scoped_token_without_a_movie_code(self):
         with patch.object(self.app.state.jav_browser, 'authorized', side_effect=lambda token: token == 'script-token'):
@@ -432,6 +521,15 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.post('/api/configuration/upgrade-repairs/retry?t=secret', json={})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(order, ['activate','retry'])
+
+    async def test_confirmed_repair_runs_only_the_named_item(self):
+        service = self.app.state.upgrade_repairs
+        with patch.object(service, 'available', True), patch.object(
+                service, 'apply_confirmed', return_value={'changed': 1}) as apply, patch(
+                'peach.routes_configuration._repair_center', return_value={'items': [], 'history': [], 'available': True}):
+            response = await self.client.post('/api/configuration/repairs/case-duplicates?t=secret', json={})
+        self.assertEqual(response.status_code, 200)
+        apply.assert_called_once_with('case-duplicates')
 
     async def test_installation_confirmation_rejects_manual_repairs(self):
         with patch('peach.api._installation_in_progress', return_value=True), patch.object(
@@ -483,6 +581,7 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.client.get("/api/background-issues")).status_code, 401)
             response = await self.client.get("/api/background-issues?t=secret")
         self.assertEqual(response.status_code, 200)
+        self.assertEqual([item['key'] for item in response.json()['issues']], ['network'])
         [issue] = response.json()["issues"]
         self.assertEqual((issue["key"], issue["href"], issue["since"], issue["retry"]),
                          ("network", "/settings/network#peachProxy", None, "/api/network-status/check"))
@@ -536,6 +635,7 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             detail = "写入端是 mac"
             read_only = True
             read_only_message = "数据库由 mac 负责写入，本机当前只能浏览。"
+            read_only_phrase = {"code": "labels.sync.readOnlyWriter", "params": {"owner": "mac"}}
 
             def observe(self):
                 return None
@@ -560,6 +660,9 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(health.json()["ledger_sync"], "reader")
             self.assertTrue(health.json()["ledger_read_only"])
             self.assertIn("只能浏览", health.json()["ledger_read_only_message"])
+            # 同一句另带 code 与参数，页面按界面语言显示。
+            self.assertEqual((health.json()["ledger_read_only_message_code"], health.json()["ledger_read_only_message_params"]),
+                             ("labels.sync.readOnlyWriter", {"owner": "mac"}))
             reviewed = await client.get("/api/review?t=secret")
             self.assertEqual(reviewed.status_code, 200)
             self.assertEqual(reviewed.json()["mirror"]["state"], "live")
@@ -780,6 +883,95 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(restore)
         return fake
 
+    def _swap_public_resources(self, upstream):
+        """站点圆标经 `public_http` 出网：在它的边界按 `upstream(httpx.Request)` 应答。
+
+        网络层失败照 curl 的形状抛 `RequestException`；地址核验、固定连接与重定向另有
+        `test_public_http` 覆盖。
+        """
+        from peach import public_http
+        from peach.http import HttpResponse
+
+        def fetch(url, **_options):
+            try:
+                response = upstream(httpx.Request("GET", url))
+            except httpx.TransportError as error:
+                raise public_http.requests.exceptions.ConnectionError(str(error)) from error
+            return HttpResponse(response.status_code, {key.lower(): value for key, value in response.headers.items()},
+                                response.content, url)
+        stub = patch.object(public_http, "get", side_effect=fetch)
+        stub.start()
+        self.addCleanup(stub.stop)
+
+    async def test_expired_avatar_is_available_before_its_background_refresh(self):
+        from starlette.requests import Request
+        from peach import follow_assets, routes_media
+        old = b'\x89PNG\r\n\x1a\n' + b'\x00' * 24
+        fresh = old + b'updated'
+        path = follow_assets.cache_path(routes_media._asset_root(self.app.state), 'avatars',
+                                       follow_assets.avatar_cache_key(service='fanbox', id='123'))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(old)
+        past = time.time() - routes_media.AVATAR_REFRESH_SECONDS - 1
+        os.utime(path, (past, past))
+        request = Request({'type': 'http', 'method': 'GET', 'headers': [], 'app': self.app})
+        with patch.object(follow_assets, 'fetch_image', return_value=fresh) as fetch, \
+                patch.object(routes_media, 'resolve_official_avatar', return_value='https://pixiv.pximg.net/icon.png'):
+            response = routes_media.follow_avatar(request, service='fanbox', id='123', args={})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(Path(response.path).read_bytes(), old)
+            fetch.assert_not_called()
+            await response.background()
+        self.assertEqual(path.read_bytes(), fresh)
+        fetch.assert_called_once()
+
+    async def test_expired_favicon_is_available_before_its_background_refresh(self):
+        from peach import link_marks, routes_media
+        generated = self.root / 'generated'
+        path = link_marks.cached_path(generated / 'link-marks', 'https://metadata.example/')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'cached-icon')
+        past = time.time() - routes_media.FAVICON_REFRESH_SECONDS - 1
+        os.utime(path, (past, past))
+        with patch.object(routes_media, 'GENERATED_DIR', generated), \
+                patch.object(routes_media.site_icons, 'best_mark', return_value=b'fresh-icon') as fetch:
+            response = routes_media._site_mark_response(self.app.state, 'https://metadata.example/', path.parent)
+            self.assertEqual(Path(response.path).read_bytes(), b'cached-icon')
+            fetch.assert_not_called()
+            await response.background()
+        self.assertEqual(path.read_bytes(), b'fresh-icon')
+        fetch.assert_called_once()
+
+    async def test_site_and_link_favicons_share_existing_local_bytes(self):
+        from peach import link_marks, routes_media
+        generated = self.root / 'generated'
+        path = link_marks.cached_path(generated / 'link-marks', 'https://metadata.example/')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'cached-icon')
+        with patch.object(routes_media, 'GENERATED_DIR', generated), \
+                patch.object(routes_media.site_icons, 'best_mark') as fetch:
+            response = routes_media._site_mark_response(self.app.state, 'https://metadata.example/',
+                                                       generated / 'site-marks')
+        self.assertEqual(Path(response.path), path)
+        self.assertIsNone(response.background)
+        fetch.assert_not_called()
+
+    async def test_expired_favicon_of_a_gone_link_only_uses_local_bytes(self):
+        from peach import link_marks, routes_media
+        generated = self.root / 'generated'
+        path = link_marks.cached_path(generated / 'link-marks', 'https://metadata.example/')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'cached-icon')
+        past = time.time() - routes_media.FAVICON_REFRESH_SECONDS - 1
+        os.utime(path, (past, past))
+        with patch.object(routes_media, 'GENERATED_DIR', generated), \
+                patch.object(routes_media.site_icons, 'best_mark') as fetch:
+            response = routes_media._site_mark_response(self.app.state, 'https://metadata.example/',
+                                                       path.parent, allow_fetch=False)
+        self.assertEqual(Path(response.path), path)
+        self.assertIsNone(response.background)
+        fetch.assert_not_called()
+
     async def test_follow_avatar_is_fetched_once_and_then_served_from_disk(self):
         """头像是元数据，落在本机：浏览器不直接碰 pixiv，第二次显示也不再问上游。"""
         denied = await self.client.get("/follow-avatar?service=fanbox&id=30917150")
@@ -825,18 +1017,20 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["content-type"], "image/webp")
         self.assertEqual(hits, ["https://kemono.cr/icons/fanbox/30917150"])
-        # 没有实测过头像端点的来源、缺 ref 或身份形状不对的请求都不出网，直接给占位图。
+        # 没有实测过头像端点的来源、缺 ref 或身份形状不对的请求都不出网，直接回 404。
+        # 404 不带占位图：浏览器会把占位图当成加载成功，页面上的兜底链（归档站头像、首字母）就走不下去。
         for query in ("provider=rule34video&ref=1", "provider=kemono&ref=noslash",
                       "service=fanbox&id=not.a.creator", "service=patreon&id=1",
                       "service=profile&id=twitter:../x", "service=profile&id=fanbox:1"):
             missing = await self.client.get(f"/follow-avatar?t=secret&{query}")
             self.assertEqual(missing.status_code, 404, query)
-            self.assertEqual(missing.headers["content-type"], PLACEHOLDER_CONTENT_TYPE, query)
+            self.assertEqual(missing.content, b"", query)
         self.assertEqual(len(hits), 1)
         # 字母加连字符是合法的 FANBOX 创作者 id：去官方查一次，走的是应用那条 client；
-        # 回来的不是资料 JSON，就给占位图，不再往别处取。
+        # 回来的不是资料 JSON，就回 404，不再往别处取。
         unknown = await self.client.get("/follow-avatar?t=secret&service=fanbox&id=not-a-number")
         self.assertEqual(unknown.status_code, 404)
+        self.assertEqual(unknown.content, b"")
         self.assertEqual(hits[1:], ["https://api.fanbox.cc/creator.get?creatorId=not-a-number"])
 
     async def test_profile_avatars_keep_the_sharpest_of_x_and_patreon(self):
@@ -1106,6 +1300,11 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         bundled = await self.client.get('/source-icon?t=secret&provider=f95zone')
         self.assertEqual(bundled.status_code, 200)
         self.assertTrue(bundled.headers['content-type'].startswith('image/png'))
+        # Iwara 官方只有透明底白字形，浅色主题下看不见；内置图优先于缓存里那张白图。
+        from peach.config import PROJECT_ROOT
+        iwara = await self.client.get('/source-icon?t=secret&provider=iwara')
+        self.assertEqual(iwara.status_code, 200)
+        self.assertEqual(iwara.content, (PROJECT_ROOT / 'resources/site-marks/iwara.png').read_bytes())
         self.assertEqual(len(hits), 1)
         blocked = await self.client.get("/source-icon?t=secret&provider=simpcity")
         self.assertEqual(blocked.status_code, 404)
@@ -1143,7 +1342,7 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             hosts.append(request.url.host)
             return httpx.Response(200, content=png, request=request,
                                   headers={"content-type": "image/png"})
-        self._swap_http_client(upstream)
+        self._swap_public_resources(upstream)
 
         denied = await self.client.get("/site-mark?source=airav")
         self.assertEqual(denied.status_code, 401)
@@ -1168,7 +1367,7 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         def upstream(request):
             reached.append(str(request.url))
             return httpx.Response(502, request=request)
-        self._swap_http_client(upstream)
+        self._swap_public_resources(upstream)
         for name in ('avsox', 'manko', 'sukebei', 'mgstage', 'dmm', 'fc2'):
             response = await self.client.get(f'/site-mark?source={name}&t=secret')
             self.assertEqual(response.status_code, 200, name)
@@ -1273,7 +1472,8 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             image.save(buffer, format="PNG")
             return httpx.Response(200, content=buffer.getvalue(), request=request,
                                   headers={"content-type": "image/png"})
-        self._swap_http_client(upstream)
+        self._swap_public_resources(upstream)
+        self.archive_upstream = upstream
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.executemany(
                 "INSERT INTO entity_link(id,entity_id,link_kind,label,url,hostname)"
@@ -1289,11 +1489,11 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                    for link_id in (901, 902)]
         self.assertEqual([answer.status_code for answer in answers], [200, 200])
         self.assertNotEqual(answers[0].content, answers[1].content)
-        self.assertEqual(len(list((self.root / "generated" / "link-marks").iterdir())), 2)
+        self.assertEqual(len(list((self.root / "generated" / "link-marks").glob('*.png'))), 2)
         self.assertTrue(all(url.startswith("https://web.archive.org/") for url in asked), asked)
 
-    async def test_a_link_marked_gone_gets_no_mark_and_no_upstream_request(self):
-        """已失效的链接不再去取图标：停放域名的一次请求就够杀毒软件报警。"""
+    async def test_a_gone_link_without_a_cached_mark_has_no_upstream_request(self):
+        """失效链接缺少本地圆标时返回未取得。"""
         asked = self._archive_links(lambda url: "red")
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.execute(
@@ -1319,12 +1519,12 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         from peach import follow_assets
 
         asked = self._archive_links(lambda url: "red")
-        serving = self.app.state.http_transport.client
+        serving = self.archive_upstream
 
         def offline(request):
             asked.append(str(request.url))
             raise httpx.ConnectError("offline", request=request)
-        self._swap_http_client(offline)
+        self._swap_public_resources(offline)
 
         first = await self.client.get("/link-mark?t=secret&id=901")
         self.assertEqual(first.status_code, 404)
@@ -1337,11 +1537,35 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         marker, = (self.root / "generated" / "link-marks").glob("*.failed")
         past = time.time() - follow_assets.RETRY_SECONDS - 1
         os.utime(marker, (past, past))
-        self.app.state.http_transport.client = serving
+        self._swap_public_resources(serving)
         recovered = await self.client.get("/link-mark?t=secret&id=901")
         self.assertEqual(recovered.status_code, 200)
         self.assertGreater(len(asked), reached)
         self.assertFalse(marker.exists())
+
+    async def test_a_site_redirecting_to_an_unusable_address_counts_as_unreachable(self):
+        """重定向到内网、明文或主机名过不了 IDNA 的地址时，`public_http` 抛 ValueError。
+
+        都按取不到处理：回 404 露出地球图标，失败窗口内不再出网。
+        """
+        self._archive_links(lambda url: "red")
+        for failure in (ValueError("public resource host must resolve only to public addresses"),
+                        ValueError("public resource address is not valid")):
+            with self.subTest(failure=str(failure)):
+                for marker in (self.root / "generated" / "link-marks").glob("*.failed"):
+                    marker.unlink()
+                asked = []
+
+                def broken(request, failure=failure, asked=asked):
+                    asked.append(str(request.url))
+                    raise failure
+                self._swap_public_resources(broken)
+                answer = await self.client.get("/link-mark?t=secret&id=901")
+                self.assertEqual(answer.status_code, 404)
+                reached = len(asked)
+                self.assertTrue(reached)
+                self.assertEqual((await self.client.get("/link-mark?t=secret&id=901")).status_code, 404)
+                self.assertEqual(len(asked), reached, "失败窗口内不再出网")
 
     async def test_unauthorized_keeps_three_shapes_grouped_by_route_class(self):
         """401 三种形态按路由类分组，收敛到 Depends 之后也不许并成一种。
@@ -1842,8 +2066,12 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_genre_tag_answers_to_the_same_rules_as_any_other_tag(self):
         """这里收录的名字和作品页加的标签进同一套词表，判据不能各写一套。"""
         performer = await self.client.post("/api/review/genre?t=secret",
-                                           json={"genre": "シャワー", "tag": "演员:桃子"})
+                                           json={"genre": "シャワー", "tag": "performer:桃子"})
         self.assertEqual(performer.status_code, 400, performer.text)
+        # 旧版前缀写的出演者标记同样不能当标签收。
+        legacy = await self.client.post("/api/review/genre?t=secret",
+                                        json={"genre": "シャワー", "tag": "演员:桃子"})
+        self.assertEqual(legacy.status_code, 400, legacy.text)
         long_name = await self.client.post("/api/review/genre?t=secret",
                                            json={"genre": "シャワー", "tag": "浴" * 81})
         self.assertEqual(long_name.status_code, 400, long_name.text)
@@ -1899,7 +2127,7 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             {"k": "local", "n": 1, "played": 0},
         ])
         self.assertEqual(scoped.json()["orientations"], [
-            {"k": "横屏", "n": 1},
+            {"k": "landscape", "n": 1},
         ])
 
     async def test_global_facets_supply_recommendations_for_an_untagged_detail(self):
@@ -2035,6 +2263,37 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(added.status_code, 200)
         self.assertIn("手动标签", added.json()["tags"])
 
+    async def test_item_edit_is_authenticated_and_returns_the_refreshed_item(self):
+        body = {"id": 1, "fields": {"title": "人工标题"}, "performers": {"add": [{"name": "自建艺人"}]}}
+        denied = await self.client.post("/api/item-edit", json=body)
+        self.assertEqual(denied.status_code, 401)
+        saved = await self.client.post("/api/item-edit?t=secret", json=body)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        item = saved.json()["item"]
+        self.assertEqual(item["field_sources"]["title"]["owner"], "user")
+        self.assertEqual([ref["user_created"] for ref in item["entity_refs"]["performer"] if ref["name"] == "自建艺人"], [True])
+        stale = await self.client.post("/api/item-edit?t=secret", json={**body, "expected_revision": -1})
+        self.assertEqual(stale.status_code, 409)
+
+    async def test_item_cover_upload_and_restore_are_authenticated(self):
+        from io import BytesIO
+        from PIL import Image
+        picture = BytesIO()
+        Image.new("RGB", (640, 430), (120, 40, 40)).save(picture, "JPEG")
+        denied = await self.client.post("/api/item-cover?id=1", content=picture.getvalue(),
+                                        headers={"Content-Type": "image/jpeg"})
+        self.assertEqual(denied.status_code, 401)
+        saved = await self.client.post("/api/item-cover?id=1&origin=upload&t=secret", content=picture.getvalue(),
+                                       headers={"Content-Type": "image/jpeg"})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertTrue(saved.json()["item"]["cover_user"])
+        refused = await self.client.post("/api/item-cover?id=1&t=secret", content=b"not an image",
+                                         headers={"Content-Type": "image/jpeg"})
+        self.assertEqual(refused.status_code, 400)
+        restored = await self.client.post("/api/item-cover/restore?t=secret", json={"id": 1})
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertFalse(restored.json()["item"]["cover_user"])
+
     async def test_tag_management_requires_auth_and_applies_the_preview(self):
         denied = await self.client.get('/api/tag-management')
         self.assertEqual(denied.status_code, 401)
@@ -2068,6 +2327,42 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["models"][0]["id"], "kimi-k3")
         discover.assert_called_once_with()
+
+    async def test_local_player_progress_writes_same_activity_columns(self):
+        from peach import playback_tracking, routes_media
+
+        class Probe:
+            eof = False
+
+            def __init__(self):
+                self.frames = iter([0.0, 0.0, 1.0, 2.0, 40.0, 41.0])
+
+            def snapshot(self):
+                position = next(self.frames, None)
+                if position is None:
+                    raise EOFError("player exited")
+                return playback_tracking.Snapshot(position, 100.0, False)
+
+            def close(self):
+                pass
+
+        con = sqlite3.connect(self.db)
+        before = con.execute("SELECT COALESCE(play_count,0) FROM asset WHERE id=1").fetchone()[0]
+        con.close()
+        trackers = playback_tracking.PlaybackTrackers(poll=0.001)
+        with patch.object(self.app.state, "playback_trackers", trackers):
+            track = routes_media._playback_tracker(self.app.state, 1)
+            self.assertTrue(track(Probe, lambda: True))
+            for _ in range(500):
+                if not trackers.threads:
+                    break
+                await asyncio.sleep(0.01)
+        self.assertFalse(trackers.threads)
+        con = sqlite3.connect(self.db)
+        row = con.execute("SELECT play_count,play_seconds,seek_count,leave_ratio,last_played IS NOT NULL "
+                          "FROM asset WHERE id=1").fetchone()
+        con.close()
+        self.assertEqual(row, (before + 1, 3.0, 1, 0.41, 1))
 
     async def test_post_writes_only_test_database(self):
         response = await self.client.post(
@@ -2166,16 +2461,20 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         routes_auth._ATTEMPTS.clear()
         self.addCleanup(routes_auth._ATTEMPTS.clear)
         form = {"Content-Type": "application/x-www-form-urlencoded"}
-        page = {**form, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+        page = {**form, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "zh-CN,zh;q=0.9"}
         body = "token=secret&next=%2Fstats&days=999"
         refused = await self.client.post("/login", content=body, headers=page)
         self.assertEqual(refused.status_code, 400)
         self.assertTrue(refused.headers["content-type"].startswith("text/html"))
-        self.assertIn('data-page="login" data-next="/stats" data-error="请选择有效的保持登录时间">', refused.text)
+        self.assertIn('data-page="login" data-next="/stats" data-mode="legacy" data-error="请选择有效的保持登录时间">', refused.text)
+        # 页面只收文字的位置按请求的语言渲染好：英文浏览器看到英文原因。
+        english = await self.client.post("/login", content=body, headers={**page, "Accept-Language": "en-US,en;q=0.9"})
+        self.assertIn(f'data-error="{interface_text.text("server:api.auth.invalidRememberDays", None, "en")}">', english.text)
+        self.assertIn('<html lang="en">', english.text)
         self.assertNotIn("set-cookie", refused.headers)
         refused = await self.client.post("/login", content=body, headers=form)
         self.assertEqual(refused.status_code, 400)
-        self.assertEqual(refused.json(), {"error": "请选择有效的保持登录时间"})
+        self.assertEqual(refused.json(), {"error": "请选择有效的保持登录时间", "message_code": "api.auth.invalidRememberDays", "message_params": {}})
         routes_auth._ATTEMPTS.clear()
         for _ in range(10):
             wrong = await self.client.post("/login", content="token=wrong&next=%2Fstats", headers=form)
@@ -2184,11 +2483,11 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(limited.status_code, 429)
         self.assertEqual(limited.headers["retry-after"], "60")
         self.assertTrue(limited.headers["content-type"].startswith("text/html"))
-        self.assertIn('data-page="login" data-next="/stats" data-error="尝试次数较多，请一分钟后重试">',
+        self.assertIn('data-page="login" data-next="/stats" data-mode="legacy" data-error="尝试次数较多，请一分钟后重试">',
                       limited.text)
         limited = await self.client.post("/login", content="token=secret&next=%2Fstats", headers=form)
         self.assertEqual(limited.status_code, 429)
-        self.assertEqual(limited.json(),{"error": "尝试次数较多，请一分钟后重试"})
+        self.assertEqual(limited.json(),{"error": "尝试次数较多，请一分钟后重试", "message_code": "api.auth.tooManyAttempts", "message_params": {}})
 
     async def test_index_directory_urls_keep_query_and_use_canonical_path(self):
         await self.client.post('/login', content='token=secret&next=%2F',
@@ -2322,6 +2621,34 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('<script>', payload)
                 self.assertEqual(response.headers['cache-control'], 'no-store')
 
+    async def test_tutorial_entry_first_frame_uses_shared_ledger_completion(self):
+        from html.parser import HTMLParser
+        from peach.web_tutorial import CAMPAIGN
+
+        class Buttons(HTMLParser):
+            entry = None
+
+            def handle_starttag(self, tag, attrs):
+                attributes = dict(attrs)
+                if tag == 'button' and attributes.get('id') == 'tutorialBtn':
+                    self.entry = attributes
+
+        self.page.write_text('<html><head></head><body><button id="tutorialBtn">教程</button></body></html>',
+                             encoding='utf-8')
+        await self.client.post('/login', content='token=secret&next=%2F',
+                               headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        for action, hidden in ((None, False), ('complete', True), ('reopen', False)):
+            if action:
+                result = await self.client.post('/api/tutorial-progress', json={'campaign': CAMPAIGN, 'action': action})
+                self.assertEqual(result.status_code, 200, result.text)
+            for path in ('/', '/settings/library'):
+                response = await self.client.get(path)
+                self.assertEqual(response.status_code, 200, response.text)
+                parsed = Buttons()
+                parsed.feed(response.text)
+                self.assertIsNotNone(parsed.entry)
+                self.assertEqual('hidden' in parsed.entry, hidden)
+
     async def test_canonical_page_urls_require_authentication(self):
         for path in ('/assets/1', '/posts/1', '/works/ABC-001', '/performers/1',
                      '/tags/1', '/tasks', '/sources', '/subscriptions', '/settings/library',
@@ -2453,6 +2780,22 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(head.content, b"")
         self.assertEqual(head.headers["content-length"], "10")
 
+    async def test_a_range_request_stats_the_source_once(self):
+        """片源在网盘上时每次 stat 都是一趟网络往返：确认存在的那一次一路传到文件响应。"""
+        real_stat = os.stat
+        seen = []
+
+        def counting(path, *args, **kwargs):
+            if os.fspath(path) == str(self.media_file):
+                seen.append(path)
+            return real_stat(path, *args, **kwargs)
+        with patch("os.stat", counting):
+            partial = await self.client.get(
+                "/stream?id=1&session=detail-stat", headers={"X-Token": "secret", "Range": "bytes=2-5"})
+        self.assertEqual(partial.status_code, 206)
+        self.assertEqual(partial.content, b"2345")
+        self.assertEqual(len(seen), 1)
+
     async def test_follow_qualities_lists_every_tier_the_source_offers(self):
         """档位数量由来源决定，不由我们写死。
 
@@ -2509,6 +2852,36 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             {"height": 360, "label": "360p"},
         ])
         self.assertEqual(response.json()["size"], 11458972)
+
+    async def test_follow_qualities_reuses_the_complete_default_media_cache_size(self):
+        from peach.follow_stream import FollowMediaUnavailable, ResolvedFollowMedia
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.executescript((ROOT / 'migrations/0018_online_follow.sql').read_text(encoding='utf-8'))
+            connection.execute("INSERT INTO follow_source(id,provider,ref,label,url,semantics,created_at,updated_at) "
+                "VALUES(2,'rule34video','r34/1','Creator','https://rule34video.com/u','work','x','x')")
+            connection.execute("INSERT INTO follow_item(id,source_id,external_id,title,url,media_url,release_key,first_seen_at,last_seen_at) "
+                "VALUES(9,2,'9','Remote','https://rule34video.com/video/9/x/',"
+                "'https://rule34video.com/get_file/9.mp4/','remote','x','x')")
+        body = b'complete-media'
+        requests = []
+        def upstream(request):
+            requests.append(request.method)
+            self.assertEqual(request.method, 'GET')
+            return httpx.Response(200, request=request, stream=httpx.ByteStream(body),
+                                  headers={'content-type': 'video/mp4', 'content-length': str(len(body))})
+        self._swap_http_client(upstream)
+        url = 'https://rule34video.com/get_file/9.mp4/'
+        target = ResolvedFollowMedia(url, 'https://rule34video.com/video/9/x/',
+                                    allowed_hosts=('rule34video.com',), qualities=((720, url),))
+        with patch.object(self.app.state.follow_media_resolver, 'resolve', return_value=target) as resolve:
+            stored = await self.client.get('/follow-stream?id=9&t=secret')
+            self.assertEqual(stored.content, body)
+            facts = await self.client.get('/follow-qualities?id=9&t=secret')
+            self.assertEqual(facts.json(), {'qualities': [{'height': 720, 'label': '720p'}], 'size': len(body)})
+            resolve.side_effect = FollowMediaUnavailable('errors.followStream.mediaUrlUnavailable')
+            offline = await self.client.get('/follow-qualities?id=9&t=secret')
+        self.assertEqual(offline.json(), {'qualities': [], 'size': len(body)})
+        self.assertEqual(requests, ['GET'])
 
     async def test_follow_qualities_reports_no_size_when_upstream_refuses_the_head(self):
         """字节数取不到不是错误：清晰度照给，`size` 给 None。
@@ -2643,7 +3016,7 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(fields["upstream_status"], 403)
                         self.assertNotIn("private upstream error", response.text)
             with patch.object(self.app.state.follow_media_resolver, "resolve",
-                              side_effect=FollowMediaUnavailable("详情未取得", status_code=429)), \
+                              side_effect=FollowMediaUnavailable("errors.followStream.recentMiss", status_code=429)), \
                     patch.object(error_reporting, "event") as emit:
                 response = await self.client.get("/follow-qualities?id=7&t=secret")
                 self.assertEqual(response.json(), {"qualities": [], "size": None})
@@ -2790,21 +3163,27 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             calls.append(str(request.url))
             if request.url.path.endswith('redirect.mp4'):
                 return httpx.Response(302, headers={'location': 'https://private.example/video.mp4'}, request=request)
-            body = b'#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\npart.ts\n#EXT-X-ENDLIST\n' if request.url.path.endswith('.m3u8') else b'media'
-            kind = 'application/vnd.apple.mpegurl' if request.url.path.endswith('.m3u8') else 'video/mp2t'
+            body = (b'#EXTM3U\n#EXT-X-TARGETDURATION:4\n'
+                    b'#EXT-X-KEY:METHOD=AES-128,URI="https://ygp.blxr5es.com/hls/key.key"\n'
+                    b'#EXTINF:4,\nhttps://ygp.blxr5es.com/hls/part.ts\n#EXT-X-ENDLIST\n'
+                    if request.url.path.endswith('.m3u8') else b'media')
+            kind = ('application/vnd.apple.mpegurl' if request.url.path.endswith('.m3u8') else
+                    'application/octet-stream' if request.url.path.endswith('.key') else 'video/mp2t')
             return httpx.Response(200, headers={'content-type': kind, 'content-length': str(len(body))},
                                   stream=httpx.ByteStream(body), request=request)
         original = self.app.state.http_transport.client
         fake = httpx.Client(transport=httpx.MockTransport(upstream))
         self.app.state.http_transport.client = fake
         try:
-            with patch('peach.follow_stream.resolves_publicly', return_value=False):
+            with patch('peach.http.host_addresses', return_value=('198.18.0.73',)):
                 ref = previews.register('EXM-010', 'https://jdforrepam.com/api/preview/root.m3u8', playlist=True)
                 playlist = await self.client.get(f'/jav-preview/EXM-010/{ref}?t=secret')
                 self.assertEqual(playlist.status_code, 200)
                 segment = next(line for line in playlist.text.splitlines() if line.startswith('/jav-preview/'))
                 self.assertEqual((await self.client.get(segment + '?t=secret')).content, b'media')
-                self.assertEqual(len(calls), 2)
+                key = next(line for line in playlist.text.splitlines() if line.startswith('#EXT-X-KEY:')).split('"')[1]
+                self.assertEqual((await self.client.get(key + '?t=secret')).content, b'media')
+                self.assertEqual(len(calls), 3)
                 for index, url in enumerate(('https://private.example/video.mp4',
                                              'https://www.prestige-av.com/api/media/redirect.mp4')):
                     code = f'EXM-{20 + index:03d}'
@@ -2812,7 +3191,7 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                     failed = await self.client.get(f'/jav-preview/{code}/{ref}?t=secret')
                     self.assertEqual(failed.status_code, 404)
                     self.assertEqual(failed.headers['cache-control'], 'no-store')
-                self.assertEqual(len(calls), 3)
+                self.assertEqual(len(calls), 4)
                 self.assertTrue(all('private.example' not in url for url in calls))
         finally:
             self.app.state.http_transport.client = original
@@ -2924,6 +3303,34 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             self.app.state.http_transport.client = original
             fake.close()
 
+    async def test_cover_image_refuses_the_official_now_printing_placeholder(self):
+        """DMM 缺图时 302 到同一主机族上的「NOW PRINTING」：回 404 不缓存，官方出图后下一次加载取到真图。"""
+        connection = sqlite3.connect(self.db)
+        connection.execute("INSERT INTO feed_discovery(code,cover_url,discovered_at) VALUES(?,?,'2026-10-22')",
+                           ('ABC-007', 'https://pics.dmm.co.jp/digital/video/abc00007/abc00007pl.jpg'))
+        connection.commit()
+        connection.close()
+        published = {'cover': False}
+        def upstream(request):
+            if request.url.path.endswith('abc00007pl.jpg') and not published['cover']:
+                return httpx.Response(302, request=request, headers={
+                    'location': 'https://imgsrc.dmm.com/pics/mono/movie/n/now_printing/now_printing.jpg?w=800&h=800'})
+            return httpx.Response(200, headers={'content-type': 'image/jpeg', 'content-length': '5'},
+                                  stream=httpx.ByteStream(b'cover'), request=request)
+        original = self.app.state.http_transport.client
+        fake = httpx.Client(transport=httpx.MockTransport(upstream))
+        self.app.state.http_transport.client = fake
+        try:
+            with patch('peach.web_jav_discovery._cached_movie', return_value={}):
+                pending = await self.client.get('/cover-image?code=ABC-007&t=secret')
+                self.assertEqual((pending.status_code, pending.headers['cache-control']), (404, 'no-store'))
+                published['cover'] = True
+                cover = await self.client.get('/cover-image?code=ABC-007&t=secret')
+                self.assertEqual((cover.status_code, cover.content), (200, b'cover'))
+        finally:
+            self.app.state.http_transport.client = original
+            fake.close()
+
     async def test_jav_image_serves_source_bytes_with_etag_and_drops_failures(self):
         """库外作品的样张与来源头像以图片本身下发：带 ETag 与私有缓存时效，取不到回 404 不缓存。"""
         from peach.javdb_public import PublicSourceUnavailable
@@ -2940,7 +3347,9 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                                                 headers={'If-None-Match': first.headers['etag']})
             self.assertEqual((revalidated.status_code, revalidated.content), (304, b''))
         self.assertEqual(source.call_args.args[1], {'code': 'EXM-001', 'image': '3'})
-        for failure in (PublicSourceUnavailable('offline'), ValueError('预览图不存在')):
+        from peach.user_messages import UserValueError
+        for failure in (PublicSourceUnavailable('errors.javdbPublic.imageUnavailable'),
+                        UserValueError('errors.javdbPublic.previewImageMissing')):
             with self.subTest(failure=failure), patch('peach.web_jav_detail.jav_image', side_effect=failure):
                 missing = await self.client.get('/jav-image?code=EXM-001&image=3&t=secret')
                 self.assertEqual((missing.status_code, missing.headers['cache-control']), (404, 'no-store'))
@@ -3076,7 +3485,8 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(local_playback, 'open_media') as launch:
             options = await self.client.get('/api/local-players', headers=headers)
             self.assertEqual(options.json(), {'players': [
-                {'id': 'default', 'label': '系统默认播放器'}, {'id': 'vlc', 'label': 'VLC'}]})
+                {'id': 'default', 'label': '系统默认播放器', 'label_code': 'labels.routesMedia.defaultPlayer'},
+                {'id': 'vlc', 'label': 'VLC'}]})
             result = await self.client.post('/api/local-playback?id=1&player=vlc', json={}, headers=headers)
             self.assertEqual(result.status_code, 200, result.text)
             self.assertEqual(launch.call_args.args[1], 'vlc')
@@ -3207,13 +3617,116 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         con.commit()
         con.close()
         with patch.object(self.app.state.transcode_service, 'requires_conversion', return_value=True), \
+                patch.object(self.app.state.transcode_service, 'original_playable', return_value=True), \
                 patch.object(self.app.state.transcode_service, 'browser_path',
                              side_effect=AssertionError('whole movie conversion')):
             response = await self.client.get('/api/stream-plan?id=1&session=s&t=secret')
             self.assertEqual(response.json()['protocol'], 'hls')
+            self.assertEqual(response.json()['original_src'], '/stream?id=1&original=1&session=s')
+            self.assertEqual(response.json()['original_mime_type'], 'video/mp4')
             playlist = await self.client.get('/stream/hls/1/index.m3u8?session=s&t=secret')
             self.assertEqual(playlist.status_code, 200)
             self.assertIn('#EXTINF:0.280', playlist.text)
+
+    async def test_original_stream_bypasses_browser_transcoding(self):
+        """原画试播要真正读原文件；兼容性转码只能由回退请求触发。"""
+        with patch.object(self.app.state.transcode_service, 'browser_path',
+                          side_effect=AssertionError('original trial started transcoding')):
+            response = await self.client.get(
+                '/stream?id=1&original=1&session=original-trial',
+                headers={'X-Token': 'secret', 'Range': 'bytes=0-3'},
+            )
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.content, b'0123')
+        self.assertEqual(response.headers['content-type'], 'video/mp4')
+        self.assertNotIn('x-peach-transcoded', response.headers)
+
+    async def test_mkv_plan_tries_original_then_remux_and_explicit_video_conversion(self):
+        from peach.transcodes import _MediaProfile
+        from peach.ffmpeg import BinaryChoice
+        from support.mkv import minimal_mkv
+
+        source = self.media_root / "clip.mkv"
+        source.write_bytes(minimal_mkv())
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE asset SET path=?, duration=13.5 WHERE id=1", (str(source),))
+        service = self.app.state.transcode_service
+        with patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                patch.object(service, "_probe", return_value=_MediaProfile("h264", "yuv420p", "aac")):
+            plan = (await self.client.get("/api/stream-plan?id=1&session=mkv&t=secret")).json()
+            self.assertEqual(plan["original_mime_type"], "video/x-matroska")
+            self.assertEqual(plan["processing"], "copy")
+            self.assertEqual(plan["segments"], 2)
+            self.assertIn("transcode=1", plan["fallback_src"])
+            playlist = await self.client.get(plan["fallback_src"] + "&t=secret")
+            self.assertIn("#EXTINF:6.000,", playlist.text)
+            self.assertIn("&transcode=1", playlist.text)
+            original = await self.client.get(plan["original_src"] + "&t=secret", headers={"Range": "bytes=0-3"})
+            self.assertEqual(original.status_code, 206)
+            self.assertEqual(original.headers["content-type"], "video/x-matroska")
+
+    async def test_mkv_with_a_silent_audio_track_skips_the_original_trial(self):
+        """AC-3 这类音轨浏览器静音照放、不报错，回退触发不了：不给原文件地址，直接走分片。"""
+        from peach.transcodes import _MediaProfile
+        from peach.ffmpeg import BinaryChoice
+        from support.mkv import minimal_mkv
+
+        source = self.media_root / "clip.mkv"
+        source.write_bytes(minimal_mkv())
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE asset SET path=?, duration=13.5 WHERE id=1", (str(source),))
+        service = self.app.state.transcode_service
+        with patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                patch.object(service, "_probe", return_value=_MediaProfile("h264", "yuv420p", "ac3")):
+            plan = (await self.client.get("/api/stream-plan?id=1&session=ac3&t=secret")).json()
+        self.assertEqual((plan["protocol"], plan["processing"]), ("hls", "audio"))
+        self.assertNotIn("original_src", plan)
+
+    async def test_original_trial_without_segments_falls_back_to_whole_file_conversion(self):
+        """时长拿不到切不了分片时，先试原文件，回退地址是原来那条整片转换。"""
+        from peach.transcodes import _MediaProfile
+        from peach.ffmpeg import BinaryChoice
+        from support.mkv import minimal_mkv
+
+        source = self.media_root / "clip.mkv"
+        source.write_bytes(minimal_mkv())
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE asset SET path=?, duration=NULL WHERE id=1", (str(source),))
+        service = self.app.state.transcode_service
+        with patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                patch.object(service, "_probe", return_value=_MediaProfile("h264", "yuv420p", "aac")):
+            plan = (await self.client.get("/api/stream-plan?id=1&session=nodur&t=secret")).json()
+        self.assertEqual(plan["protocol"], "range")
+        self.assertEqual(plan["src"], "/stream?id=1&original=1&session=nodur")
+        self.assertEqual(plan["mime_type"], "video/x-matroska")
+        self.assertEqual((plan["fallback_src"], plan["fallback_mime_type"]), ("/stream?id=1&session=nodur", "video/mp4"))
+
+    async def test_mkv_audio_conversion_and_forced_video_conversion_reach_the_segment_service(self):
+        from unittest.mock import AsyncMock
+        from peach.transcodes import _MediaProfile
+        from peach.ffmpeg import BinaryChoice
+        from support.mkv import minimal_mkv
+
+        source = self.media_root / "clip.mkv"
+        source.write_bytes(minimal_mkv())
+        segment = self.media_root / "slice.ts"
+        segment.write_bytes(b"transport stream")
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE asset SET path=?, duration=13.5 WHERE id=1", (str(source),))
+        service = self.app.state.transcode_service
+        generate = AsyncMock(return_value=segment)
+        with patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                patch.object(service, "_probe", return_value=_MediaProfile("h264", "yuv420p", "dts")), \
+                patch.object(self.app.state.hls_service, "generate", generate):
+            plan = (await self.client.get("/api/stream-plan?id=1&session=mkv&t=secret")).json()
+            self.assertEqual(plan["processing"], "audio")
+            response = await self.client.get("/stream/hls/1/0.ts?session=mkv&t=secret")
+            self.assertEqual(response.content, b"transport stream")
+            self.assertTrue(generate.call_args.kwargs["audio_transcode"])
+            self.assertNotIn("transcode", generate.call_args.kwargs)
+            await self.client.get("/stream/hls/1/0.ts?session=mkv&transcode=1&t=secret")
+            self.assertTrue(generate.call_args.kwargs["transcode"])
+            self.assertNotIn("audio_transcode", generate.call_args.kwargs)
 
     async def test_unknown_ledger_duration_still_slices_by_the_probed_duration(self):
         """账本没记时长（或记成 -1）的 HEVC MP4 也按片切：时长取 ffprobe 报的，不走整片转码。"""
@@ -3236,6 +3749,52 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             playlist = await self.client.get("/stream/hls/1/index.m3u8?session=s&t=secret")
         self.assertEqual(playlist.status_code, 200)
         self.assertEqual(playlist.text.count("#EXTINF:"), 3)
+
+    async def test_browser_reported_hevc_decoding_plays_the_original(self):
+        """浏览器报能解 HEVC：计划回 Range，`/stream` 地址带上同一份能力；只差音轨时标成换封装。"""
+        from peach.ffmpeg import BinaryChoice
+        from peach.transcodes import _MediaProfile
+        service = self.app.state.transcode_service
+        cases = (("aac", "standard-http-range"), ("ac3", "remux"))
+        for audio, reason in cases:
+            with self.subTest(audio=audio), \
+                    patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                    patch.object(service, "_probe",
+                                 return_value=_MediaProfile("hevc", "yuv420p", audio, 13.5, codec_tag="hvc1")):
+                service._native_profiles.clear()
+                plan = (await self.client.get(
+                    "/api/stream-plan?id=1&session=s&decode=hevc,hevc10,bogus&t=secret")).json()
+                self.assertEqual((plan["protocol"], plan["reason"]), ("range", reason))
+                self.assertEqual(plan["src"], "/stream?id=1&session=s&decode=hevc,hevc10")
+                service._native_profiles.clear()
+                plain = (await self.client.get("/api/stream-plan?id=1&session=s&t=secret")).json()
+                self.assertEqual(plain["protocol"], "hls")
+
+    async def test_transport_stream_with_h264_is_remuxed_without_reporting_capabilities(self):
+        """`.ts` 里是 H.264：不报解码能力也走整片换封装（Range），HEVC 没报能力仍走转码分片。"""
+        ts = self.media_root / "recording.ts"
+        ts.write_bytes(b"ts-source")
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO asset(id,location,path,name,medium,size,duration,first_seen) "
+            "VALUES(4,'local',?,'recording.ts','video',9,13.5,'2026-08-15')",
+            (str(ts),),
+        )
+        con.commit()
+        con.close()
+        from peach.ffmpeg import BinaryChoice
+        from peach.transcodes import _MediaProfile
+        service = self.app.state.transcode_service
+        cases = (("h264", "range", "remux"), ("hevc", "hls", None))
+        for codec, protocol, reason in cases:
+            with self.subTest(codec=codec), \
+                    patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                    patch.object(service, "_probe", return_value=_MediaProfile(codec, "yuv420p", "aac", 13.5)):
+                service._native_profiles.clear()
+                plan = (await self.client.get("/api/stream-plan?id=4&session=s&t=secret")).json()
+                self.assertEqual(plan["protocol"], protocol)
+                if reason:
+                    self.assertEqual((plan["reason"], plan["src"]), (reason, "/stream?id=4&session=s"))
 
     async def test_unprobeable_file_without_duration_gets_range_and_a_404_playlist(self):
         """moov 缺失的文件 ffprobe 读不出、账本也没时长：计划回 Range，播放列表回 404，不是 500。"""
@@ -3274,11 +3833,38 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                     "/stream/hls/1/1.ts?session=hls-test&t=secret",
                 )
         submit.assert_called_once()
-        self.assertEqual(self.app.state.hls_plan_executor._max_workers, 2)
+        self.assertEqual(self.app.state.hls_plan_executor._max_workers, 8)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, b"one segment")
         self.assertEqual(response.headers["content-type"], "video/mp2t")
         self.assertTrue(segment.exists(), "片段要留在缓存里，重复请求不该再跑一次 FFmpeg")
+
+    async def test_segments_reuse_the_plan_the_playlist_resolved_for_the_session(self):
+        """播放列表算好的计划记在会话上：之后每个分片不再读账本、问画像、排进计划执行器。"""
+        from peach import routes_media
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE asset SET location='115', duration=13.5, path=? WHERE id=1",
+                    (str(self.hls_file),))
+        con.commit()
+        con.close()
+        segment = self.root / "segment.ts"
+        segment.write_bytes(b"one segment")
+
+        async def generate(source, start, duration, **_kwargs):
+            return segment
+
+        playlist = await self.client.get("/stream/hls/1/index.m3u8?session=plan-once&t=secret")
+        self.assertEqual(playlist.status_code, 200)
+        with patch.object(self.app.state.hls_service, "generate", new=generate), \
+                patch.object(routes_media, "_hls_plan", side_effect=AssertionError("每片重算计划")), \
+                patch.object(self.app.state.hls_plan_executor, "submit",
+                             side_effect=AssertionError("排进计划执行器")):
+            for index in range(3):
+                response = await self.client.get(f"/stream/hls/1/{index}.ts?session=plan-once&t=secret")
+                self.assertEqual(response.status_code, 200)
+        cancelled = await self.client.post("/api/stream-cancel?session=plan-once&t=secret")
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertIsNone(self.app.state.hls_session_plans.get("plan-once", 1))
 
     async def test_a_repaired_header_takes_a_broken_timestamp_file_off_the_transcode_path(self):
         """时间戳错乱的片子一旦有了修好的头，就该按 Range 无损播，不再实时转码。"""
@@ -3315,17 +3901,22 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         con.execute("UPDATE asset SET path=?, duration=13.5 WHERE id=1", (str(self.hls_file),))
         con.commit()
         con.close()
+        from peach.transcodes import _MediaProfile
         service = self.app.state.transcode_service
         asked: list[int] = []
 
         with patch.object(service, "requires_conversion", return_value=True), \
                 patch.object(service, "decode_order_timestamps", return_value=True), \
+                patch.object(service, "_profile_for", return_value=_MediaProfile(
+                    "h264", "yuv420p", "aac", 13.5, decode_order_timestamps=True)), \
                 patch.object(self.app.state.header_repairs, "lookup", return_value=None), \
                 patch.object(self.app.state.header_repairs, "request",
                              new=lambda asset_id, source: asked.append(asset_id)):
             plan = (await self.client.get("/api/stream-plan?id=1&session=s&t=secret")).json()
 
         self.assertEqual(plan["protocol"], "hls")
+        self.assertNotIn("original_src", plan)
+        self.assertEqual(plan["processing"], "transcode")
         self.assertEqual(asked, [1])
 
     async def test_transcoded_stream_has_browser_mime_and_marker(self):
@@ -3400,6 +3991,13 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             "If-None-Match": poster.headers["etag"],
         })
         self.assertEqual(denied.status_code, 401)
+
+    async def test_missing_poster_reports_which_step_failed(self):
+        """卡片按 `reason_code` 写缺图原因：没有接触印相时说的是缺印相，不是笼统的不可用。"""
+        missing = await self.client.get("/poster?id=999&c=4", headers={"X-Token": "secret"})
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json(), {"error": "unavailable", "reason": "snapshot unavailable",
+                                          "reason_code": "errors.previews.snapshotUnavailable", "reason_params": {}})
 
     async def test_endcard_frame_is_authenticated_and_confined_to_evidence_root(self):
         denied = await self.client.get(
@@ -3489,6 +4087,18 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         reveal.assert_called_once_with(source)
 
+    async def test_reveal_answers_within_the_deadline_when_the_drive_is_stuck(self):
+        """文件所在的盘答不上：回 503 说明盘没响应，不当成文件已删，也不把请求挂住。"""
+        source = self._seed_photo()
+        with stalled_mount(source), patch("peach.routes_api.reveal_path", return_value=True) as reveal:
+            started = time.monotonic()
+            response = await self.client.post("/api/reveal", headers={"X-Token": "secret"}, json={"id": 9})
+            seconds = time.monotonic() - started
+        self.assertLess(seconds, 3)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["message_code"], "api.routes.revealUnreachable")
+        reveal.assert_not_called()
+
     async def test_reveal_by_path_stays_inside_peach_own_data_root(self):
         """页面上印着全路径的那几处（凭据文件、问题日志、要删的数据目录）按 `path` 定位。
 
@@ -3522,6 +4132,16 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         # 410 与 403 在页面那层的通用错误映射里都没有说法，原因得由这条自己写成中文。
         self.assertEqual(gone.json()["message"], "这个位置已经不在了")
         self.assertIn("不归 Peach 管", refused.json()["message"])
+
+    async def test_headless_reveal_returns_the_server_resolved_asset_path(self):
+        source = self._seed_photo()
+        headers = {'X-Token': 'secret'}
+        with patch('peach.routes_api.reveal_path', return_value=False):
+            response = await self.client.post('/api/reveal', headers=headers,
+                json={'id': 9, 'path': '/client-controlled'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['mode'], 'server')
+        self.assertEqual(response.json()['path'], str(source))
 
     async def test_photo_thumbnail_is_generated_once_and_cached(self):
         source = self._seed_photo()
@@ -3565,6 +4185,29 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any((self.cover_root.parent / "cover-thumbs").iterdir()))
         full = await self.client.get("/cover?code=ABC-123", headers=headers)
         self.assertEqual(full.content, source.read_bytes())
+
+    async def test_the_front_image_is_served_beside_the_cover_with_its_own_tiers(self):
+        """装好的 DMM 竖版正封走 `/cover?front=1`，派生档不和横图那一份共用文件。"""
+        from PIL import Image
+
+        front = self.cover_root / "front" / "ABC-125.jpg"
+        front.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (2400, 1620), (200, 120, 90)).save(self.cover_root / "ABC-125.jpg", "JPEG")
+        Image.new("RGB", (1536, 2184), (20, 120, 190)).save(front, "JPEG")
+        headers = {"X-Token": "secret"}
+        original = await self.client.get("/cover?front=1&code=ABC-125", headers=headers)
+        self.assertEqual(original.content, front.read_bytes())
+        tier = await self.client.get("/cover?front=1&code=ABC-125&thumb=2", headers=headers)
+        cover_tier = await self.client.get("/cover?code=ABC-125&thumb=2", headers=headers)
+        with Image.open(io.BytesIO(tier.content)) as derived:
+            self.assertEqual(derived.size, (563, 800))
+        with Image.open(io.BytesIO(cover_tier.content)) as derived:
+            self.assertEqual(derived.size, (800, 540))
+        missing = await self.client.get("/cover?front=1&code=ABC-126", headers=headers)
+        self.assertEqual(missing.status_code, 404)
+        Image.new("RGB", (800, 540)).save(self.cover_root / "ABC-127.jpg", "JPEG")
+        unfronted = await self.client.get("/cover?front=1&code=ABC-127", headers=headers)
+        self.assertEqual(unfronted.status_code, 404)
 
     async def test_the_card_start_tier_is_an_800_edge_webp_next_to_the_grid_tier(self):
         """卡片起始档 `/cover?thumb=2` 长边 800，和 1600 那一档同目录、按长边各成一个文件。
@@ -3734,7 +4377,7 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         def factory(_secrets_root):
             def download(url):
                 asked.append(url)
-                raise OSError("来源连接未取得")
+                raise OSError("connection refused")
             return download
 
         headers = {"X-Token": "secret"}
@@ -3845,8 +4488,12 @@ class UnconfiguredMachineTests(unittest.IsolatedAsyncioTestCase):
                         ready = await client.get("/healthz?ready=1")
                         self.assertEqual(ready.status_code, 503)
                         self.assertFalse(ready.json()["ready"])
+                        for path in ('/', '/settings/library'):
+                            page = await client.get(path)
+                            self.assertEqual(page.status_code, 200)
+                            self.assertIn('id="tutorialBtn"', page.text)
                 self.assertEqual([record.levelname for record in captured.records], ["WARNING"])
-                self.assertIn("数据库准备完成后重启服务", captured.output[0])
+                self.assertIn("Restart the service once the database is ready", captured.output[0])
                 self.assertNotIn(str(database), captured.output[0])
                 self.assertEqual(database.read_bytes() if database.exists() else None, original)
 
@@ -4001,7 +4648,9 @@ class UnconfiguredMachineTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 await shutdown
                 self.assertTrue(closed.is_set())
-                self.assertEqual(calls, ["/api/taste"])
+                # 只走到预热清单的第一项：关机等它释放账本，后面的不再起。
+                from peach.api import WARM_AGGREGATES
+                self.assertEqual(calls, [WARM_AGGREGATES[0][0]])
             finally:
                 release.set()
                 if shutdown is not None:
@@ -4009,6 +4658,27 @@ class UnconfiguredMachineTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     await context.__aexit__(None, None, None)
                 await asyncio.to_thread(closed.wait, 5)
+
+    async def test_shutdown_stops_waiting_for_a_warmup_that_never_finishes(self):
+        """预热查询卡住（比如读一个挂死的网盘）时，关停最多等 `WARMUP_STOP_SECONDS` 就往下走。"""
+        parent = self.settings.db_path.parent
+        parent.mkdir(parents=True)
+        database = fresh_ledger(parent)
+        opened, release = threading.Event(), threading.Event()
+
+        def query(contract, path, args):
+            opened.set()
+            release.wait(60)
+
+        context = self.ledger_client(database)
+        with patch("peach.api.web_contract.dispatch_api_get", side_effect=query), \
+                patch("peach.api.WARMUP_STOP_SECONDS", 0.5):
+            try:
+                await context.__aenter__()
+                self.assertTrue(await asyncio.to_thread(opened.wait, 5))
+                await asyncio.wait_for(context.__aexit__(None, None, None), 20)
+            finally:
+                release.set()
 
     async def test_the_page_serves_the_first_run_shell(self):
         response = await self.client.get("/")
@@ -4049,6 +4719,10 @@ PUBLIC_ROUTES = {
     ("GET", "/api/setup/questions"),
     ("POST", "/api/setup"),
     ("POST", "/api/setup/restore"),
+    # Docker 首次访问设置的提交（ADR-0149）。这时还没有访问策略，没有密码可验；只在 Docker 且
+    # 没有策略时收，来源须是本机或私有网络、不带代理转发头（403），再看 Origin（403）；已有策略
+    # 就 409，非 Docker 是 404。
+    ("POST", "/api/configuration/access/first"),
     # 首启与登录页的浏览器尚无会话；此接口仅向本机同源开放，限流、限长后只写脱敏错误日志。
     ("POST", "/api/diagnostics/client-error"),
     # 登录页在拿到会话之前就要出图，书签与历史记录也从这三个固定路径取图标。
@@ -4078,6 +4752,10 @@ PUBLIC_ROUTES = {
     # STRM 的 HLS 子资源供浏览器和外部播放器共用：处理函数验证浏览器会话，
     # 或绑定资产与 Origin 的限时 HMAC；两条分支都检查媒体根目录及资源归属。
     ("GET,HEAD", "/strm-resource/{id}/{key}"),
+    # 本机 CA 的公开证书（ADR-0142）。手机扫码时还没登录、也还没信任这张证书，二维码带进程
+    # 密钥签发、十分钟有效的签名，只换得到这张公开证书；处理函数里不带签名的请求照常
+    # `require_auth`。私钥不经过这条路由。
+    ("GET", "/api/configuration/certificate/peach-local-ca.crt"),
 }
 
 
@@ -4118,11 +4796,18 @@ class RouteAuthContractTests(unittest.TestCase):
         cls.guards = {getattr(routes_auth, name) for name in cls.GUARD_NAMES}
         cls.special_guards = {
             ("GET", "/api/jav-browser"): routes_jav_browser.browser_client,
+            ("GET", "/api/jav-browser/active"): routes_jav_browser.browser_client,
             ("GET", "/api/jav-browser/identify"): routes_jav_browser.browser_client,
             ("GET", "/api/jav-browser/updates"): routes_jav_browser.browser_client,
             ("GET", "/api/jav-browser/people"): routes_jav_browser.browser_client,
             ("POST", "/api/jav-browser"): routes_jav_browser.browser_client,
             ("POST", "/api/jav-browser/errors"): routes_jav_browser.browser_client,
+            ("POST", "/api/jav-browser/postprocess"): routes_jav_browser.browser_client,
+            ("POST", "/api/jav-browser/prioritize"): routes_jav_browser.browser_client,
+            ("GET", "/api/jav-browser/performer"): routes_jav_browser.browser_client,
+            ("POST", "/api/jav-browser/performer"): routes_jav_browser.browser_client,
+            ("POST", "/api/jav-browser/dismiss"): routes_jav_browser.browser_client,
+            ("POST", "/api/jav-browser/want"): routes_jav_browser.browser_client,
         }
         cls.routes = {(",".join(sorted(route.methods)), route.path):
                       {dependency.call for dependency in route.dependant.dependencies}
@@ -4220,12 +4905,12 @@ class LoginPageWithoutSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_missing_bundle_opened_in_the_browser_is_the_error_page(self):
         login = await self.client.post("/login", data={"token": "entry-password", "next": "/"})
         self.assertEqual(login.status_code, 303)
-        page = await self.client.get("/dist/no-such.js", headers={"Accept": "text/html"})
+        page = await self.client.get("/dist/no-such.js", headers={"Accept": "text/html", "Accept-Language": "zh-CN"})
         self.assertEqual(page.status_code, 404)
         self.assertIn('data-page="error" data-status="404" data-detail="这个地址下没有页面。"', page.text)
         script = await self.client.get("/dist/no-such.js")
         self.assertEqual(script.status_code, 404)
-        self.assertEqual(script.json(), {"error": "这个地址下没有页面。"})
+        self.assertEqual(script.json(), {"error": "这个地址下没有页面。", "message_code": "http.notFound", "message_params": {}})
 
 
 if __name__ == "__main__":

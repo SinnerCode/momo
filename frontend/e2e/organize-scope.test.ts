@@ -11,7 +11,7 @@ describe('整理目录范围', () => {
 
   it('路径在桌面来源右侧，手机换行且长路径不撑宽页面', { timeout: 60_000 }, async () => {
     for (const viewport of [DESKTOP, MOBILE]) {
-      const opened = await visit(browser, '/data-cleanup', viewport);
+      const opened = await visit(browser, '/data-cleanup/organize', viewport);
       try {
         const page = opened.page;
         await page.route('**/api/organize', (route) => route.fulfill({ json: {

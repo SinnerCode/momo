@@ -15,6 +15,7 @@ from scripts.dedupe_entity_links import destination
 from scripts.install_agencies import collect as agency_plan
 from scripts.install_agencies import apply_rows as install_agencies
 from scripts.install_agencies import split_name
+from support.ledger import fresh_ledger
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "migrations"
@@ -155,8 +156,7 @@ class AgencyLedgerTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name).resolve()
-        self.db = root / "ledger.db"
-        upgrade(self.db, MIGRATIONS)
+        self.db = fresh_ledger(root)
         self.con = sqlite3.connect(self.db)
         self.con.row_factory = sqlite3.Row
         self.addCleanup(self.con.close)

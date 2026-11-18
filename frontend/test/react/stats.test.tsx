@@ -16,6 +16,7 @@ import {
   fmtCount, lengthRows, mediumRows, percentOf, percentText, playedFor, prefetchStats, radialArc,
   radialBarSize, radialCeiling, radialSlices, replayRows, STATS_URL, watchNote, type StatsData,
 } from '../../src/react/stats/stats';
+import { RadialCard } from '../../src/react/stats/radial-card';
 import { StatsPage } from '../../src/react/stats/stats-page';
 
 import { actionOrder, buttonNamed, click, mount, mountRoot } from './render';
@@ -32,8 +33,8 @@ const payload = (overrides: Partial<StatsData> = {}): StatsData => ({
     { k: '115', n: 1, bytes: 1073741824, videos: 1 }],
   by_medium: [{ k: 'video', n: 4, bytes: 4294967296 }, { k: 'image', n: 6, bytes: 1048576 }],
   by_library: [{ k: 'main', name: '主库', icon: 'film', videos: 4, bytes: 4294967296 }],
-  by_length: [{ k: '速食', n: 1 }, { k: '短', n: 3 }, { k: '中', n: 0 }, { k: '长', n: 0 }],
-  by_quality: [{ k: '4K', n: 0 }, { k: '2K', n: 0 }, { k: '1080P', n: 4 }, { k: '720P', n: 0 }, { k: '低画质', n: 0 }],
+  by_length: [{ k: 'quick', n: 1 }, { k: 'short', n: 3 }, { k: 'medium', n: 0 }, { k: 'long', n: 0 }],
+  by_quality: [{ k: '4K', n: 0 }, { k: '2K', n: 0 }, { k: '1080P', n: 4 }, { k: '720P', n: 0 }, { k: 'low', n: 0, label_code: 'taste.qualityBand.low' }],
   play_activity: {
     timezone: 'UTC+08:00',
     days: [{ date: '2026-09-20', count: 1 }, { date: '2026-09-22', count: 1 }],
@@ -102,11 +103,6 @@ it('整页一个请求：四张卡和下面三个面板读的是同一份快照'
     .toEqual(['4', '2', '50%', '1 个卷']);
 });
 
-it('抬头那一句用遗留层同一套体积口径', async () => {
-  const { host } = await open();
-  expect(host.querySelector('p')?.textContent).toBe('数据库中的当前统计 · 4 个视频 · 4.0 GB');
-});
-
 it('四张卡就是页签：点「看过」换到看过那一层，其余的收起来', async () => {
   const { host } = await open();
   await click(tabNamed(host, '看过'));
@@ -139,6 +135,38 @@ it('满圈是最长那段的 1.1 倍，圈数越多每圈越细', () => {
   expect([2, 12, 40].map(radialBarSize)).toEqual([14, 8, 4]);
 });
 
+it('指到垫到最小弧长的那一段，浮层读原始数，不读画图用的弧长', async () => {
+  // 拿掉 `ResizeObserver` 让 Recharts 按初始尺寸画；声明减少动态效果，圈直接是终态。
+  vi.stubGlobal('ResizeObserver', undefined);
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    matches: query.includes('reduce'), media: query, addEventListener() {}, removeEventListener() {},
+  }));
+  // 满圈 3023 × 1.1，最小弧长是它的 2%：66.506，比欧美剧情的 36 大，那一段画的是垫高的弧。
+  const rows = [
+    { name: '单人剧情', value: 3023 }, { name: '共演剧情', value: 128 },
+    { name: '欧美剧情', value: 36 }, { name: '写真', value: 198 },
+  ];
+  const host = await mount(<RadialCard title="媒体库" rows={rows} empty="" />);
+  // 每圈的底色扇区：路径头一段是 `M cx,cy-外径`，第二段弧是内径，取中间那条半径指上去。
+  const rings = [...host.querySelectorAll('path.recharts-radial-bar-background-sector')].map((path) => {
+    const [outer, inner] = [...(path.getAttribute('d') ?? '').matchAll(/A ([\d.]+),/g)].map(([, r]) => Number(r));
+    return { cx: Number(path.getAttribute('cx')), cy: Number(path.getAttribute('cy')), r: (outer! + inner!) / 2 };
+  });
+  expect(rings).toHaveLength(rows.length);
+  const tipFor = async (index: number) => {
+    const { cx, cy, r } = rings[index]!;
+    await act(async () => {
+      host.querySelector('.recharts-wrapper')!.dispatchEvent(new MouseEvent('mousemove',
+        { bubbles: true, clientX: cx, clientY: cy - r }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    const tip = host.querySelector('.recharts-tooltip-wrapper')!;
+    return [...tip.querySelectorAll('span')].map((span) => span.textContent);
+  };
+  expect(await tipFor(2)).toEqual(['欧美剧情', '36']);
+  expect(await tipFor(0)).toEqual(['单人剧情', '3,023']);
+});
+
 it('点图例把那一段钉住，读数跟着换；再点一次放开', async () => {
   const { host } = await open();
   const card = radialCharts(host)[0]!.closest('section')!;
@@ -162,8 +190,8 @@ it('库存那一层按时长、画质、文件类型各出一张分布图，页�
 });
 
 it('分布图的分档：时长换成分钟区间，文件类型多的在前，播放次数长尾并档', () => {
-  expect(lengthRows([{ k: '速食', n: 1 }, { k: '长', n: 2 }, { k: '超长', n: 3 }]))
-    .toEqual([{ name: '<5 分钟', value: 1 }, { name: '>40 分钟', value: 2 }, { name: '超长', value: 3 }]);
+  expect(lengthRows([{ k: 'quick', n: 1 }, { k: 'long', n: 2 }, { k: 'extra', n: 3 }]))
+    .toEqual([{ name: '<5 分钟', value: 1 }, { name: '>40 分钟', value: 2 }, { name: 'extra', value: 3 }]);
   expect(mediumRows([{ k: 'video', n: 4, bytes: 0 }, { k: 'account', n: 9, bytes: 0 }, { k: 'x', n: 1, bytes: 0 }]))
     .toEqual([{ name: '账号', value: 9 }, { name: '视频', value: 4 }, { name: 'x', value: 1 }]);
   expect(replayRows([{ k: 1, n: 52 }, { k: 2, n: 13 }, { k: 4, n: 6 }, { k: 7, n: 1 }, { k: 9, n: 1 }, { k: 12, n: 2 }]))
@@ -192,6 +220,28 @@ it('看过那一层有播放时间的两张热力图，指到一格读数换成�
   expect(panel.querySelector('section[aria-label="播放次数"] header b')?.textContent).toBe('2');
   const liked = [...panel.querySelectorAll('span')].find((term) => term.textContent === '喜欢');
   expect(liked?.nextElementSibling?.textContent).toBe('1');
+});
+
+it('一张热力图只占一个 Tab 停靠点，方向键在格子之间挪', async () => {
+  const { host } = await open();
+  await click(tabNamed(host, '看过'));
+  const card = host.querySelector('[role=tabpanel] svg[role=img]')!.closest('section')!;
+  const stops = () => [...card.querySelectorAll<SVGRectElement>('rect[tabindex="0"]')];
+  expect(card.querySelectorAll('rect').length).toBe(168);
+  expect(stops().map((cell) => cell.dataset.cell)).toEqual(['0']);
+  const first = stops()[0]!;
+  await act(async () => { first.focus(); });
+  await act(async () => {
+    first.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  });
+  expect(document.activeElement?.getAttribute('data-cell')).toBe('24');
+  expect(stops().map((cell) => cell.dataset.cell)).toEqual(['24']);
+  expect(card.querySelector('header small')?.textContent).toBe(
+    document.activeElement?.getAttribute('aria-label')?.split('，')[0]);
+  await act(async () => {
+    document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }));
+  });
+  expect(document.activeElement?.getAttribute('data-cell')).toBe('47');
 });
 
 it('没有播放时间记录时看过那一层不出热力图，留一张说明卡', async () => {
@@ -271,7 +321,7 @@ it('类别名放不下就截断加省略号，轴宽跟着最长的名字走并�
 it('覆盖率那一层的每条进度用同一对分子分母，不另算一遍', async () => {
   const { host } = await open();
   await click(tabNamed(host, '内容标签'));
-  const bars = [...host.querySelectorAll('[role=progressbar]')];
+  const bars = [...host.querySelectorAll('[role=meter]')];
   expect(bars.map((bar) => bar.getAttribute('aria-label'))).toEqual([
     '有创作者：3 / 4', '有番号：2 / 4', '有厂牌：1 / 4', '已抽帧：4 / 4', '已探测时长：4 / 4',
   ]);
@@ -286,7 +336,7 @@ it('取不到容量的卷不画使用率，只说取不到', async () => {
   const panel = host.querySelectorAll('[role=tabpanel]')[0]!;
   expect(panel.textContent).toContain('容量未取得');
   expect(panel.textContent).toContain('未映射');
-  expect(panel.querySelector('[role=progressbar]')).toBeNull();
+  expect(panel.querySelector('[role=meter]')).toBeNull();
 });
 
 it('按字节计的卷在百格画布上按真实比例画出已用那一段，读屏值仍是字节', async () => {
@@ -297,7 +347,7 @@ it('按字节计的卷在百格画布上按真实比例画出已用那一段，�
     storage_summary: { volumes: 1, online: 1, measured: 1, free: total - used, used, total },
   }));
   await click(tabNamed(host, '使用空间'));
-  const bar = host.querySelectorAll('[role=tabpanel]')[0]!.querySelector('[role=progressbar]')!;
+  const bar = host.querySelectorAll('[role=tabpanel]')[0]!.querySelector('[role=meter]')!;
   expect(bar.getAttribute('aria-valuemax')).toBe(String(total));
   expect(bar.getAttribute('aria-valuenow')).toBe(String(used));
   expect(bar.getAttribute('viewBox')).toBe('0 0 100 1');
@@ -388,7 +438,7 @@ it('重新进这一页会重取：这一页的刷新就是重新进来一次，�
   const host = await mount(
     <QueryClientProvider client={queryClient}><StatsPage {...legacyProps()} /></QueryClientProvider>);
   expect(first.fetcher).toHaveBeenCalledTimes(2);
-  expect(host.textContent).toContain('数据库中的当前统计');
+  expect(host.querySelector('[role=tablist]')).not.toBeNull();
 });
 
 it('卸载之后不再敲库：这一页没有轮询，也不该留下别的定时器', async () => {

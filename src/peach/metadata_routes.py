@@ -23,8 +23,10 @@ from __future__ import annotations
 import re
 from typing import Iterable, Mapping, Sequence
 
-from .catalog_rules import is_amateur_code, is_korean_mib_code, is_uncensored_code
+from .catalog_rules import is_amateur_code, is_korean_mib_code, is_uncensored_code, is_uncensored_label_code
+from .content_words import OTHER_SYSTEM_MARKS
 from .metadata_policy import SOURCE_SPECS
+from .user_messages import UserValueError
 
 
 #: 内容类型。`unknown` 是「番号认不出来」，不是一种内容；`other` 是认得出、但 Peach 没接
@@ -47,7 +49,6 @@ _CODE_PARTS = re.compile(r"^([A-Z]+)-?0*(\d+)$")
 #: 路径里出现就说明这是 Peach 没接来源的体系。每一个都在本机账本的路径里实测出现过
 #: （2026-09-25 只读统计）：`兔子先生TZ-105`、`网红…合集\MXGD3721.MP4` 这类文件的番号
 #: 形状和有码一模一样，按有码链问下去是片商官网、r18.dev、DMM、三家综合索引各白问一遍。
-OTHER_SYSTEM_MARKS = ("国产", "國產", "网红", "網紅", "兔子先生", "麻豆")
 #: 欧美片站的文件名：番号前面挂着至少两个用连字符或下划线连起来的拉丁词
 #: （`wankzvr-elena-koshka-GFE-180_180x180_3dh_LR.mp4`，站名加演员名）。日本片的前缀是
 #: 站点水印（`hjd2048.com-`、`[FHD]`、`HD_`），不会是两个以上纯字母词连写。
@@ -76,7 +77,9 @@ ROUTES: dict[str, tuple[str, ...]] = {
     # 最后一处可能有官方值的地方。
     # dmm 不进：2026-09-24 实测 DMM 的搜索对 `MIUM 1239`、`LUXU 1475` 零结果，MGS 素人号
     # 不在它的目录上，多问一家只多两次白请求。
-    "amateur": ("mgstage", "avbase", "javbus", "javdb", "r18dev"),
+    # MGStage 之后是两个认人 Wiki（`WIKI_STAGE`，ADR-0145）：MGS 只给素人名义（`まいな`、`七○舞`），
+    # Wiki 给出背后的艺名。排在综合索引前面，是因为它们与 javdb 不共一条 3 秒的队。
+    "amateur": ("mgstage", "sougouwiki", "av_neme", "avbase", "javbus", "javdb", "r18dev"),
     # 无码：发行方自己那份作品 JSON 先问，但只在本机证据指着一本道时才问
     # （见 `route_for_code`）——日期式番号不带片商，カリビアンコム 与一本道同形，
     # 问错一家答回来的是同一天发行的另一部片。
@@ -87,7 +90,7 @@ ROUTES: dict[str, tuple[str, ...]] = {
     # avsox 经 amane 桥（ADR-0043）垫在最后：它专收无码，但是转载索引，且要经 Cloudflare，
     # 三家综合索引都落空才轮到它。
     "uncensored": ("1pondo", "avbase", "javbus", "javdb", "avsox"),
-    # FC2：发行方商品页 → 下架作品的镜像站 → FC2PPV-DB → JAVten → JavArchive → javdb。
+    # FC2 元数据优先匿名 JavDB；缺字段或演员身份未确认时再问专站（ADR-0150）。
     # fc2cmadb 给下架作品的原图与女优栏，排在前；FC2PPV-DB 给女优、卖家、販売日与流出标记，
     # 不给封面；JAVten 给日文标题、标签与 FC2 存储原件的地址（ADR-0060）。这两站都在 Cloudflare
     # 验证后面，由本机浏览器过验证（ADR-0065）；验证没过、或没有浏览器时 Cookie 失效回 403，各自
@@ -98,7 +101,7 @@ ROUTES: dict[str, tuple[str, ...]] = {
     # 不含 r18dev（实测 85 条全空）、不含 AVBase 与 JavBus（本机 1213 份来源证据里
     # 这两家对 FC2 番号一份都没给过，javdb 给了 166 份）。判据原文在
     # `community_catalog.community_sources_for` 与 `docs/SOURCING.md`。
-    "fc2": ("fc2", "fc2cmadb", "fc2ppvdb", "javten", "javarchive", "javdb"),
+    "fc2": ("javdb", "fc2", "fc2cmadb", "fc2ppvdb", "javten", "javarchive"),
     # 韩国 MIB 一家都不问：番号和日本番号同形，JAV 目录站按它去查返回的是别的作品，
     # 那份错值只能靠人一条条认出来。官网走 `scripts/harvest_kmib.py`，不在这条路上。
     "kmib": (),
@@ -146,6 +149,11 @@ COMMUNITY_STAGE = ("avbase", "javbus", "javdb")
 #: 的 `LIST_FIELD_DEPTH` 名额——那三家的互证样本不该被转载站挤掉。链上放在综合索引之前
 #: 还是之后由各类型的链自己定：默认链上只有无码的 avsox，垫在最后；其余三站只由整条覆盖点名。
 AMANE_STAGE = ("fc2club", "freejavbt", "airav", "avsox")
+#: 素人链上的两个认人 Wiki（`sources.seesaa`，ADR-0145），各自一档、先后问。2026-11-05 对 29 个
+#: 不同厂牌的素人番号实测：素人系総合 Wiki 13 部、av_neme 16 部给出演员，与账本已确认的演员一致，
+#: 不一致的几条是账本记着素人名义、Wiki 给出艺名。av_name 只给 12 部，唯一一条与账本对不上的
+#: 也出自它，且它的厂牌页只挂最新约 1100 件，不进链，仍可由 `scrape_codes --sources` 点名。
+WIKI_STAGE = ("sougouwiki", "av_neme")
 
 #: 必填标量字段。一档把这几项（在这一行还缺的范围内）都给全了就不问下一档。
 SCALAR_FIELDS = ("title", "performers", "studio", "release_date")
@@ -184,7 +192,7 @@ def classify(code: str | None, *hints: str | None) -> str:
     # `FC2-PPV-…`；没归一的短写法按 `_FC2_SHORT` 认。
     if value.upper().startswith("FC2") or _FC2_SHORT.match(value):
         return "fc2"
-    if is_uncensored_code(value):
+    if is_uncensored_code(value) or is_uncensored_label_code(value):
         return "uncensored"
     if is_amateur_code(value) or _MGS_AMATEUR.match(value.upper()):
         return "amateur"
@@ -230,17 +238,17 @@ def parse_route_overrides(raw: str | Mapping[str, Sequence[str] | str] | None):
     overrides: dict[str, tuple[str, ...]] = {}
     for entry in items:
         if len(entry) != 2:
-            raise ValueError("来源链覆盖要写成 `类型=来源,来源`")
+            raise UserValueError("errors.metadataRoutes.overrideFormat")
         name, value = entry
         content = str(name).strip()
         if content not in CONTENT_TYPES:
-            raise ValueError("未知内容类型：" + content)
+            raise UserValueError("errors.metadataRoutes.unknownContentType", {"type": content})
         parts = value.split(",") if isinstance(value, str) else list(value)
         sources = tuple(dict.fromkeys(
             str(part).strip() for part in parts if str(part).strip()))
         unknown = [source for source in sources if source not in SOURCE_SPECS]
         if unknown:
-            raise ValueError("未知来源：" + "、".join(unknown))
+            raise UserValueError("errors.metadataRoutes.unknownSources", {"sources": "、".join(unknown)})
         overrides[content] = sources
     return overrides
 
@@ -252,7 +260,7 @@ def route(content_type: str, *, overrides: Mapping[str, Sequence[str]] | None = 
     整条替换让设置里那一行自己就是答案。
     """
     if content_type not in ROUTES:
-        raise ValueError("未知内容类型：" + str(content_type))
+        raise ValueError("unknown content type: " + str(content_type))
     resolved = parse_route_overrides(overrides)
     if content_type in resolved:
         return resolved[content_type]
@@ -348,14 +356,16 @@ def official_route(code: str | None, *hints: str | None,
     return tuple(source for source in chain if source in OFFICIAL_STAGE)
 
 
-def required_scalars(missing: Iterable[str]):
+def required_scalars(missing: Iterable[str], *, code: str | None = None):
     """这一行还缺、且属于必填标量的那些字段。空集合表示没有可短路的目标。"""
     wanted = set(str(field) for field in missing)
+    if code and classify(code) == 'fc2':
+        wanted.discard('studio')
     return tuple(field for field in SCALAR_FIELDS if field in wanted)
 
 
 def settles(required: Sequence[str], provided: Iterable[str], *,
-            wants_tags: bool = False, then: str = "") -> bool:
+            wants_tags: bool = False, wants_cast: bool = False, then: str = "") -> bool:
     """这一档给的字段够不够停手。
 
     `required` 空时任何一档只要给出资料就停——这一行要的本来就不是标量字段，
@@ -365,9 +375,14 @@ def settles(required: Sequence[str], provided: Iterable[str], *,
     作品资料没有类别，标量给全了也一个标签都没有；下一档仍是官方档（有码链上片商官网之后
     的 r18.dev）时再问它一次换一批标签。下一档是综合索引或转载站就照样停：javdb 按出口 IP
     计配额，不为标签多问。
+
+    `wants_cast` 是这一行缺演员、还没有 Wiki 给过（ADR-0145）：MGStage 给的演员是素人名义，
+    给了也不停，下一档是认人 Wiki 时接着问它。
     """
     given = set(str(field) for field in provided)
     if wants_tags and "tags" not in given and then in OFFICIAL_STAGE_NAMES:
+        return False
+    if wants_cast and then in WIKI_STAGE:
         return False
     if not required:
         return True

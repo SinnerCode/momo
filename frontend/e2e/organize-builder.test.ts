@@ -8,7 +8,7 @@ describe('整理规则构建', () => {
   before(async () => { browser = await launch() });
   after(async () => { await browser.close() });
   for (const viewport of VIEWPORTS) it(`${viewport.name}：参数插入、模板区分与站点图标`, async () => {
-    const opened = await visit(browser, '/data-cleanup', viewport, async (page) => {
+    const opened = await visit(browser, '/data-cleanup/organize', viewport, async (page) => {
       await page.route('**/api/organize', route => route.fulfill({ json: {
         status: 'idle', locations: [{ location: 'local', roots: [] }], last_batch: '',
         templates: { local: { file: '{code}', dir: '' } },
@@ -62,6 +62,7 @@ describe('整理规则构建', () => {
       assert.equal(await dir.inputValue(), '{studio}');
       await page.waitForFunction(() => document.querySelector('[data-organize-example]')?.textContent?.includes('厂牌/ABC-123 标题.mp4'));
       assert.ok((await organize.textContent())?.includes('路径示例：厂牌/ABC-123 标题.mp4'));
+      await page.goto(new URL('/data-cleanup/links', page.url()).href);
       const icon = page.locator('#link-manager a[href="https://example.com"] img');
       await icon.scrollIntoViewIfNeeded();
       await page.waitForFunction(() => {

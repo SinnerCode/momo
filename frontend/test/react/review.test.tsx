@@ -6,14 +6,16 @@
 import { act } from 'react';
 import { notifyManager, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, expect, it, vi } from 'vitest';
+import * as legacyUi from '@peach/legacy/ui';
 
 import { queryClient } from '../../src/react/query';
 import {
-  commonReviewSources, filterReviewRows, groupReviewRows, prefetchReview, REVIEW_DECISION_URL,
+  commonReviewSources, fieldName, filterReviewRows, groupReviewRows, prefetchReview, REVIEW_DECISION_URL,
   REVIEW_KEY, REVIEW_PAGE_SIZE, REVIEW_URL, reviewGroupingOptions, settleReviewRows,
   reviewWindow, type ReviewCandidate, type ReviewData, type ReviewRow,
   type DecisionResult,
 } from '../../src/react/review/review';
+import { AUTO_LANDINGS_URL, type AutoLandingWrite } from '../../src/react/review/auto-landings';
 import { ReviewPage } from '../../src/react/review/review-page';
 
 import { actionOrder, choose, click, mountRoot, settle } from './render';
@@ -24,6 +26,18 @@ afterEach(() => queryClient.clear());
 /* Query 派发更新用的是它自己抓住的那个真 `setTimeout(0)`，假时钟推不动它：推完时钟
    断言到的还是上一帧的 DOM。用例里改成当场派发。 */
 notifyManager.setScheduler((notify) => notify());
+
+type Confirmation = Parameters<typeof legacyUi.confirmModal>[0];
+
+/** 批量判定先弹确认：这里替人点主按钮，记下弹窗写了什么。 */
+function acceptConfirm() {
+  const asked: Confirmation[] = [];
+  vi.spyOn(legacyUi, 'confirmModal').mockImplementation((async (options: Confirmation) => {
+    asked.push(options);
+    return { confirmed: true, result: await options.onConfirm?.() };
+  }) as typeof legacyUi.confirmModal);
+  return asked;
+}
 
 const candidate = (source: string, value: string): ReviewCandidate =>
   ({ candidate_key: `${source}:${value}`, source, display_value: value });
@@ -58,6 +72,8 @@ interface Plan {
   data?: ReviewData;
   /** 判定的回答：给一串就按顺序一条一条回（最后一条之后一直回它）。 */
   decisions?: DecisionResult[];
+  /** 「自动写入的资料」列出的条目；缺省没有，那一块不出现。 */
+  autoLandings?: AutoLandingWrite[];
 }
 
 function serve(plan: Plan = {}) {
@@ -67,6 +83,7 @@ function serve(plan: Plan = {}) {
     if (url === REVIEW_DECISION_URL) {
       return ok(decisions.length > 1 ? decisions.shift()! : decisions[0]!);
     }
+    if (url.startsWith(AUTO_LANDINGS_URL)) return ok({ items: plan.autoLandings ?? [] });
     if (url.startsWith(REVIEW_URL)) return ok(plan.data ?? review());
     throw new Error(`没有安排这个端点：${url}`);
   });
@@ -222,6 +239,19 @@ it('筛掉一个分组之后回到第一页', async () => {
   expect(buttonIn(host, '下一页')).toBeNull();
 });
 
+it('切换每页数量回到第一页并保留已选候选', async () => {
+  const { host } = await open();
+  await click(boxOf(host, 0));
+  await click(buttonIn(host, '下一页'));
+  await choose(host.querySelector('[data-table-pagination] button[aria-haspopup="listbox"]'), '每页 10 条');
+  expect(cards(host)).toHaveLength(10);
+  expect(keys(host)[0]).toBe('row-0');
+  expect(statusText(host)).toContain('已选 1 项');
+  await choose(host.querySelector('[data-table-pagination] button[aria-haspopup="listbox"]'), '每页 50 条');
+  expect(cards(host)).toHaveLength(QUEUE.length);
+  expect(buttonIn(host, '下一页')).toBeNull();
+});
+
 it('分类进地址栏，换一条队列就把手里的选择放下', async () => {
   const { host, props } = await open();
   expect(host.querySelector('[data-selection-dock]')).toBeNull();
@@ -249,6 +279,16 @@ it('Shift 选一段，翻页之后手里还是同一批', async () => {
   expect(statusText(host)).toContain('已选 5 项');
 });
 
+it('全选全部一次选中当前筛选下所有页的待处理项，选满后按钮收起', async () => {
+  const { host } = await open();
+  expect(cards(host)).toHaveLength(REVIEW_PAGE_SIZE);
+  await click(buttonIn(host, `全选全部 ${QUEUE.length} 项`));
+  expect(statusText(host)).toContain(`已选 ${QUEUE.length} 项`);
+  expect(buttonIn(host, `全选全部 ${QUEUE.length} 项`)).toBeNull();
+  await choose(host.querySelector('button[aria-label="筛选当前分类"]'), '单一来源 · 3');
+  expect(buttonIn(host, '全选全部 3 项')).toBeNull();
+});
+
 it('判过的行从缓存里摘掉并同步计数，不为一次判定重取整条队列', async () => {
   const { host, fetcher, props } = await open();
   const reads = () => fetcher.mock.calls.filter(([url]) => String(url) === REVIEW_URL).length;
@@ -271,7 +311,8 @@ it('服务端拒绝这次判定时说出原因，那一行留在屏幕上', asyn
   expect(queueOf().sections.metadata_fields).toHaveLength(QUEUE.length);
 });
 
-it('批量判定把成功的摘掉，没写成的留下来等重试', async () => {
+it('批量判定先确认，成功的摘掉，没写成的留下来等重试', async () => {
+  const asked = acceptConfirm();
   const { host, props } = await open({
     decisions: [{ ok: true }, { ok: false, error: '来源已失效' }, { ok: true }],
   });
@@ -282,6 +323,8 @@ it('批量判定把成功的摘掉，没写成的留下来等重试', async () =
     .toEqual(['忽略所选', '稍后处理所选', '通过所选', '取消选择']);
   await click(buttonIn(host, '通过所选'));
   await settle();
+  // 通过写进真相字段，撤不回：弹窗写明，回执不带撤销。
+  expect(asked[0]?.body).toBe('将通过选中的 3 项，按所选来源写入资料。不能撤销。');
   expect(props.toast).toHaveBeenCalledWith('已通过 2 项，1 项未完成');
   expect(queueOf().sections.metadata_fields).toHaveLength(QUEUE.length - 2);
   expect(keys(host)).toEqual(['row-101']);
@@ -312,6 +355,7 @@ it('逐项通过使用同资产最近一次批准的版本，已过期的候选�
 });
 
 it('批量通过逐条沿用服务端版本回执，并保留其他写入造成的冲突', async () => {
+  acceptConfirm();
   const { host, fetcher } = await open({
     data: review({ sections: { metadata_fields: sameAssetRows() } }),
     decisions: [receipt(1, 4), receipt(4, 5), { ok: false, error: '资产资料已更改' }],
@@ -337,7 +381,9 @@ it('只读数据库上判定与批量都不给点', async () => {
   const { host, fetcher } = await open(
     { data: review({ mirror: { state: 'live' } }) },
     { readOnly: true, writerUrl: 'https://writer.example/review' });
-  expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([REVIEW_URL]);
+  // 只读：队列与自动写入批次各读一次，一个写请求都不发。
+  expect(fetcher.mock.calls.map(([url]) => String(url)).sort()).toEqual([REVIEW_URL, AUTO_LANDINGS_URL]);
+  expect(fetcher.mock.calls.every(([, init]) => !init?.method || init.method === 'GET')).toBe(true);
   expect(noteText(host).join()).toContain('正在显示写入端的实时复核队列');
   expect(host.querySelector('a[href="https://writer.example/review"]')).toBeTruthy();
   // 勾选与批量操作整条都不出现：没有可写的东西，工具条只是一排点不动的按钮。
@@ -350,7 +396,9 @@ it('只读数据库上判定与批量都不给点', async () => {
 
 it('打开复核页只读队列，不再触发自动落库写操作', async () => {
   const { fetcher } = await open();
-  expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([REVIEW_URL]);
+  // 读两样：复核队列与「自动写入的资料」的批次列表；都是 GET。
+  expect(fetcher.mock.calls.map(([url]) => String(url)).sort()).toEqual([REVIEW_URL, AUTO_LANDINGS_URL]);
+  expect(fetcher.mock.calls.every(([, init]) => !init?.method || init.method === 'GET')).toBe(true);
 });
 
 it('稍后处理切换独立队列，刷新地址可还原且恢复保持原排序', async () => {
@@ -418,14 +466,16 @@ it('批量状态移动只采用成功项，失败行和其他类别保持不变'
 });
 
 it('批量稍后处理失败的行留在待处理，成功行进入独立队列', async () => {
+  acceptConfirm();
   const rows = [row(0, ['nfo']), row(1, ['nfo']), row(2, ['nfo'])];
-  const { host } = await open({
+  const { host, props } = await open({
     data: review({ sections: { metadata_fields: rows }, counts: { metadata_fields: 3 } }),
     decisions: [{ ok: true }, { ok: false, error: '候选已变更' }, { ok: true }],
   });
   await click(buttonIn(host, '全选本页'));
   await click(buttonIn(host, '稍后处理所选'));
   await settle();
+  expect(props.toast).toHaveBeenCalledWith('已移至稍后处理 2 项，1 项未完成', { undo: expect.any(Function) });
   expect(keys(host)).toEqual(['row-1']);
   expect(cards(host)[0]?.textContent).toContain('候选已变更');
   expect(queueOf().counts.metadata_fields).toBe(1);
@@ -462,4 +512,34 @@ it('没有可采纳候选的卡仍可忽略或稍后处理，通过键不可用'
   const footer = cards(host)[0]!.querySelector('footer')!;
   expect([...footer.querySelectorAll('button')].map((button) => button.textContent?.trim()))
     .toEqual(['忽略', '稍后处理', '不可通过']);
+});
+
+const WRITES: AutoLandingWrite[] = [
+  { item_key: 'DASS-468:release_date', rule: 'adr-0139-official-replaces-verified', label: '官方来源一致，覆盖原值',
+    batch: 'adr-0139-official-replaces-verified@20261104T141053', at: 1793772653, field: '发行日期',
+    value: '2024-09-10', previous: ['2024-09-06'], tags: [], assets: 1,
+    asset_id: 7, code: 'DASS-468', name: '某部作品的标题', preview_url: '' },
+  { item_key: 'ROYD-083:tags', rule: 'adr-0139-verified-tags-union', label: '补上来源多给的标签',
+    batch: 'auto:metadata-tags@20261104T141053', at: 1793772653, field: '标签',
+    value: '痴女、姐弟', previous: [], tags: ['痴女', '姐弟'], assets: 1,
+    asset_id: 8, code: 'ROYD-083', name: '另一部作品', preview_url: '' },
+];
+
+it('元数据字段下逐条列出自动写入：作品、写了什么、原来是什么，只读端也能浏览', async () => {
+  const { host } = await open({ autoLandings: WRITES }, { readOnly: true });
+  const section = host.querySelector('[aria-labelledby="auto-landings-title"]')!;
+  const text = section.textContent ?? '';
+  for (const expected of ['自动写入的资料', 'DASS-468', '某部作品的标题', '发行日期：2024-09-10', '原为 「2024-09-06」',
+    'ROYD-083', '标签：痴女、姐弟', '原有标签保留']) expect(text).toContain(expected);
+});
+
+it('没有自动写入时不出现那一块', async () => {
+  const { host } = await open();
+  expect(host.querySelector('[aria-labelledby="auto-landings-title"]')).toBeNull();
+});
+
+it('候选表的字段名按字段 id 取当前语言，登记之外的字段照原样显示脚本写的名字', () => {
+  expect(fieldName({ ...row(1), field: 'performers', field_label: '出演' })).toBe('演员');
+  expect(fieldName({ ...row(1), field: 'director', field_label: '导演' })).toBe('导演');
+  expect(fieldName({ ...row(1), field: 'runtime', field_label: '' })).toBe('runtime');
 });

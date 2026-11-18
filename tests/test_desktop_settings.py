@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+import plistlib
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -59,6 +60,14 @@ class DesktopSettingsTests(unittest.TestCase):
                          'config.toml.bak 是用户按运维文档自己复制的回退副本')
         self.assertNotIn(str(unrelated), full['files'])
 
+    def test_macos_standalone_uninstall_follows_the_trash_convention(self):
+        with patch.object(desktop_uninstall, 'sys', SimpleNamespace(platform='darwin')),                 patch.object(desktop_uninstall.distribution, 'standalone', return_value=True):
+            state = desktop_uninstall.snapshot(self.config)
+        self.assertFalse(state['available'], 'macOS 不跑 Windows 的卸载助手')
+        self.assertIn('移到废纸篓', state['message'])
+        self.assertIn('关闭开机自启', state['message'], 'LaunchAgent 不随应用一起删除')
+        self.assertEqual(state['data_root'], str(self.data))
+
     def test_uninstall_refuses_media_overlap_external_storage_and_source_tree(self):
         self.config.locations = {'local': (str(self.data / 'sources/media'),)}
         with self.assertRaisesRegex(ValueError, '媒体'):
@@ -107,6 +116,51 @@ class DesktopSettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             desktop_startup.save(self.config, enabled=False, silent=True, desktop=None)
 
+    def _macos_agent(self):
+        agent = self.root / 'LaunchAgents/agent.plist'
+        agent.parent.mkdir()
+        (self.data / 'state').mkdir(exist_ok=True)
+        for patcher in (patch.object(desktop_startup, 'sys', SimpleNamespace(platform='darwin', executable=sys.executable)),
+                        patch.object(desktop_startup, 'launch_agent_path', return_value=agent)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return agent
+
+    def test_macos_launch_agent_relaunches_only_after_abnormal_exit(self):
+        agent = self._macos_agent()
+        program = self.program / 'Peach.exe'
+        desktop_startup.save(self.config, enabled=True, silent=True, desktop=False, executable=program)
+        entry = plistlib.loads(agent.read_bytes())
+        self.assertIs(entry['RunAtLoad'], True)
+        self.assertEqual(entry['KeepAlive'], {'SuccessfulExit': False}, '菜单「退出 Peach」退出码 0，不该被拉回来')
+        self.assertGreaterEqual(entry['ThrottleInterval'], 10)
+
+        desktop_startup.save(self.config, enabled=False, silent=True, desktop=False, executable=program)
+        entry = plistlib.loads(agent.read_bytes())
+        self.assertIs(entry['RunAtLoad'], False)
+        self.assertIs(entry['KeepAlive'], False, 'SuccessfulExit 隐含 RunAtLoad，关了自启还写它就会登录即起')
+
+    def test_macos_upgrade_refreshes_an_enabled_launch_agent_in_place(self):
+        agent = self._macos_agent()
+        program = (self.program / 'Peach.exe').resolve()
+        old = {'Label': 'old', 'ProgramArguments': [str(program), '--silent'], 'RunAtLoad': True,
+               'KeepAlive': False, 'StandardOutPath': '/tmp/peach.log'}
+        agent.write_bytes(plistlib.dumps(old))
+        with patch.object(desktop_startup, 'target', return_value=(program, [], self.program)):
+            self.assertTrue(desktop_startup.refresh_launch_agent(self.config))
+            entry = plistlib.loads(agent.read_bytes())
+            self.assertEqual(entry, {**old, **desktop_startup.launch_agent_supervision(True)}, '其余键原样保留')
+            self.assertFalse(desktop_startup.refresh_launch_agent(self.config), '已是当前写法就不再改写')
+
+            disabled = {**old, 'RunAtLoad': False}
+            agent.write_bytes(plistlib.dumps(disabled))
+            self.assertFalse(desktop_startup.refresh_launch_agent(self.config))
+            self.assertEqual(plistlib.loads(agent.read_bytes()), disabled, '自启关着时不碰')
+
+            agent.write_bytes(plistlib.dumps({**old, 'ProgramArguments': [str(self.root / 'Other/Peach')]}))
+            with self.assertRaisesRegex(ValueError, '另一份'):
+                desktop_startup.refresh_launch_agent(self.config)
+
     def test_configuration_actions_require_local_origin_and_uninstall_confirmation(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
@@ -121,11 +175,19 @@ class DesktopSettingsTests(unittest.TestCase):
                 patch.object(settings_file, 'load_config', return_value=self.config), \
                 patch.object(desktop_uninstall, 'request', return_value={'accepted':True}) as remove:
             self.assertEqual(client.post('/api/configuration/uninstall',json={'delete_data':True}).status_code,400)
-            self.assertEqual(client.post('/api/configuration/uninstall',json={'delete_data':True,'confirmation':'卸载 Peach'},
+            self.assertEqual(client.post('/api/configuration/uninstall',json={'delete_data':True,'confirmation':'uninstall-peach'},
                                          headers={'origin':'https://other.invalid'}).status_code,403)
             remove.assert_not_called()
-            self.assertEqual(client.post('/api/configuration/uninstall',json={'delete_data':False,'confirmation':'卸载 Peach'}).status_code,200)
+            self.assertEqual(client.post('/api/configuration/uninstall',json={'delete_data':False,'confirmation':'uninstall-peach'}).status_code,200)
             remove.assert_called_once_with(self.config,False)
+            from peach.jobs import BackgroundJob
+            follow = BackgroundJob('PeachFollowCheckJob', task_key='follow-check')
+            follow.state = {'job_id': 'running-follow', 'status': 'running'}
+            app.state.web_contract = SimpleNamespace(follow_job=follow)
+            busy = client.post('/api/configuration/uninstall',json={'delete_data':False,'confirmation':'uninstall-peach'})
+            self.assertEqual(busy.status_code,409)
+            self.assertEqual(busy.json()['detail']['message'],'追更检查正在运行，请在任务中心等它完成或取消后再卸载')
+            remove.assert_called_once()
             self.assertEqual(client.post('/api/configuration/startup',json={'enabled':'false','silent':True}).status_code,400)
             self.assertEqual(client.post('/api/configuration/peach-proxy',json={'mode':'proxy','proxy':'invalid'}).status_code,400)
             # 外部入口：域名不成形时整批不写，落下去的会是一排点过去必然落空的入口。
@@ -205,7 +267,9 @@ class DesktopSettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '另一份'):
                 desktop_startup.save(self.config, enabled=False, silent=True, desktop=True)
             self.assertEqual(desktop_startup.desktop_snapshot(self.config),
-                             {'desktop': False, 'desktop_message': '桌面快捷方式属于另一份 Peach 安装'})
+                             {'desktop': False, 'desktop_message': '桌面快捷方式属于另一份 Peach 安装',
+                              'desktop_message_code': 'errors.desktopStartup.desktopShortcutForeign',
+                              'desktop_message_params': {}})
             desktop_startup.save(self.config, enabled=True, silent=True, desktop=False)
             self.assertEqual(len(list(startup.iterdir())), 1)
             self.assertTrue(icon.is_file())
@@ -321,7 +385,7 @@ class DesktopSettingsTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn('启动项未能保存', message)
         self.assertIn('Expected shortcut', message)
-        self.assertRegex(message, r'第 \d+ 行')
+        self.assertRegex(message, r'RuntimeException line \d+')
         self.assertNotIn('CLIXML', message)
 
     @unittest.skipUnless(os.name == 'nt', 'Windows 系统卸载助手')

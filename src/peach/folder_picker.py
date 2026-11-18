@@ -9,22 +9,25 @@
 调用方只在回环地址上开放这条路：否则局域网里任何人都能让这台电脑弹窗。
 
 Windows 这里刻意用 `powershell.exe`（Windows PowerShell 5.1）：它在每台 Windows 上都有，
-pwsh 7 是另装的。它自带的 `FolderBrowserDialog` 是 XP 时代的树形面板、没有地址栏，所以
+pwsh 7 是另装的。它按 `%SystemRoot%` 下的绝对路径启动，不依赖服务进程的 PATH。它自带的 `FolderBrowserDialog` 是 XP 时代的树形面板、没有地址栏，所以
 用 `Add-Type` 编一段 COM 互操作直接调 `IFileOpenDialog`。脚本以 `-EncodedCommand` 传入，
 避开引号与中文的转义。
 """
 from __future__ import annotations
 
 import base64
+import ntpath
 import os
+import re
 import subprocess
 import sys
 import threading
+from .user_messages import UserFacingError
 
 __all__ = ["PickerBusy", "PickerUnavailable", "command", "pick_folder"]
 
 
-class PickerUnavailable(RuntimeError):
+class PickerUnavailable(UserFacingError, RuntimeError):
     """这台机器上没有可用的文件夹对话框，或者对话框没能打开。"""
 
 
@@ -32,7 +35,7 @@ class PickerUnsupported(PickerUnavailable):
     """当前平台不提供系统文件夹对话框。"""
 
 
-class PickerBusy(RuntimeError):
+class PickerBusy(UserFacingError, RuntimeError):
     """已经有一个对话框开着：系统对话框是模态的，第二个只会藏在第一个后面。"""
 
 
@@ -42,7 +45,16 @@ _LOCK = threading.Lock()
 #: 用户在对话框里翻多久都行，但进程不能被一个忘了关的窗口永久占住。
 DIALOG_TIMEOUT_SECONDS = 15 * 60
 
-PROMPT = "选择媒体目录"
+#: 对话框标题的 code（ADR-0159）：对话框开在这台电脑上，跟本机语言。
+PROMPT_CODE = "labels.folderPicker.prompt"
+
+
+def prompt() -> str:
+    from . import interface_text
+    return interface_text.text(f"server:{PROMPT_CODE}", None, interface_text.local_language())
+
+#: osascript 没法弹窗的错误码：-1713 当前会话不允许用户交互，-1743 未获自动化授权。
+_MACOS_NO_DIALOG = frozenset({"-1713", "-1743"})
 
 #: `IFileOpenDialog` 的最小互操作：vtable 顺序必须与 shobjidl 一致，一个都不能少。
 #: FOS_NOCHANGEDIR 0x8 不改进程工作目录，FOS_PICKFOLDERS 0x20 选文件夹，
@@ -103,8 +115,9 @@ namespace PeachPick {
     static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")]
     static extern bool SetForegroundWindow(IntPtr window);
-    // 服务进程在后台，Windows 不给它前台权：对话框会开在浏览器后面。等它的窗口
-    // 出现后置顶（SetWindowPos 到 HWND_TOPMOST 不需要前台权），模态窗关掉即消失。
+    // The server runs in the background and Windows won't give it the foreground, so the dialog
+    // would open behind the browser. Once its window appears, make it topmost (SetWindowPos to
+    // HWND_TOPMOST needs no foreground rights); it goes away when the modal dialog closes.
     static void Raise(string title) {
       for (int attempt = 0; attempt < 200; attempt++) {
         var window = FindWindow("#32770", title);
@@ -151,33 +164,45 @@ Add-Type -TypeDefinition @'
 '@
 $picked = [PeachPick.Picker]::Pick('@PROMPT@', $env:PEACH_PICK_INITIAL)
 if ($picked) { [Console]::Out.Write($picked) }
-""".replace("@INTEROP@", _WINDOWS_INTEROP.strip()).replace("@PROMPT@", PROMPT)
+""".replace("@INTEROP@", _WINDOWS_INTEROP.strip())
 
 
 def _applescript_string(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _windows_powershell() -> str:
+    """系统目录里的 Windows PowerShell；服务进程的 PATH 可能缺了它，按名字查找会找不到。"""
+    root = os.environ.get("SystemRoot")
+    if not root:
+        return "powershell.exe"
+    return ntpath.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+
+
 def command(initial: str | None, platform: str = sys.platform) -> tuple[list[str], dict[str, str]]:
     """这个平台弹对话框的命令行，以及要附加的环境变量。"""
     if platform == "win32":
-        encoded = base64.b64encode(_WINDOWS_SCRIPT.encode("utf-16-le")).decode("ascii")
-        argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", encoded]
+        # 标题放进 PowerShell 单引号字符串：单引号写两次。
+        script = _WINDOWS_SCRIPT.replace("@PROMPT@", prompt().replace("'", "''"))
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        argv = [_windows_powershell(), "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", encoded]
         return argv, {"PEACH_PICK_INITIAL": initial or ""}
     if platform == "darwin":
-        script = f'choose folder with prompt "{_applescript_string(PROMPT)}"'
+        script = f'choose folder with prompt "{_applescript_string(prompt())}"'
         if initial and os.path.isdir(initial):
             script += f' default location POSIX file "{_applescript_string(initial)}"'
         return ["osascript", "-e", f"POSIX path of ({script})"], {}
-    raise PickerUnsupported("这个系统上没有可用的文件夹对话框")
+    raise PickerUnsupported("errors.folderPicker.unsupportedSystem")
 
 
 def pick_folder(initial: str | None = None, *, platform: str = sys.platform,
                 run=subprocess.run) -> str | None:
     """弹对话框，返回选中的绝对路径；用户取消返回 None。"""
+    if os.environ.get('PEACH_HEADLESS_MANAGED') == '1':
+        raise PickerUnsupported("errors.folderPicker.headless")
     argv, extra = command(initial, platform)
     if not _LOCK.acquire(blocking=False):
-        raise PickerBusy("已经有一个选择文件夹的窗口开着")
+        raise PickerBusy("errors.folderPicker.busy")
     try:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform == "win32" else 0
         try:
@@ -185,14 +210,21 @@ def pick_folder(initial: str | None = None, *, platform: str = sys.platform,
                          timeout=DIALOG_TIMEOUT_SECONDS, creationflags=flags)
         except subprocess.TimeoutExpired:
             return None
+        except OSError as exc:
+            # 对话框程序不存在或起不来，与不支持的平台同样处理：这台机器不提供对话框。
+            raise PickerUnsupported("errors.folderPicker.cannotOpen") from exc
     finally:
         _LOCK.release()
     stderr = (result.stderr or b"").decode("utf-8", "replace")
     if result.returncode != 0:
-        # osascript 在用户取消时以 1 退出，stderr 是 "User canceled."；这不是失败。
-        if "canceled" in stderr.lower():
-            return None
-        raise PickerUnavailable("没能打开文件夹对话框")
+        # osascript 失败时以 1 退出，消息跟随系统语言（中文是「用户已取消。」），
+        # 末尾括号里的 AppleScript 错误码不变，所以按错误码判断。
+        codes = set(re.findall(r"\((-\d+)\)", stderr))
+        if "-128" in codes:
+            return None  # 用户取消，不是失败。
+        if codes & _MACOS_NO_DIALOG:
+            raise PickerUnsupported("errors.folderPicker.noPermission")
+        raise PickerUnavailable("errors.folderPicker.failed")
     text = (result.stdout or b"").decode("utf-8", "replace").strip()
     if platform == "darwin" and len(text) > 1:
         text = text.rstrip("/")

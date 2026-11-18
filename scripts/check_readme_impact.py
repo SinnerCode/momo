@@ -1,4 +1,4 @@
-"""核对一次分支交付的 README 影响声明。"""
+"""README 安装契约与提交检查共用的 Git 读取。"""
 
 from __future__ import annotations
 
@@ -6,15 +6,13 @@ import subprocess
 import re
 import tomllib
 from pathlib import Path
+import sys
+
+if str(Path(__file__).resolve().parents[1] / "src") not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from peach.interface_text import dev as t  # noqa: E402
 
 READMES = {"README.md", "README.zh-CN.md"}
-PREFIXES = ("src/peach/", "web/", "frontend/", "migrations/", "resources/")
-FILES = {
-    "pyproject.toml", "package.json", "package-lock.json",
-    ".github/workflows/release.yml", "docs/FRONTEND.md",
-    "docs/TESTING_DESKTOP.md", "docs/OPERATIONS.md", "docs/SOURCING.md",
-    "scripts/build_windows.ps1", "scripts/build_app_entry.py",
-}
 
 
 def installation_contracts(repo: Path) -> list[str]:
@@ -25,10 +23,10 @@ def installation_contracts(repo: Path) -> list[str]:
     for name in sorted(READMES):
         text = (repo / name).read_text(encoding='utf-8')
         if not re.search(rf'\bPython {re.escape(floor)}(?:\+| or newer| 或更高)', text):
-            problems.append(f'{name}: Python 下限须为 {floor}')
+            problems.append(t("check_readme_impact.pythonFloor", name=name, floor=floor))
         counterpart, = READMES - {name}
         if counterpart not in re.findall(r'\]\(([^)\s]+)\)', text):
-            problems.append(f'{name}: 缺少语言入口 {counterpart}')
+            problems.append(t("check_readme_impact.languageLink", name=name, counterpart=counterpart))
     return problems
 
 
@@ -64,48 +62,3 @@ def trailers(repo: Path, message: str) -> dict[str, list[str]]:
         name, _, value = line.partition(":")
         result.setdefault(name.casefold(), []).append(value.strip())
     return result
-
-
-def declaration(values: list[str]) -> tuple[str, list[str]]:
-    """检查声明形态；与 README 文件差异的关系由交付检查核对。"""
-    if len(values) != 1:
-        return "", ["交付提交须有唯一 README-Impact: updated; 说明 或 README-Impact: none; 原因"]
-    status, separator, reason = values[0].partition(";")
-    if status not in {"updated", "none"} or not separator or not reason.strip():
-        return "", ["README-Impact 需使用 updated/none，并在英文分号后写具体原因"]
-    return status, []
-
-
-def reviewed_declaration(values: list[str], counterpart: str | None = None) -> list[str]:
-    """另一语言的核对声明必须唯一，指明文件及无需修改的原因。"""
-    if len(values) != 1:
-        return ["README-Reviewed 须有唯一的未改 README 文件名和原因"]
-    name, separator, reason = values[0].partition(";")
-    allowed = {counterpart} if counterpart else READMES
-    if name.strip() not in allowed or not separator or not reason.strip():
-        return ["README-Reviewed 须填写未改 README 文件名，并在英文分号后写明无需修改的原因"]
-    return []
-
-
-def check(repo: Path, base: str, head: str = "HEAD") -> list[str]:
-    """以实际交付差异和最后提交的 Git trailer 为依据。"""
-    paths = set(git(repo, "diff", "--name-only", "--no-renames", "-z",
-                    base, head).rstrip("\0").split("\0")) - {""}
-    touched = paths & READMES
-    relevant = any(path in FILES or path.startswith(PREFIXES) for path in paths)
-    if not touched and not relevant:
-        return []
-    message = git(repo, "show", "-s", "--format=%B", head)
-    status, problems = declaration(trailers(repo, message).get("readme-impact", []))
-    if problems:
-        return problems
-    if touched and touched != READMES:
-        reviewed = trailers(repo, message).get("readme-reviewed", [])
-        other = next(iter(READMES - touched))
-        if problems := reviewed_declaration(reviewed, other):
-            return problems
-    if status == "updated" and not touched:
-        return ["README-Impact 声明 updated，但交付差异未包含 README"]
-    if status == "none" and touched:
-        return ["README-Impact 声明 none，但交付差异包含 README"]
-    return []

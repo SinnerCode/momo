@@ -6,6 +6,8 @@ import { QueryClient } from '@tanstack/query-core';
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
+      /* 同一浏览器标签页保留已访问内容；主动刷新和写操作失效仍会取新数据。 */
+      gcTime: Infinity,
       /* 请求都打本机的 `/api/...`。浏览器的 online 标记说的是外网，断了外网它就翻 false，
          Query 默认会把本机请求也挂起成 paused——页面于是停在旧数据上，什么都不说。 */
       networkMode: 'always',
@@ -16,9 +18,9 @@ export const queryClient = new QueryClient({
          再加一条焦点触发就是同一份数据两个节律。对外来源的采集与追更一律显式触发，
          更不能因为切回标签页就发出去。要即时刷新的页面自己在 `useQuery` 里打开。 */
       refetchOnWindowFocus: false,
-      /* 挂载不重取、错了也不重试：每次进页面都是路由元素先 `prefetch` 再挂载（`history/managed.ts` 的页面打开契约），组件挂上去时缓存里那一份就是刚取回来的。默认值会在同一次进入里
-         紧接着再发一遍同样的请求；失败那次还会再失败一遍，错误反而晚一个来回才显示。 */
-      refetchOnMount: false,
+      /* 初次进入先预取，栏目往返复用缓存。挂载只重取被写操作失效的查询，不重复正常读取；
+         失败保持错误回执，由页面自己的重试入口处理。 */
+      refetchOnMount: query => query.state.isInvalidated,
       retryOnMount: false,
     },
   },

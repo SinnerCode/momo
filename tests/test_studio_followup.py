@@ -1,4 +1,4 @@
-"""补厂牌官网与标识后继：证据确定的直接落，不确定的不写，写下的能整批撤回（ADR-0052）。
+"""厂牌官网与标识补全后继：证据确定的直接落，不确定的不写，写下的能整批撤回（ADR-0052）。
 
 全程临时账本、临时标识目录；试地址与取图都桩掉，不联网。
 """
@@ -15,7 +15,9 @@ from unittest import mock
 
 from peach import studio_followup, studio_icons
 from peach.repository import LedgerDatabase
+from peach.task_outcomes import parts
 from support.ledger import fresh_ledger
+from support.outcomes import told
 
 ROOT = Path(__file__).resolve().parents[1]
 STAMP = "2026-09-24T00:00:00.000Z"
@@ -149,7 +151,7 @@ class PlanTests(StudioFollowupCase):
             connection.execute(
                 "INSERT INTO entity_link(entity_id,link_kind,label,url,hostname,is_sensitive,"
                 "metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,0,'{}',?,?)",
-                (studio, "official", "官方网站", "https://old.jp/", "old.jp", STAMP, STAMP))
+                (studio, "official", "official-site", "https://old.jp/", "old.jp", STAMP, STAMP))
         self.assertEqual(planned(), [key])
 
     def test_stock_tries_again_after_a_round_without_the_face_gate(self):
@@ -170,6 +172,74 @@ class PlanTests(StudioFollowupCase):
             planned = [item.key for item in
                        studio_followup.stock(connection, self.logos, attempts, limit=10)]
         self.assertEqual(planned, [studio_followup.followup_key(studio)])
+
+    def test_stock_tries_again_a_day_after_no_candidate_answered(self):
+        """候选官网全连不上（断网）只挡一天；回了 HTTP 状态的未取得照旧等实体变。"""
+        import time
+
+        from peach.followups import Attempts, attempts_root
+
+        studio = self.entity("studio", "OLDLABEL")
+        with self.database.write_transaction(notify=False) as connection:
+            connection.execute("INSERT INTO asset(id,location,path,name,medium,code,size)"
+                               " VALUES(1,'R:','R:\\media\\a.mp4','a.mp4','video','OLD-1',1)")
+            connection.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source)"
+                               " VALUES(1,?,'studio','test')", (studio,))
+        key = studio_followup.followup_key(studio)
+
+        def planned(after: float) -> list[str]:
+            attempts = Attempts(attempts_root(self.contract.candidate_root),
+                                clock=lambda: time.time() + after)
+            with self.database.read_connection() as connection:
+                return [item.key for item in
+                        studio_followup.stock(connection, self.logos, attempts, limit=10)]
+
+        unreached = {**site_row("未取得"), "status": "", "note": "取不到：ConnectError"}
+        with mock.patch.object(studio_followup.studio_sites, "discover",
+                               return_value=(unreached, 0.0)):
+            self.run_followup(studio)
+        self.assertEqual(planned(0), [])
+        self.assertEqual(planned(studio_followup.RETRY_UNREACHED + 60), [key])
+
+        answered = {**site_row("未取得"), "status": 404, "note": "HTTP 404"}
+        with mock.patch.object(studio_followup.studio_sites, "discover",
+                               return_value=(answered, 0.0)):
+            self.run_followup(studio)
+        self.assertEqual(planned(studio_followup.RETRY_UNREACHED + 60), [])
+
+    def test_an_old_miss_without_a_deadline_is_released_once(self):
+        """带期限之前记下的「官网未取得」分不清是不是断网，放一次重试；其余记录不动。"""
+        import json
+
+        from peach.followups import Attempts, attempts_root
+
+        studio = self.entity("studio", "OLDLABEL")
+        with self.database.write_transaction(notify=False) as connection:
+            connection.execute("INSERT INTO asset(id,location,path,name,medium,code,size)"
+                               " VALUES(1,'R:','R:\\media\\a.mp4','a.mp4','video','OLD-1',1)")
+            connection.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source)"
+                               " VALUES(1,?,'studio','test')", (studio,))
+        root = attempts_root(self.contract.candidate_root)
+        attempts = Attempts(root)
+        key = studio_followup.followup_key(studio)
+        with self.database.read_connection() as connection:
+            attempts.record(key, studio_followup.fingerprint(connection, studio), parts("officialSite", "unfetched"))
+        attempts.record("studio-mark:999", "fp", parts("officialSite", "needsReview"))
+        attempts.record("studio-mark:998", "fp", parts("officialSite", "unfetched"),
+                        retry_after=studio_followup.RETRY_UNREACHED)
+        attempts.record("performer-profile:1", "fp", parts("officialSite", "unfetched"))
+
+        def planned() -> list[str]:
+            with self.database.read_connection() as connection:
+                return [item.key for item in studio_followup.stock(connection, self.logos, attempts, limit=10)]
+
+        self.assertEqual(planned(), [])
+        self.assertEqual(studio_followup.release_unbounded_misses(root), 1)
+        self.assertEqual(planned(), [key])
+        self.assertEqual(studio_followup.release_unbounded_misses(root), 0)
+        untouched = {name: json.loads((root / f"{name}.json").read_text(encoding="utf-8"))
+                     for name in ("studio-mark-999", "performer-profile-1")}
+        self.assertTrue(all("retry_until" not in record for record in untouched.values()))
 
     def test_stock_studios_are_not_crowded_out_by_avatarless_performers(self):
         """没头像的女优再多，存量厂牌也有自己那一份名额。"""
@@ -207,12 +277,12 @@ class SiteTests(StudioFollowupCase):
                 mock.patch.object(studio_followup.studio_icons, "land_one",
                                   return_value={"outcome": "未取得"}) as land:
             summary = self.run_followup(entity_id)
-        self.assertEqual(summary["site"]["outcome"], "已登记")
+        self.assertEqual(told(summary["site"])["outcome"], "已登记")
         [link] = self.links(entity_id)
         self.assertEqual((link["link_kind"], link["label"], link["url"]),
-                         ("official", "官方网站", "https://newlabel.jp/"))
+                         ("official", "official-site", "https://newlabel.jp/"))
         metadata = json.loads(link["metadata_json"])
-        self.assertEqual(metadata["source"], studio_followup.SOURCE)
+        self.assertEqual(told(metadata)["source"], studio_followup.SOURCE)
         self.assertEqual(metadata["batch"], f"{studio_followup.SOURCE}@77")
         self.assertEqual(metadata["verdict"], "ok")
         # 登记下的官网就是取图那一趟的起点。
@@ -225,7 +295,7 @@ class SiteTests(StudioFollowupCase):
                                return_value=(site_row("weak"), 0.0)), \
                 mock.patch.object(studio_followup.studio_icons, "land_one") as land:
             summary = self.run_followup(entity_id)
-        self.assertEqual(summary["outcome"], "官网待人确认")
+        self.assertEqual(told(summary)["outcome"], "厂牌官网待人确认")
         self.assertEqual(self.links(entity_id), [])
         land.assert_not_called()
 
@@ -235,7 +305,7 @@ class SiteTests(StudioFollowupCase):
             connection.execute(
                 "INSERT INTO entity_link(entity_id,link_kind,label,url,hostname,is_sensitive,"
                 "metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,0,'{}',?,?)",
-                (entity_id, "official", "官方网站", "https://newlabel.jp/", "newlabel.jp",
+                (entity_id, "official", "official-site", "https://newlabel.jp/", "newlabel.jp",
                  STAMP, STAMP))
         with mock.patch.object(studio_followup.studio_sites, "discover") as discover, \
                 mock.patch.object(studio_followup.studio_icons, "land_one",
@@ -249,21 +319,21 @@ class SiteTests(StudioFollowupCase):
         (self.logos / "NEWLABEL.img").write_bytes(b"png")
         with mock.patch.object(studio_followup.studio_sites, "discover") as discover:
             summary = self.run_followup(entity_id)
-        self.assertEqual(summary["outcome"], "已有标识")
+        self.assertEqual(told(summary)["outcome"], "已有标识")
         discover.assert_not_called()
 
     def test_a_vanished_studio_is_not_a_failure(self):
-        self.assertEqual(self.run_followup(999), {"outcome": "档案已不存在"})
+        self.assertEqual(told(self.run_followup(999)), {"outcome": "资料记录已不存在"})
 
 
 class MarkTests(StudioFollowupCase):
     def test_a_clean_square_mark_is_installed_with_its_provenance(self):
         landed = self.land(Faces())
-        self.assertEqual(landed["outcome"], "已装上")
+        self.assertEqual(told(landed)["outcome"], "已保存资料图片")
         self.assertIn("NEWLABEL.icon.img", landed["installed"])
         record = json.loads((self.logos / "NEWLABEL.icon.img.provenance.json")
                             .read_text(encoding="utf-8"))
-        self.assertEqual((record["source"], record["batch"]), (studio_followup.SOURCE, "b1"))
+        self.assertEqual((told(record)["source"], record["batch"]), (studio_followup.SOURCE, "b1"))
 
     def test_a_mark_with_a_face_is_not_installed(self):
         landed = self.land(Faces(found=True))
@@ -272,7 +342,7 @@ class MarkTests(StudioFollowupCase):
 
     def test_nothing_is_installed_while_the_face_gate_is_down(self):
         landed = self.land(Faces(unavailable="取不到人脸模型"))
-        self.assertIn("人像闸未生效", landed["outcome"])
+        self.assertIn("人像闸未生效", told(landed)["outcome"])
         # 任务中心按这个标记把这一轮标成「发现问题」，而不是绿色的已完成。
         self.assertIs(landed["face_match_unavailable"], True)
         self.assertEqual(list(self.logos.iterdir()), [])

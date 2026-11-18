@@ -19,11 +19,22 @@ import sys
 import time
 
 from . import distribution
+from .user_messages import UserFacingError, UserValueError
+
+
+def _local_text(error: BaseException) -> str:
+    """写给安装器弹窗的报错：本机直接给人看，按本机语言渲染；没带 code 的异常照旧给原文。"""
+    from . import interface_text
+    if isinstance(error, UserFacingError):
+        return interface_text.text(f"server:{error.code}", error.params, interface_text.local_language())
+    return str(error)
 
 APP_ID = "02D9748A-78F6-4866-AC75-918177194DAB"
 UNINSTALL_KEY = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{{{APP_ID}}}_is1"
 #: 开始菜单项的文件名，与 `.iss` 的 `[Icons]` 一致。
 MENU_SHORTCUT = "Peach.lnk"
+#: 每次 `taskkill` 的期限（秒）。
+TASKKILL_SECONDS = 30.0
 _UNINSTALLER = re.compile(r"unins\d{3}\.(?:exe|dat|msg)", re.IGNORECASE)
 
 
@@ -94,8 +105,13 @@ def stop(program: Path, *, timeout: float = 60) -> bool:
     while (strays := _running_from(program)) and time.monotonic() < deadline:
         time.sleep(.5)
     for pid in strays:
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW, check=False)
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdin=subprocess.DEVNULL,
+                           capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False,
+                           timeout=TASKKILL_SECONDS)
+        except subprocess.TimeoutExpired:
+            # 杀不掉就照实报：下面再看一眼还剩谁。
+            pass
     return not _running_from(program)
 
 
@@ -133,13 +149,13 @@ def prepare(program: Path, owner: int, error_file: Path) -> int:
         previous = job_recovery.legacy_library_request(db)
         update_tasks.wait_quiescent(db)
         if not stop(program):
-            raise update_tasks.UpdateBusy('Peach 尚未退出，安装未完成。请稍后重试。')
+            raise update_tasks.UpdateBusy('errors.desktopInstaller.peachStillRunning')
         job_recovery.import_legacy_library(db, previous)
         return 0
     except Exception as exc:
         if token:
             update_tasks.release(db, token)
-        atomic_write_text(error_file, str(exc))
+        atomic_write_text(error_file, _local_text(exc))
         return 1
 
 
@@ -154,7 +170,7 @@ def prepare_install_tools(program: Path, cache: Path, error_file: Path, *, stage
             cached = cache / url.rsplit('/', 1)[-1]
             if cached.is_file():
                 if cached.stat().st_size != size or update_packages.digest(cached) != checksum:
-                    raise ValueError(f'本地工具包校验失败：{cached.name}。请重新下载或移走此文件后重试。')
+                    raise UserValueError("errors.desktopInstaller.cachedToolInvalid", {"name": cached.name})
                 shutil.copy2(cached, archive)
                 progress(size)
             else:
@@ -167,7 +183,9 @@ def prepare_install_tools(program: Path, cache: Path, error_file: Path, *, stage
                                             report=lambda data, **changes: data.update(changes), fetch=fetch)
         return 0
     except Exception as exc:
-        atomic_write_text(error_file, f'媒体工具准备失败：{exc}')
+        from . import interface_text
+        atomic_write_text(error_file, interface_text.text("server:tray.installer.toolsFailed", {"error": _local_text(exc)},
+                                                          interface_text.local_language()))
         return 1
 
 

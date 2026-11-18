@@ -18,7 +18,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from peach import __version__
+from peach import __version__, sparkle_update
+from peach.interface_text import dev as t
 
 
 def minimum_system_version(app: Path) -> str:
@@ -32,20 +33,20 @@ def minimum_system_version(app: Path) -> str:
             if stream.read(4) in magic:
                 binaries.append(str(path))
     if not binaries:
-        raise ValueError("应用内没有 Mach-O 可执行文件")
+        raise ValueError(t("build_macos_standalone.noMachO"))
     result = subprocess.run(["otool", "-l", *binaries], capture_output=True,
                             text=True, encoding="utf-8", check=True)
     versions = re.findall(r"cmd LC_(?:BUILD_VERSION|VERSION_MIN_MACOSX)\s+cmdsize \d+\s+"
                           r"(?:platform \d+\s+)?(?:minos|version) ([\d.]+)", result.stdout)
     if not versions:
-        raise ValueError("未取得随包二进制的 macOS 版本下限")
+        raise ValueError(t("build_macos_standalone.noMinimumVersion"))
     return max(versions, key=lambda value: tuple(int(part) for part in value.split(".")))
 
 
 def package_dmg(app: Path, destination: Path) -> Path:
     """以固定拖放布局分发应用，许可证随应用资源保留。"""
     if not (app / "Contents" / "MacOS" / "Peach").is_file():
-        raise FileNotFoundError(f"找不到应用可执行文件：{app}")
+        raise FileNotFoundError(t("build_macos_standalone.executableMissing", path=app))
     destination.parent.mkdir(parents=True, exist_ok=True)
     from dmgbuild import build_dmg
     from resvg_py import svg_to_bytes
@@ -70,21 +71,28 @@ def package_dmg(app: Path, destination: Path) -> Path:
     return destination
 
 
+def install_sparkle(app: Path, source: Path) -> None:
+    """框架放在 `Contents/Frameworks`，即 PyInstaller 的 `_MEIPASS`；保留符号链接，签名由取件时完成。"""
+    shutil.copytree(source / "Sparkle.framework", app / "Contents/Frameworks/Sparkle.framework", symlinks=True)
+    shutil.copyfile(source / "LICENSE-Sparkle.txt", app / "Contents/Resources/LICENSE-Sparkle.txt")
+
+
 def build(destination: Path, *, dmg: bool = True, target_arch: str | None = None,
           require_reporting: bool = False) -> dict[str, str]:
     if sys.platform != "darwin":
-        raise SystemExit("macOS 应用必须在 macOS 上构建")
+        raise SystemExit(t("build_macos_standalone.macosOnly"))
     from peach import seed_pack
     seed_pack.load(ROOT / "resources/seed/entities.json")
     architecture = target_arch or platform.machine()
     if architecture not in {"arm64", "x86_64"} or architecture != platform.machine():
-        raise SystemExit("目标架构必须与当前 Python 一致；请使用 arm64 或 x86_64 Python 及对应依赖构建")
+        raise SystemExit(t("build_macos_standalone.architectureMismatch"))
     from write_reporting_config import reporting_config, write as write_reporting_config
     reporting_config(require=require_reporting)
     from build_macos_app import build_frontend_bundles
     from media_tool_bundle import validate
     from build_macos_media import audit_binary
     from fetch_cloudflared_macos import validate as validate_cloudflared
+    from fetch_sparkle_macos import validate as validate_sparkle
     from fetch_face_models import install as install_face_models
     from build_amane_runtime import build as build_amane_runtime, verify as verify_amane_runtime
 
@@ -97,6 +105,8 @@ def build(destination: Path, *, dmg: bool = True, target_arch: str | None = None
             audit_binary(media_root / tool / tool / name, architecture)
     cloudflared = media_root / "cloudflared"
     validate_cloudflared(cloudflared, architecture)
+    sparkle = media_root / "sparkle"
+    validate_sparkle(sparkle)
     work = ROOT / "build" / "macos-standalone" / architecture
     amane_runtime = work / "amane-runtime"
     build_amane_runtime(amane_runtime, work=work / "amane-build")
@@ -139,12 +149,14 @@ def build(destination: Path, *, dmg: bool = True, target_arch: str | None = None
     for name in ("LICENSE-cloudflared.txt", "NOTICE-cloudflared.md"):
         shutil.copyfile(cloudflared / name, app / "Contents/Resources" / name)
     shutil.copyfile(cloudflared / "manifest.json", app / "Contents/Resources/cloudflared-manifest.json")
+    install_sparkle(app, sparkle)
     for archive in sources:
         shutil.copyfile(archive, destination / archive.name)
     minimum = minimum_system_version(app)
     info_path = app / "Contents" / "Info.plist"
     info = plistlib.loads(info_path.read_bytes())
     info["LSMinimumSystemVersion"] = minimum
+    info.update(sparkle_update.info_plist_keys(architecture))
     info_path.write_bytes(plistlib.dumps(info))
     subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True)
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
@@ -159,11 +171,11 @@ def build(destination: Path, *, dmg: bool = True, target_arch: str | None = None
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=t("build_macos_standalone.description"))
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--target-arch", choices=("arm64", "x86_64"), default=platform.machine())
-    parser.add_argument("--no-dmg", action="store_true", help="只生成独立应用")
-    parser.add_argument("--require-reporting", action="store_true", help="发行构建：缺 Sentry DSN 时失败")
+    parser.add_argument("--no-dmg", action="store_true", help=t("build_macos_standalone.helpNoDmg"))
+    parser.add_argument("--require-reporting", action="store_true", help=t("build_macos_standalone.helpRequireReporting"))
     args = parser.parse_args()
     destination = args.destination or ROOT / "dist" / "macos.noindex" / args.target_arch
     print(json.dumps(build(destination, dmg=not args.no_dmg, target_arch=args.target_arch,

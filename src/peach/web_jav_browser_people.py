@@ -11,6 +11,7 @@ from PIL import Image, ImageOps
 from . import entities
 from .jav_browser import code_key
 from .previews import PreviewUnavailable
+from .user_messages import UserValueError
 from .web_jav_detail import visible_actors
 
 
@@ -21,16 +22,16 @@ def _snapshots(contract, codes):
     path = contract.cover_root.parent / 'jav-discovery-metadata.json'
     try:
         if path.stat().st_size > 16 * 1024 * 1024:
-            raise ValueError('本地人物快照过大')
+            raise UserValueError("api.javBrowserPeople.snapshotTooLarge")
         payload = json.loads(path.read_text(encoding='utf-8'))
         if payload.get('version') != 1 or not isinstance(payload.get('records'), dict):
-            raise ValueError('本地人物快照格式无效')
+            raise UserValueError("api.javBrowserPeople.snapshotInvalid")
         records = payload['records']
         return {code: records.get(code, {}).get('movie', {}) for code in codes}
     except FileNotFoundError:
         return {}
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError('本地人物快照未取得') from error
+        raise UserValueError("api.javBrowserPeople.snapshotUnavailable") from error
 
 
 #: 用户脚本的人物头像是 24 CSS px 圆框，返回 64 px 图；取景沿用 `frontend/src/card-art/face-frame.ts`。
@@ -71,11 +72,26 @@ def _framed(original: Image.Image, focus: dict | None) -> Image.Image:
     return ImageOps.fit(image, (OUTPUT_PX, OUTPUT_PX), centering=tuple(centering))
 
 
+def entity_avatar(contract, preview, entity_id: int) -> str | None:
+    """已安装头像按人脸取景成小图 data URI；没装头像是空串，装了却读不出是 None。"""
+    if not contract.has_entity_image('performer', entity_id):
+        return ''
+    try:
+        path, _ = preview.entity_image('performer', entity_id)
+        with Image.open(path) as original:
+            image = _framed(original, contract.avatar_focus('performer', entity_id))
+        output = io.BytesIO()
+        image.save(output, format='JPEG', quality=75)
+        return 'data:image/jpeg;base64,' + base64.b64encode(output.getvalue()).decode('ascii')
+    except (PreviewUnavailable, OSError, ValueError):
+        return None
+
+
 def _page_names(performers) -> list[str]:
     """详情页出演者原文：去掉 ♀ 标记，男演员（♂）不参与；只在查询单个番号时使用。"""
     names = [str(name).strip() for name in performers or ()]
     if len(names) > 10 or any(not name or len(name) > 60 for name in names):
-        raise ValueError('出演者最多 10 位，每位不超过 60 个字符')
+        raise UserValueError("api.javBrowserPeople.performersLimit")
     return [name.replace('♀', '').strip() for name in names if '♂' not in name]
 
 
@@ -89,15 +105,9 @@ def _page_person(connection, name: str) -> dict:
     return {'id': None, 'name': base}
 
 
-def cached_people(contract, preview, value: str, performers=()) -> dict:
-    raw = value.split(',')
-    if not 1 <= len(raw) <= 50:
-        raise ValueError('每次最多查询 50 个番号')
-    codes = list(dict.fromkeys(code_key(code) for code in raw))
-    page_names = _page_names(performers)
-    if page_names and len(codes) != 1:
-        raise ValueError('出演者只能随单个番号查询')
-    items, avatars = {}, {}
+def local_people(contract, codes, page_names=()) -> dict[str, list[dict]]:
+    """每个番号本机认得的出演者：账本、发现资料快照，二者都空时才用详情页给的名字；不联网。"""
+    items = {}
     snapshots = _snapshots(contract, codes)
     with contract.database.read_connection() as connection:
         excluded = entities.male_performer_ids(connection)
@@ -118,27 +128,40 @@ def cached_people(contract, preview, value: str, performers=()) -> dict:
                 if key and key not in people:
                     found = entities.resolve_entity(connection, 'performer', name)
                     people[key] = {'id': found['id'] if found else None, 'name': name}
-            for name in page_names:
+            # 详情页的出演者名只给账本与发现资料都没有人物的作品兜底：素人作品入库后账本记的是资料站认出的
+            # 真名，页面仍写店铺艺名，两者对不上时不能把艺名算成第二个人。
+            for name in page_names if not people else ():
                 person = _page_person(connection, name)
                 key = entities.normalize_entity_name(person['name'])
                 if key and key not in people and person['id'] not in excluded:
                     people[key] = person
-            for person in people.values():
-                entity_id = person['id']
-                if entity_id is None or not contract.has_entity_image('performer', entity_id):
-                    continue
-                if entity_id not in avatars:
-                    try:
-                        path, _ = preview.entity_image('performer', entity_id)
-                        with Image.open(path) as original:
-                            image = _framed(original, contract.avatar_focus('performer', entity_id))
-                        output = io.BytesIO()
-                        image.save(output, format='JPEG', quality=75)
-                        avatars[entity_id] = 'data:image/jpeg;base64,' + base64.b64encode(output.getvalue()).decode('ascii')
-                    except (PreviewUnavailable, OSError, ValueError):
-                        avatars[entity_id] = ''
-                        person['avatar_unavailable'] = True
-                if avatars[entity_id]:
-                    person['avatar'] = avatars[entity_id]
             items[code] = list(people.values())
+    return items
+
+
+def local_names(contract, code: str) -> list[str]:
+    """浏览记录用的出演者名字：只读本机，不取头像。"""
+    return [person['name'] for person in local_people(contract, [code]).get(code, [])]
+
+
+def cached_people(contract, preview, value: str, performers=()) -> dict:
+    raw = value.split(',')
+    if not 1 <= len(raw) <= 50:
+        raise UserValueError("api.javBrowserPeople.codesLimit")
+    codes = list(dict.fromkeys(code_key(code) for code in raw))
+    page_names = _page_names(performers)
+    if page_names and len(codes) != 1:
+        raise UserValueError("api.javBrowserPeople.performersNeedSingleCode")
+    items, avatars = local_people(contract, codes, page_names), {}
+    for people in items.values():
+        for person in people:
+            entity_id = person['id']
+            if entity_id is None or not contract.has_entity_image('performer', entity_id):
+                continue
+            if entity_id not in avatars:
+                avatars[entity_id] = entity_avatar(contract, preview, entity_id)
+                if avatars[entity_id] is None:
+                    person['avatar_unavailable'] = True
+            if avatars[entity_id]:
+                person['avatar'] = avatars[entity_id]
     return {'ok': True, 'source': 'local-cache', 'items': items}

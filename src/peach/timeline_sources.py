@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -13,7 +14,7 @@ from xml.etree import ElementTree as ET
 import m3u8
 from PIL import Image
 
-from . import bif
+from . import bif, media_io
 
 MAX_INDEX_BYTES = 4 * 1024 * 1024
 MAX_FRAMES = 20000
@@ -48,30 +49,30 @@ def _text(path: Path) -> str:
     with path.open('rb') as stream:
         data = stream.read(MAX_INDEX_BYTES + 1)
     if len(data) > MAX_INDEX_BYTES:
-        raise ValueError('预览索引过大')
+        raise ValueError("preview index is too large")
     return data.decode('utf-8-sig')
 
 
 def _local(base: Path, name: str, root: Path) -> Path:
-    """只接受同一视频目录内的本地引用，解析符号链接后仍须留在目录内。"""
+    """只接受同一视频目录内的本地引用。越界按 `_real` 判：其他平台解析符号链接，Windows 按词法。"""
     url = urlsplit(name)
     if url.scheme or url.netloc or url.query or '\\' in name:
-        raise ValueError('预览图片引用无效')
+        raise ValueError("invalid preview image reference")
     relative = Path(unquote(url.path))
     if relative.is_absolute() or ':' in str(relative):
-        raise ValueError('预览图片引用无效')
-    path = (base / relative).resolve()
-    if not path.is_relative_to(root.resolve()):
-        raise ValueError('预览图片超出视频目录')
+        raise ValueError("invalid preview image reference")
+    path = _real(base / relative)
+    if not path.is_relative_to(_real(root)):
+        raise ValueError("preview image is outside the video directory")
     return path
 
 
 def _size(path: Path) -> tuple[int, int]:
     if path.suffix.lower() not in IMAGE_SUFFIXES or path.stat().st_size > MAX_IMAGE_BYTES:
-        raise ValueError('预览图片格式或大小无效')
+        raise ValueError("invalid preview image format or size")
     with Image.open(path) as image:
         if image.format not in ('JPEG', 'PNG', 'WEBP') or image.width * image.height > 40_000_000:
-            raise ValueError('预览图片像素过多')
+            raise ValueError("preview image has too many pixels")
         return image.size
 
 
@@ -99,10 +100,10 @@ def _timeline(source: str, frames: list[Frame], *, estimated: bool = False) -> T
 
 def _seconds(value: str) -> float:
     if not re.fullmatch(r'(?:\d+:)?\d{2}:\d{2}\.\d{3}', value):
-        raise ValueError('预览时刻无效')
+        raise ValueError("invalid preview timestamp")
     parts = value.split(':')
     if float(parts[-1]) >= 60 or int(parts[-2]) >= 60:
-        raise ValueError('预览时刻无效')
+        raise ValueError("invalid preview timestamp")
     return sum(float(part) * 60 ** index for index, part in enumerate(reversed(parts)))
 
 
@@ -143,47 +144,47 @@ def _grid(frames: list[Frame], path: Path, start: float, end: float,
           interval: float, columns: int, rows: int, width: int, height: int) -> None:
     values = (start, end, interval, columns, rows, width, height)
     if not all(math.isfinite(value) for value in values) or interval <= 0 or end <= start:
-        raise ValueError('预览网格无效')
+        raise ValueError("invalid preview grid")
     if min(columns, rows, width, height) <= 0 or columns * rows > MAX_FRAMES:
-        raise ValueError('预览网格无效')
+        raise ValueError("invalid preview grid")
     for slot in range(min(columns * rows, math.ceil((end - start) / interval - 1e-9))):
         point = start + slot * interval
         frames.append(Frame(point, min(end, point + interval), path,
                             ((slot % columns) * width, (slot // columns) * height, width, height)))
         if len(frames) > MAX_FRAMES:
-            raise ValueError('预览帧数过多')
+            raise ValueError("too many preview frames")
 
 
 def _dash_segments(template, ns: str, duration: float) -> list[tuple[int, int]]:
     scale = int(template.get('timescale', '1'))
     offset = int(template.get('presentationTimeOffset', '0'))
     if scale <= 0:
-        raise ValueError('DASH 时间尺度无效')
+        raise ValueError("invalid DASH timescale")
     timeline = template.find(ns + 'SegmentTimeline')
     if timeline is None:
         step = int(template.get('duration', '0'))
         if step <= 0:
-            raise ValueError('DASH 分段时长无效')
+            raise ValueError("invalid DASH segment duration")
         count = math.ceil((duration * scale + offset) / step)
         if not 0 < count <= MAX_FRAMES:
-            raise ValueError('DASH 预览帧数过多')
+            raise ValueError("too many DASH preview frames")
         return [(index * step, step) for index in range(count)]
     entries = list(timeline)
     segments, point = [], 0
     for number, entry in enumerate(entries):
         if entry.tag != ns + 'S':
-            raise ValueError('DASH 时间线无效')
+            raise ValueError("invalid DASH timeline")
         point = int(entry.get('t', str(point)))
         step = int(entry.get('d', '0'))
         repeat = int(entry.get('r', '0'))
         if point < 0 or step <= 0 or repeat < -1:
-            raise ValueError('DASH 时间线无效')
+            raise ValueError("invalid DASH timeline")
         if repeat == -1:
             next_point = (int(entries[number + 1].get('t')) if number + 1 < len(entries)
                           else duration * scale + offset)
             repeat = math.ceil((next_point - point) / step) - 1
         if repeat < 0 or len(segments) + repeat + 1 > MAX_FRAMES:
-            raise ValueError('DASH 预览帧数过多')
+            raise ValueError("too many DASH preview frames")
         for _ in range(repeat + 1):
             segments.append((point, step))
             point += step
@@ -238,7 +239,7 @@ def _dash_name(template: str, representation: str, number: int, time: int, bandw
         return str(value).zfill(int(match[2] or 0))
     name = re.sub(r'\$(RepresentationID|Number|Time|Bandwidth)(?:%0(\d{1,2})d)?\$', replace, template)
     if '$' in name:
-        raise ValueError('DASH 预览模板无效')
+        raise ValueError("invalid DASH preview template")
     return name
 
 
@@ -355,11 +356,11 @@ def read_jellyfin(directory: Path, duration: float) -> Timeline | None:
                    key=lambda item: int(item.stem))
     if not paths or [int(item.stem) for item in paths] != list(range(len(paths))):
         return None
-    if any(not path.resolve().is_relative_to(directory.parent.parent.resolve()) for path in paths):
+    if any(not _inside(path, directory.parent.parent) for path in paths):
         return None
     interval, count, estimated = 10.0, math.ceil(duration / 10), True
     metadata = directory / 'trickplay.json'
-    if metadata.is_file() and metadata.resolve().is_relative_to(directory.parent.parent.resolve()):
+    if metadata.is_file() and _inside(metadata, directory.parent.parent):
         data = json.loads(_text(metadata))
         interval = float(data['Interval']) / 1000
         count = int(data['ThumbnailCount'])
@@ -381,36 +382,78 @@ def read_jellyfin(directory: Path, duration: float) -> Timeline | None:
     return _timeline('jellyfin', frames, estimated=estimated)
 
 
-def discover(video: Path, duration: float) -> Timeline | None:
-    """按准确文件主名配对，不通过番号或同目录唯一性猜测视频版本。"""
-    root = video.parent.resolve()
-    candidates = []
-    for suffix, reader in (('.vtt', read_vtt), ('.m3u8', read_hls), ('.mpd', read_dash)):
-        for stem in (video.stem, video.name, video.stem + '.thumbnails', video.stem + '-thumbs', video.stem + '.storyboard'):
-            candidates.append((root / (stem + suffix), reader))
+def _real(path: Path) -> Path:
+    """越界判断用的绝对路径，口径同 `media.normalized_path`：Windows 只做 `abspath`。
+
+    PikPak、115 的盘符是网络重定向器映射的，`resolve()` 要逐级问最终路径，一次就是几秒。
+    """
+    return Path(os.path.abspath(path)) if os.name == 'nt' else path.resolve()
+
+
+def _inside(path: Path, root: Path) -> bool:
+    return _real(path).is_relative_to(_real(root))
+
+
+def _listed(entries: dict, root: Path, name: str, *, directory: bool = False) -> Path | None:
+    """目录清单里认一个名字（不分大小写）。清单里的普通条目本来就在目录里，不再 stat；
+    符号链接仍按真实路径核对不出目录。"""
+    entry = entries.get(name.casefold())
+    if entry is None:
+        return None
     try:
-        for path, reader in candidates:
-            if path.is_file() and path.resolve().is_relative_to(root):
+        if not (entry.is_dir() if directory else entry.is_file()):
+            return None
+        path = root / entry.name
+        if entry.is_symlink() and not path.resolve().is_relative_to(root.resolve()):
+            return None
+    except OSError:
+        return None
+    return path
+
+
+def discover(video: Path, duration: float) -> Timeline | None:
+    """按准确文件主名配对，不通过番号或同目录唯一性猜测视频版本。
+
+    绝大多数片子旁边什么都没有，所以先把视频目录列一次，候选名字从这份清单里认（`_listed`），
+    不对十几个候选逐个 stat。列目录交给带期限的读取子进程：挂死的挂载上读不出来就当没有。
+    """
+    root = _real(video.parent)
+    try:
+        entries = {entry.name.casefold(): entry for entry in media_io.directory_entries(root)}
+    except OSError:
+        return None
+
+    def present(name: str, *, directory: bool = False) -> Path | None:
+        return _listed(entries, root, name, directory=directory)
+
+    try:
+        for suffix, reader in (('.vtt', read_vtt), ('.m3u8', read_hls), ('.mpd', read_dash)):
+            for stem in (video.stem, video.name, video.stem + '.thumbnails', video.stem + '-thumbs', video.stem + '.storyboard'):
+                path = present(stem + suffix)
+                if path is None:
+                    continue
                 try:
                     found = reader(path, root)
                     if found:
                         return replace(found, root=root)
                 except (OSError, ValueError, OverflowError, KeyError, TypeError, ET.ParseError, Image.DecompressionBombError):
                     continue
-        for path in sorted(root.iterdir()):
-            if path.suffix.lower() != '.bif' or not path.name.startswith(video.stem):
+        for name in sorted(entry.name for entry in entries.values()):
+            if not name.lower().endswith('.bif') or not name.startswith(video.stem):
                 continue
-            tail = path.stem[len(video.stem):]
+            tail = Path(name).stem[len(video.stem):]
             if tail and not re.fullmatch(r'-(?:\d+-\d+|sd|hd|fhd)', tail):
                 continue
-            if path.resolve().is_relative_to(root):
-                found = read_bif(path.resolve(), duration)
+            path = present(name)
+            if path is not None:
+                found = read_bif(path, duration)
                 if found:
                     return replace(found, root=root)
-        directory = root / (video.stem + '.trickplay')
-        if directory.is_dir() and directory.resolve().is_relative_to(root):
-            for resolution in sorted(directory.iterdir()):
-                if resolution.is_dir() and resolution.resolve().is_relative_to(root):
+        directory = present(video.stem + '.trickplay', directory=True)
+        if directory is not None:
+            for entry in sorted(media_io.directory_entries(directory), key=lambda entry: entry.name):
+                resolution = directory / entry.name
+                if entry.is_dir() and _inside(resolution, root):
                     try:
                         found = read_jellyfin(resolution, duration)
                         if found:
@@ -428,7 +471,7 @@ def frame_bytes(timeline: Timeline, number: int) -> bytes | None:
         return None
     frame = timeline.frames[number]
     try:
-        if timeline.root is not None and not frame.path.resolve().is_relative_to(timeline.root):
+        if timeline.root is not None and not _inside(frame.path, timeline.root):
             return None
         if frame.bif_index is not None:
             return bif.read_frame(frame.bif_index, frame.bif_number)

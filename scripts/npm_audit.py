@@ -2,11 +2,24 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import time
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if not __package__:
+    sys.path.insert(0, str(PROJECT_ROOT))
+    __package__ = "scripts"
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from peach.interface_text import dev as t  # noqa: E402
+from . import npm_backports  # noqa: E402
 
 TRANSIENT = {"EAI_AGAIN", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND",
              "E429", "E500", "E502", "E503", "E504"}
@@ -34,17 +47,22 @@ def audit(project: Path, *, runner=subprocess.run, sleep=time.sleep) -> int:
             try:
                 payload = json.loads(result.stdout)
                 if not isinstance(payload, dict):
-                    raise ValueError("审计结果不是 JSON 对象")
+                    raise ValueError(t("npm_audit.notJsonObject"))
             except (ValueError, TypeError):
                 print(result.stdout or result.stderr)
                 return 1
             decision = classify(payload, result.returncode)
-            print(json.dumps({"attempt": attempt + 1, "project": str(project),
-                              "decision": decision, "audit": payload}, ensure_ascii=False), flush=True)
+            entry = {"attempt": attempt + 1, "project": str(project), "decision": decision, "audit": payload}
+            if decision == "vulnerable" and result.returncode == 1:
+                backports = npm_backports.verify(PROJECT_ROOT, project, payload, now=datetime.now(timezone.utc))
+                if backports:
+                    decision = entry["decision"] = "verified_backport"
+                    entry["backports"] = backports
+            print(json.dumps(entry, ensure_ascii=False), flush=True)
         except subprocess.TimeoutExpired:
             decision = "retry"
-            print(f"npm audit 第 {attempt + 1} 次超时", flush=True)
-        if decision == "clean":
+            print(t("npm_audit.timedOut", attempt=attempt + 1), flush=True)
+        if decision in {"clean", "verified_backport"}:
             return 0
         if decision != "retry" or attempt == 2:
             return 1
@@ -53,7 +71,7 @@ def audit(project: Path, *, runner=subprocess.run, sleep=time.sleep) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=t("npm_audit.description"))
     parser.add_argument("--prefix", type=Path, default=Path("."))
     return audit(parser.parse_args().prefix.resolve())
 

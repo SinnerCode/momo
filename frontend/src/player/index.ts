@@ -5,14 +5,20 @@ export type { PlayerHost, PlayerSettings } from './host';
 export { configurePlayer } from './host';
 export type { PlayerMenuHooks } from './menu';
 export { closePlayerMenu, configurePlayerMenu } from './menu';
-export { applyAmbientMode, applyTheaterMode, clickPlayerControl } from './controls';
+export { applyAmbientMode, applyTheaterMode, clickPlayerControl, PLAYER_SPINNER_HTML } from './controls';
 export type { DetailPlayerOptions, MountPlayerOptions, PlayerMedia, PlayerResume } from './detail-player';
 export {
   attachPlayerChrome, mountDetailPlayer, mountPlayer, preparePlayerFrame, stopPlayerPanels,
 } from './detail-player';
 export { disposePlayer } from './dispose';
+export { lockLandscape } from './fullscreen';
+export { gestureSettings } from './gesture-settings';
+export type { Panels } from './subtitles';
+export { SubtitleControls, subtitleIcon, subtitlePanels } from './subtitles';
 export type { ImmersePlayerOptions } from './immerse-player';
 export { seekVideoBy, toggleVideoPlayback } from './playback';
+export type { SeekPreview } from './seek-preview';
+export { createSeekPreview } from './seek-preview';
 export { detailPlayer, resizeSoon, setDetailPlayer } from './registry';
 export { fmtSpeed, streamSpeedBits } from './stats';
 export {

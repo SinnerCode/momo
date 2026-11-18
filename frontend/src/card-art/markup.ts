@@ -10,6 +10,7 @@ import { entityDisplayName } from '../core/entity-names';
 import { javImageKind } from '../jav-artwork';
 import { imageFallbackAttrs } from './image-fallback';
 import { representativeOf } from './representatives';
+import { t } from '../i18n';
 
 /** 人脸取景：`axis`／`pct` 是挪的那一半，`box` 是放大的那一半（`/api/entity` 的 `avatar_focus`）。 */
 export interface FaceFocus {
@@ -31,7 +32,7 @@ export interface FaceRef {
 }
 
 /** 代表作画面替账号顶着圆框时，悬停与读屏读到的那句。 */
-export const STAND_IN_TITLE = '代表作画面，非本人';
+export const STAND_IN_TITLE = t('catalog:cardIdentity.standInAvatar');
 
 /* 原地替换的图（实体图、封面、标识）地址都带服务端下发的内容版本（文件修改时间）：换头像、
    补高清封面、换标识都覆盖同一个文件，地址不跟着变的话，同一页里浏览器直接复用内存里那张
@@ -59,6 +60,10 @@ export const CARD_COVER_SMALL_DPR = 1.5;
 export const cardCoverUrl = (item: { code?: string | null; cover_key?: string; cover_version?: string }): string =>
   coverUrl(item, (window.devicePixelRatio || 1) <= CARD_COVER_SMALL_DPR ? 2 : 1);
 
+/** 装好的 DMM 竖版正封（`/cover?front=1`），派生档与版本同封面。取景提示带 `front` 时才有。 */
+export const cardFrontUrl = (item: { code?: string | null; cover_key?: string; cover_version?: string }): string =>
+  cardCoverUrl(item).replace('/cover?', '/cover?front=1&');
+
 /** 库外作品的官方封面：`/cover-image` 按番号在服务端查地址，经 Peach 的出网设置取图，浏览器不直连图床。 */
 export const remoteCoverUrl = (item: { code?: string | null }): string =>
   `/cover-image?code=${encodeURIComponent(item.code || '')}`;
@@ -73,7 +78,7 @@ const focusOf = (value: unknown): FaceFocus | null =>
 /** 「女优」只用于番号发行物。素人、创作者自制和网红内容里的出镜者是艺人，套上 JAV 的行业
  *  称谓既不准确也会和创作者身份混淆。判据由后端 `is_jav` 给。 */
 export function performerLabel(item: { is_jav?: boolean } | null | undefined): string {
-  return item && item.is_jav ? '女优' : '艺人';
+  return item && item.is_jav ? t('catalog:shared.actresses') : t('catalog:shared.performers');
 }
 
 /* 实体那张脸：规范实体图优先，取不到退到代表作头像，两样都取不到就一个 `<img>`
@@ -161,7 +166,8 @@ export function avatarInner(name: string, ref: FaceRef | null | undefined, repId
   // 这一层大多是小圆框和窄格子，厂牌标识在那里要方形图标而不是横着的字标；索引页的
   // 厂牌大格是同一个模板里的例外，由调用方点名要 `large`。
   const hint = focus === undefined ? (ref && ref.avatar_focus) || null : focus;
-  const sourceFace = !ref?.has_image && !logoName && ref?.source_avatar_url
+  const localPortrait = (ref?.has_avatar && ref.rep) || repId;
+  const sourceFace = !ref?.has_image && !localPortrait && !logoName && ref?.source_avatar_url
     ? `<img src="${esc(ref.source_avatar_url)}" width="128" height="128" alt="" loading="lazy" decoding="async" ${
       imageFallbackAttrs({ fallbacks: ref.source_avatar_fallbacks || [] })}>` : '';
   return `<span class="ini">${esc(firstGrapheme(entityDisplayName(kind, name, ref?.id)))}</span>`
@@ -225,7 +231,7 @@ export interface CoverItem {
   cover_version?: string;
   has_thumb?: boolean;
   has_local_poster?: boolean;
-  cover_frame?: { cx?: number | null; cy?: number | null; layout?: string } | null;
+  cover_frame?: { cx?: number | null; cy?: number | null; layout?: string; front?: boolean } | null;
   poster_box?: { x0?: number; y0?: number; x1?: number; y1?: number; px?: number[]; method?: string } | null;
   [field: string]: unknown;
 }
@@ -234,7 +240,12 @@ export interface CoverItem {
    要推多远，只有同时拿到图片和容器的比例才知道。人物在画面里的位置差别很大，写死的锚点会
    把一部分作品裁掉下巴或整个切出画外；取不到人脸就退回固定取景。 */
 export function coverImage(item: CoverItem, layout: 'big' | 'small', eager = false): string {
-  const src = cardCoverUrl(item);
+  /* 装了 DMM 竖版正封的，大图位直接用它，小图位仍看整张横图；两张地址都挂在元素上，
+     大图／小图原地切换时换图不换元素（`relayoutJavImages`）。 */
+  const front = item.cover_frame?.front && item.poster_box?.method !== 'manual' ? cardFrontUrl(item) : '';
+  const whole = cardCoverUrl(item);
+  const src = front && layout === 'big' ? front : whole;
+  const pair = front ? ` data-cover-front="${esc(front)}" data-cover-whole="${esc(whole)}"` : '';
   const wide = /ブルーレイ|blu[\s-]?ray/i.test(String(item.title || item.display_title || item.name || ''));
   const f = item.cover_frame || {};
   const still = item.poster_box?.method !== 'manual' && (f.layout === 'still'
@@ -249,7 +260,7 @@ export function coverImage(item: CoverItem, layout: 'big' | 'small', eager = fal
   const box = pb ? ` data-posterbox="${[pb.x0, (pb.px || [])[0], (pb.px || [])[1], pb.y0, pb.x1, pb.y1].map(Number).join(' ')}"` : '';
   // 小图看整张（含剧照拼贴），大图只取右侧正封。
   return `<img class="poster cover ${layout === 'small' ? 'whole' : 'front'}" src="${src}"
-    width="640" height="360" alt="" loading="${eager ? 'eager' : 'lazy'}" decoding="async" data-cover-code="${esc(item.code || '')}"${wide ? ' data-wide-sleeve="1"' : ''}${still ? ' data-cover-layout="still"' : ''}${face}${box} data-drop="self">`;
+    width="640" height="360" alt="" loading="${eager ? 'eager' : 'lazy'}" decoding="async" data-cover-code="${esc(item.code || '')}"${wide ? ' data-wide-sleeve="1"' : ''}${still ? ' data-cover-layout="still"' : ''}${face}${box}${pair} data-drop="self">`;
 }
 
 /** 封面格的两种图：官方封套（取景链接管）或预览图。空串是这一条没有可用的图。 */
@@ -312,7 +323,7 @@ export function frameArtwork(item: CoverItem, eager: boolean): Artwork {
 
 /** 播放队列一行的小图：Mix 画面按小图取，没有可用的图就写「无预览」占住那一格。 */
 export function queueThumbHtml(item: CoverItem, javImage: unknown): string {
-  return mixFace(item, 'small', false, javImage).html || '<span class="nopic">无预览</span>';
+  return mixFace(item, 'small', false, javImage).html || `<span class="nopic">${t('catalog:catalogList.noPreview')}</span>`;
 }
 
 /* 详情开场给播放器的海报位：video.js 的脚本还在下载、流源还没接上时，画面先给本地
@@ -358,7 +369,7 @@ export function cardIdentity(item: IdentityItem): {
   const primaryCreator = item.is_jav && performer ? '' : item.creator || '';
   const kind = primaryCreator ? 'creator' : performer ? 'performer' : '';
   return {
-    kind, name: primaryCreator || performer || '未归属',
+    kind, name: primaryCreator || performer || t('catalog:shared.uncredited'),
     coStarred: performers.length > 1 && !primaryCreator, performers, refs,
     total: item.performer_total || performers.length,
   };
@@ -387,5 +398,5 @@ export function mixLabel(item: IdentityItem, tagLabel: (tag: string) => string):
   if (item.is_jav && performer) return entityDisplayName('performer', performer);
   if (item.creator) return entityDisplayName('creator', item.creator);
   return (performer ? entityDisplayName('performer', performer) : '') || item.studio || item.code
-    || tagLabel((item.tags || [])[0] || '') || '为你推荐';
+    || tagLabel((item.tags || [])[0] || '') || t('catalog:shared.recommendedForYou');
 }

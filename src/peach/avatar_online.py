@@ -1,12 +1,17 @@
 """创作者头像候选：已绑定来源的社媒头像、作品封面与正文图片。"""
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from . import interface_text
 from .avatar_picker import Choice, MAX_ASSET_CHOICES, MAX_IMAGE_BYTES, PickerError, prepare_image
+from .avatar_provider import AvatarCandidateCache
 from .follow_avatar import profile_identities
 from .follow_identity import official_avatar_url
 from .follow_store import FollowItemRow, FollowStore
@@ -22,12 +27,43 @@ class MediaChoices:
 MediaProjection = Callable[[FollowItemRow], MediaChoices]
 
 
+def cached_profile_avatar(providers_root: Path, entity_id: int, params: dict) -> tuple[bytes, dict] | None:
+    """仅复用当前实体、同一 X 账号且原图哈希一致的采集证据。"""
+    if params.get("service") != "profile":
+        return None
+    accounts = {f"x:{handle}".casefold()
+                for service, handle in profile_identities(str(params.get("id") or ""))
+                if service == "twitter"}
+    if not accounts:
+        return None
+    # 采集器写 social；picker.keep 写 social-web，后者的时间是保存时间而非抓取时间。
+    for path in sorted((providers_root / "social" / "evidence").glob(f"performer-{int(entity_id)}-*.json"),
+                       key=lambda path: path.stat().st_mtime_ns, reverse=True):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (record.get("entity_id") != entity_id or record.get("provider") != "social-web"
+                or record.get("source_kind") != "official_profile"
+                or str(record.get("external_id") or "").casefold() not in accounts):
+            continue
+        url = str(record.get("upstream_url") or "")
+        parsed = urlsplit(url)
+        if (parsed.scheme != "https" or parsed.hostname != "pbs.twimg.com"
+                or not parsed.path.startswith("/profile_images/")):
+            continue
+        body = AvatarCandidateCache(path.parent.parent).lookup(url)
+        if body and hashlib.sha256(body).hexdigest() == record.get("sha256"):
+            return body, record
+    return None
+
+
 def _profile(url: str) -> dict:
     parsed = urlsplit(url)
     host = (parsed.hostname or "").removeprefix("www.")
     path = parsed.path.strip("/").split("/")
     service = {"x.com": "twitter", "twitter.com": "twitter", "patreon.com": "patreon",
-               "pixiv.net": "pixiv"}.get(host)
+               "pixiv.net": "pixiv", "lit.link": "litlink"}.get(host)
     handle = path[-1] if service == "pixiv" and path[0] == "users" else path[0]
     identity = f"{service}:{handle}"
     if service and profile_identities(identity):
@@ -37,7 +73,8 @@ def _profile(url: str) -> dict:
     return {}
 
 
-def choices(connection: sqlite3.Connection, entity_id: int, *, project: MediaProjection) -> list[Choice]:
+def choices(connection: sqlite3.Connection, entity_id: int, *, project: MediaProjection,
+            providers_root: Path | None = None) -> list[Choice]:
     """列举只读本地元数据；图片仅在候选可见或用户进入框选时取。"""
     store = FollowStore(lambda: connection)
     result: list[Choice] = []
@@ -45,9 +82,19 @@ def choices(connection: sqlite3.Connection, entity_id: int, *, project: MediaPro
     for link_id, url, label in connection.execute(
             "SELECT id,url,label FROM entity_link WHERE entity_id=? AND link_kind IN ('social','official')",
             (entity_id,)):
-        if _profile(url):
-            result.append(Choice(ref=f"follow-link:{link_id}", source="social",
-                                 label=f"{label or urlsplit(url).hostname} · 社媒头像"))
+        profile = _profile(url)
+        if profile:
+            cached = cached_profile_avatar(providers_root, entity_id, profile) if providers_root else None
+            detail_code, detail_params = "", ()
+            if cached is not None:
+                date = str(cached[1].get("cached_at") or "")[:10]
+                detail_code = "labels.avatarOnline.cachedOn" if date else "labels.avatarOnline.cached"
+                detail_params = (("date", date),) if date else ()
+            ref = f"sha256:{cached[1]['sha256']}" if cached else f"follow-link:{link_id}"
+            result.append(Choice(ref=ref, source="social", label=label or urlsplit(url).hostname,
+                                 detail=interface_text.text(f"server:{detail_code}", dict(detail_params))
+                                 if detail_code else "",
+                                 detail_code=detail_code, detail_params=detail_params))
     for source in store.sources():
         if source["entity_id"] != entity_id:
             continue
@@ -55,7 +102,7 @@ def choices(connection: sqlite3.Connection, entity_id: int, *, project: MediaPro
         if avatar and avatar not in seen:
             seen.add(avatar)
             result.append(Choice(ref=f"follow-avatar:{source['id']}", source="social",
-                                 label=f"{source['label']} · 社媒头像"))
+                                 label=source["label"]))
     item_ids = connection.execute(
         "SELECT i.id FROM follow_item i JOIN follow_source s ON s.id=i.source_id"
         " WHERE s.entity_id=? ORDER BY coalesce(i.published_at,i.first_seen_at) DESC,i.id DESC LIMIT ?",
@@ -82,7 +129,7 @@ def resolve(ref: str, connection: sqlite3.Connection, entity_id: int, *, project
     listed = choices(connection, entity_id, project=project)
     allowed = {base for choice in listed for base in (choice.bases or (choice.ref,))}
     if ref not in allowed:
-        raise PickerError("这张备选图片不属于当前创作者")
+        raise PickerError("errors.avatarOnline.notThisCreator")
     if ref.startswith("follow-link:"):
         row = connection.execute("SELECT url FROM entity_link WHERE id=? AND entity_id=?",
                                  (int(ref.split(":")[1]), entity_id)).fetchone()
@@ -103,7 +150,9 @@ def resolve(ref: str, connection: sqlite3.Connection, entity_id: int, *, project
             index = int(base[5:]) if base[5:] else None
             body = media(item, index)
         provider = "follow-content"
-    if not body or len(body) > MAX_IMAGE_BYTES:
-        raise PickerError("这张图未取得或太大了")
+    if not body:
+        raise PickerError("errors.avatarOnline.imageNotFound")
+    if len(body) > MAX_IMAGE_BYTES:
+        raise PickerError("errors.avatarOnline.imageOverLimit")
     body = prepare_image(body)
     return body, {"source": "avatar picker", "provider": provider, "external_id": ref}

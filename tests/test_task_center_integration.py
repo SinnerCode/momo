@@ -14,9 +14,9 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from peach import web_contract, web_tasks
+from peach import interface_text, web_contract, web_tasks
 from peach.jobs import BackgroundJob, TaskRunConflict
-from peach.routes_api import api_get, api_post, task_run_detail
+from peach.routes_api import api_get, api_post, task_run_detail, task_run_control
 from peach.repository import LedgerDatabase
 from peach.task_runs import TaskRunStore
 from support.ledger import fresh_ledger
@@ -121,15 +121,25 @@ class BackgroundJobTaskRunTests(unittest.TestCase):
                 {'source': 17, 'label': '示例作者', 'provider_label': '示例站点',
                  'ok': False, 'error': 'HTTP 403', 'url': 'private'},
                 {'source': 18, 'label': '另一来源', 'ok': True, 'backfill_error': '连接超时'},
+                {'source': 19, 'label': '订阅源', 'ok': False, 'error': '冷却中；还有 2 个顺延',
+                 'error_code': 'labels.webFeeds.cooling', 'error_params': {},
+                 'deferred_note_code': 'labels.webFeeds.deferredRest', 'deferred_note_params': {'count': 2}},
             ],
         })
         job.thread.join(5)
         summary = self.store.query(task_key='follow-check')[0].result_summary
-        self.assertEqual(summary['source_failed'], 1)
+        self.assertEqual(summary['source_failed'], 2)
         self.assertEqual(summary['source_warning'], 1)
+        check, backfill = 'labels.taskResults.kind.check', 'labels.taskResults.kind.backfill'
         self.assertEqual(summary['issues'], [
-            {'source': 17, 'label': '示例作者', 'provider': '示例站点', 'kind': '检查失败', 'error': 'HTTP 403'},
-            {'source': 18, 'label': '另一来源', 'provider': '', 'kind': '补查失败', 'error': '连接超时'},
+            {'source': 17, 'label': '示例作者', 'provider': '示例站点', 'kind': '检查失败', 'kind_code': check,
+             'error': 'HTTP 403'},
+            {'source': 18, 'label': '另一来源', 'provider': '', 'kind': '补查失败', 'kind_code': backfill,
+             'error': '连接超时'},
+            {'source': 19, 'label': '订阅源', 'provider': '', 'kind': '检查失败', 'kind_code': check,
+             'error': '冷却中；还有 2 个顺延',
+             'error_parts': [{'code': 'labels.webFeeds.cooling', 'params': {}}, {'code': 'outcome.semicolon'},
+                             {'code': 'labels.webFeeds.deferredRest', 'params': {'count': 2}}]},
         ])
         self.assertNotIn('private', json.dumps(summary))
 
@@ -163,13 +173,13 @@ class BackgroundJobTaskRunTests(unittest.TestCase):
         job = self.job()
 
         def work(_job_id):
-            raise RuntimeError("上游挡回来了")
+            raise RuntimeError("upstream refused the request")
 
         job.start(work)
         job.thread.join(5)
         run = self.store.query()[0]
         self.assertEqual(run.status, "failed")
-        self.assertIn("上游挡回来了", run.error)
+        self.assertIn("upstream refused the request", run.error)
 
     def test_manual_restart_over_a_foreign_run_is_a_conflict(self):
         """表里那一轮不是这个进程开的，本类自己的锁看不见它，只有互斥键看得见。"""
@@ -349,6 +359,119 @@ class TasksEndpointTests(unittest.TestCase):
         (self.contract.candidate_root / 'sample.csv').write_text('item_key\nasset:1:title\n', encoding='utf-8')
         self.assertNotEqual(web_tasks.q_tasks(self.contract, {})['result_versions']['review'], committed['review'])
 
+    def test_the_page_wide_poll_carries_versions_and_notices_without_the_task_list(self):
+        """每个页面常驻的那份轮询只带结果版本、入库通知、忙不忙与在跑任务，和任务中心那份版本一致。"""
+        from pathlib import Path
+        self.contract.candidate_root = Path(self.tmp.name) / 'candidates'
+        self.contract.candidate_root.mkdir()
+        idle = web_tasks.q_result_updates(self.contract, {})
+        self.assertEqual(set(idle), {'ok', 'result_versions', 'ingest_notices', 'busy', 'running_tasks'})
+        self.assertFalse(idle['busy'])
+        self.assertEqual(idle['running_tasks'], [])
+        self.assertEqual(idle['result_versions'], web_tasks.q_tasks(self.contract, {})['result_versions'])
+        run = self.store.start('library-processing', trigger='manual')
+        busy = web_tasks.q_result_updates(self.contract, {})
+        self.assertTrue(busy['busy'])
+        self.assertEqual(busy['running_tasks'],
+                         [{'task_key': 'library-processing', 'run_id': run.id, 'status': 'running'}])
+        self.store.finish(run.id, 'succeeded')
+        settled = web_tasks.q_result_updates(self.contract, {})
+        self.assertFalse(settled['busy'])
+        self.assertEqual(settled['running_tasks'], [])
+
+    def test_running_tasks_list_each_kind_once_and_prefer_the_running_round(self):
+        """在排在跑的任务按种类各报一项：在跑的那轮压过排队的，多条后继也只占一项。"""
+        parent = self.store.start('library-processing', trigger='manual')
+        self.store.enqueue_followups(parent.id, [(f'leaf:{index}', 'leaf', '还在排的后继') for index in range(3)])
+        check = self.store.start('follow-check', trigger='scheduled')
+        listed = web_tasks.q_result_updates(self.contract, {})['running_tasks']
+        self.assertEqual([entry['task_key'] for entry in listed], ['follow-check', 'leaf', 'library-processing'])
+        by_key = {entry['task_key']: entry for entry in listed}
+        self.assertEqual(by_key['follow-check'], {'task_key': 'follow-check', 'run_id': check.id, 'status': 'running'})
+        self.assertEqual(by_key['leaf']['status'], 'pending')
+        self.store.finish(check.id, 'succeeded')
+        self.assertNotIn('follow-check', [entry['task_key'] for entry in
+                                          web_tasks.q_result_updates(self.contract, {})['running_tasks']])
+
+    def _insert_asset(self, name, *, background):
+        from peach.repository import in_background
+
+        def write():
+            with self.contract.write_transaction() as connection:
+                connection.execute("INSERT INTO asset(path,name,location,medium) VALUES(?,?,'local','video')",
+                                   (f'A:/{name}', name))
+        worker = threading.Thread(target=in_background(write) if background else write)
+        worker.start()
+        worker.join(5)
+
+    def test_background_writes_change_the_page_wide_versions_at_most_every_interval(self):
+        """批处理每几秒提交一次；页面两秒轮询一次，版本一变就整组重取，有任务在跑时要按住。"""
+        now = [1000.0]
+        run = self.store.start('library-processing', trigger='manual')
+        with unittest.mock.patch('peach.web_tasks.time.monotonic', lambda: now[0]):
+            first = web_tasks.q_result_updates(self.contract, {})['result_versions']
+            self._insert_asset('one.mp4', background=True)
+            now[0] += 2
+            self.assertEqual(web_tasks.q_result_updates(self.contract, {})['result_versions'], first)
+            now[0] += web_tasks.RESULT_UPDATE_INTERVAL
+            held = web_tasks.q_result_updates(self.contract, {})['result_versions']
+            self.assertNotEqual(held['catalog'], first['catalog'])
+            # 用户自己点的写入立即放出。
+            self._insert_asset('two.mp4', background=False)
+            now[0] += 2
+            mine = web_tasks.q_result_updates(self.contract, {})['result_versions']
+            self.assertNotEqual(mine['catalog'], held['catalog'])
+            # 空闲时不节流。
+            self.store.finish(run.id, 'succeeded')
+            self._insert_asset('three.mp4', background=True)
+            now[0] += 2
+            self.assertNotEqual(web_tasks.q_result_updates(self.contract, {})['result_versions']['catalog'],
+                                mine['catalog'])
+
+    def test_a_refresh_landing_only_moves_the_keys_whose_tables_it_read(self):
+        """写回一份只读关注表的结果，不让馆藏那一组页面也跟着重取。"""
+        before = web_tasks.q_result_updates(self.contract, {})['result_versions']
+        with self.contract.cache_lock:
+            self.contract.cache_landed['follow_item'] = 1
+        after = web_tasks.q_result_updates(self.contract, {})['result_versions']
+        self.assertNotEqual(after['follow'], before['follow'])
+        self.assertEqual(after['catalog'], before['catalog'])
+        self.assertEqual(after['discoveries'], before['discoveries'])
+
+    def test_finished_runs_are_listed_without_a_query_per_row(self):
+        """最近完成那一页两百来条大多早已结束：控制状态与资源占用只问还有活动的那几条，连接数不随页长增长。"""
+        from unittest import mock
+        for _ in range(30):
+            self.store.finish(self.store.start('library-processing', trigger='manual').id, 'succeeded')
+        parent = self.store.start('parent', trigger='manual')
+        self.store.enqueue_followups(parent.id, [('leaf:1', 'leaf', '还在排的后继')])
+        self.store.finish(parent.id, 'succeeded')
+        original = self.store.database.read_connection
+        opened = []
+
+        def counted():
+            opened.append(1)
+            return original()
+
+        with mock.patch.object(self.store.database, 'read_connection', side_effect=counted):
+            payload = web_tasks.q_tasks(self.contract, {'limit': '100'})
+        controlled = [row['id'] for row in (*payload['finished'], *payload['working_parents']) if 'control' in row]
+        self.assertEqual(controlled, [parent.id])
+        self.assertLess(len(opened), 20, f'连接数：{len(opened)}')
+
+    def test_ingest_notices_ride_along_with_the_task_list(self):
+        from unittest import mock
+
+        from peach.ingest_notices import IngestNotices
+        notices = IngestNotices()
+        notices.add('download', 7, 'SSIS-057')
+        notices.add('discovered', 0, '无效编号不记')
+        with mock.patch.object(web_tasks, 'NOTICES', notices):
+            payload = web_tasks.q_tasks(self.contract, {})['ingest_notices']
+        self.assertEqual(payload['epoch'], notices.epoch)
+        self.assertEqual([(item['id'], item['kind'], item['asset_id'], item['label']) for item in payload['items']],
+                         [(1, 'download', 7, 'SSIS-057')])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -414,6 +537,19 @@ class TasksEndpointTests(unittest.TestCase):
             seen += [row["id"] for row in page["finished"]]
         self.assertEqual(seen, [slow.id, late, *reversed(early)])
 
+    def test_recent_page_numbers_support_totals_and_clamp_to_the_last_page(self):
+        ids = [self._settled(f"2026-09-11T10:0{minute}:00.000Z") for minute in range(5)]
+        page = web_tasks.q_tasks(self.contract, {"limit": "2", "page": "2"})
+        self.assertEqual([row['id'] for row in page['finished']], [ids[2], ids[1]])
+        self.assertEqual(page['finished_total'], 5)
+        self.assertEqual(page['finished_page'], 2)
+        last = web_tasks.q_tasks(self.contract, {"limit": "2", "page": "99"})
+        self.assertEqual([row['id'] for row in last['finished']], [ids[0]])
+        self.assertEqual(last['finished_page'], 3)
+        for value in ('0', '-1', 'invalid'):
+            with self.assertRaises(ValueError):
+                web_tasks.q_tasks(self.contract, {'page': value})
+
     def test_a_page_counts_top_level_runs_and_brings_their_followups_along(self):
         """一轮派出二十条后继时，按行数翻页会让后继把派出它们的那一轮挤出第一页。"""
         parent = self.store.start("feed-check", trigger="manual")
@@ -436,6 +572,19 @@ class TasksEndpointTests(unittest.TestCase):
         payload = web_tasks.q_tasks(self.contract, {})
         self.assertEqual([row["id"] for row in payload["running"]], [parent.id])
         self.assertEqual([row["id"] for row in payload["finished"]], queued)
+
+    def test_a_running_parent_sends_only_its_latest_settled_followups_with_the_full_count(self):
+        """任务中心两秒取一次；一轮派出上千条后继时只下发最近那几条，总数看计数。"""
+        parent = self.store.start("follow-check", trigger="manual")
+        queued = self.store.enqueue_followups(
+            parent.id, [(f"entity-avatar:performer:{n}", "entity-avatar", f"补头像 {n}")
+                        for n in range(5)])["queued"]
+        for run_id in queued:
+            self.store.finish(run_id, "succeeded")
+        with unittest.mock.patch("peach.task_runs.SETTLED_FOLLOWUP_LIMIT", 2):
+            payload = web_tasks.q_tasks(self.contract, {})
+        self.assertEqual([row["id"] for row in payload["finished"]], queued[-2:])
+        self.assertEqual(payload["followup_counts"][str(parent.id)], {"succeeded": 5})
 
     def test_a_dispatch_with_dozens_of_followups_stays_one_working_parent_with_counts(self):
         """自动修复每批派几十条；接口只下发最近几条排队的，但在跑的、父任务与总数都不能丢。"""
@@ -502,7 +651,7 @@ class TasksEndpointTests(unittest.TestCase):
         """迁移是单独一步，升级后第一次打开活动页撞上这张表不存在是正常路径。"""
         bare = Path(self.tmp.name) / "bare.db"
         sqlite3.connect(bare).close()
-        contract = types.SimpleNamespace(task_runs=TaskRunStore(LedgerDatabase(bare)))
+        contract = web_contract.WebContract(bare)
         payload = web_tasks.q_tasks(contract, {})
         self.assertFalse(payload["available"])
         self.assertEqual(payload["running"], [])
@@ -560,8 +709,51 @@ class ConflictStatusTests(unittest.TestCase):
     def test_the_detail_route_answers_by_id_and_404s_for_the_rest(self):
         run = self.contract.task_runs.start("batch", trigger="manual")
         self.assertEqual(task_run_detail(self.request, run.id, {})["run"]["id"], run.id)
-        self.assertEqual(
-            task_run_detail(self.request, run.id + 1000, {}).status_code, 404)
+        missing = task_run_detail(self.request, run.id + 1000, {})
+        self.assertEqual(missing.status_code, 404)
+        body = json.loads(missing.body)
+        self.assertEqual((body["error"], body["message_code"], body["message_params"]),
+                         (f"没有第 {run.id + 1000} 轮任务", "errors.webTasks.runMissing", {"run_id": run.id + 1000}))
+        self.assertEqual(interface_text.text(f"server:{body['message_code']}", body["message_params"], language="en"),
+                         f"Task run {run.id + 1000} does not exist")
+
+    def test_control_endpoint_exposes_pending_pause_and_resumes_the_same_row(self):
+        parent = self.contract.task_runs.start('parent', trigger='manual')
+        child = self.contract.task_runs.enqueue_followups(parent.id, [('leaf:1', 'leaf', '子任务')])['queued'][0]
+        self.contract.task_runs.finish(parent.id, 'succeeded')
+        with unittest.mock.patch.object(self.contract.followups, 'wake') as wake:
+            paused = task_run_control(self.request, child, {'action': 'pause'}, {})
+            self.assertEqual(paused['run']['control'], {'state': 'paused',
+                             'actions': ['resume', 'cancel', 'set_speed'], 'speed_mode': 'standard'})
+            continued = task_run_control(self.request, child, {'action': 'resume'}, {})
+            self.assertEqual(continued['run']['id'], child)
+            self.assertEqual(continued['run']['control']['state'], 'running')
+            self.assertEqual(wake.call_count, 2)
+
+    def test_task_speed_endpoint_changes_only_the_selected_run(self):
+        from peach.web_settings import q_settings
+        run = self.contract.task_runs.start('scan', trigger='manual')
+        other = self.contract.task_runs.start('probe', trigger='manual')
+        with unittest.mock.patch.object(self.contract.followups, 'wake'):
+            response = task_run_control(self.request, run.id,
+                                        {'action': 'set_speed', 'speed_mode': 'low'}, {})
+        self.assertEqual(response['run']['control']['speed_mode'], 'low')
+        self.assertEqual(task_run_detail(self.request, other.id, {})['run']['control']['speed_mode'], 'standard')
+        self.assertEqual(q_settings(self.contract)['taskSpeedMode'], 'standard')
+        invalid = task_run_control(self.request, run.id, {'action': 'set_speed', 'speed_mode': 'fast'}, {})
+        self.assertEqual(invalid.status_code, 409)
+
+    def test_control_endpoint_rejects_unknown_finished_foreign_and_read_only_runs(self):
+        run = self.contract.task_runs.start('control-test', trigger='manual')
+        self.assertEqual(task_run_control(self.request, run.id + 1000, {'action': 'pause'}, {}).status_code, 404)
+        self.assertEqual(task_run_control(self.request, run.id, {'action': 'delete'}, {}).status_code, 409)
+        self.contract.task_runs.enabled = False
+        self.assertEqual(task_run_control(self.request, run.id, {'action': 'pause'}, {}).status_code, 403)
+        self.contract.task_runs.enabled = True
+        foreign = TaskRunStore(self.db, host='other-host').start('elsewhere', trigger='manual')
+        self.assertEqual(task_run_control(self.request, foreign.id, {'action': 'cancel'}, {}).status_code, 403)
+        self.contract.task_runs.finish(run.id, 'succeeded')
+        self.assertEqual(task_run_control(self.request, run.id, {'action': 'pause'}, {}).status_code, 409)
 
 
 if __name__ == "__main__":

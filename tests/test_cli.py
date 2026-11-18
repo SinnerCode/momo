@@ -18,7 +18,8 @@ from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 from peach import cli, onboarding, settings_file
-from peach.migrations import plan, upgrade
+from peach.migrations import plan
+from support.ledger import fresh_ledger
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "migrations"
@@ -58,17 +59,16 @@ class StatusCommandTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.db = self.root / "ledger.db"
+        self.db = fresh_ledger(self.root)
         self.shared = self.root / "shared" / "ledger.db"
         self.state = self.root / "state"
-        upgrade(self.db, MIGRATIONS)
         connection = sqlite3.connect(self.db)
         connection.executemany(
             "INSERT INTO asset(location,path,name,medium,size,duration,snapshot_path,"
             "creator,ctx_length) VALUES(?,?,?,?,?,?,?,?,?)",
             [
                 ("local", r"R:\media\a.mp4", "a.mp4", "video", 2 << 30, 1800.0,
-                 r"R:\snap\a.jpg", "Someone", "中"),
+                 r"R:\snap\a.jpg", "Someone", "medium"),
                 ("local", r"R:\media\b.mp4", "b.mp4", "video", 1 << 30, None, None,
                  None, None),
                 ("online", "https://example.test/x", "x", "account", None, None, None,
@@ -92,6 +92,8 @@ class StatusCommandTests(unittest.TestCase):
         # 在线资产不进「加工进度」的分母，否则百分比永远到不了 100。
         self.assertIn("有时长 (ffprobe)", output)
         self.assertIn("1 / 2", output)
+        # 情境层取值存的是 id，按命令行语言显示。
+        self.assertIn("中=1", output)
         self.assertIn("待应用 0 个", output)
         self.assertIn("同步：", output)
 
@@ -111,6 +113,23 @@ class StatusCommandTests(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertIn("数据库不存在", output)
         self.assertFalse(missing.exists())
+        # 命令行跟系统语言走（ADR-0159 第三条）：英文系统看到的是英文。
+        with mock.patch.dict(os.environ, {"PEACH_LANGUAGE": "en"}):
+            _code, english = self._run(["status", "--db", str(missing), "--shared-db", str(self.shared)])
+        self.assertIn(f"Database not found: {missing}", english)
+
+
+class CommandLanguageTests(unittest.TestCase):
+    def test_peach_language_wins_then_the_system_display_language_decides(self):
+        from peach.interface_text import local_language
+        with mock.patch("peach.system_language.system_language", return_value="zh-CN"):
+            self.assertEqual(local_language({"PEACH_LANGUAGE": "en"}), "en")
+            self.assertEqual(local_language({"PEACH_LANGUAGE": "zh_CN.UTF-8"}), "zh-CN")
+            self.assertEqual(local_language({}), "zh-CN")
+            # 没有译文的写法不算指定，照旧跟系统。
+            self.assertEqual(local_language({"PEACH_LANGUAGE": "ja"}), "zh-CN")
+        with mock.patch("peach.system_language.system_language", return_value=None):
+            self.assertEqual(local_language({}), "en")
 
 
 class InitCommandTests(unittest.TestCase):
@@ -397,6 +416,7 @@ class InteractiveInitTests(unittest.TestCase):
         self.addCleanup(active.stop)
         settings = PeachSettings(
             db_path=loaded.directory("database") / "ledger.db", configured=True, token="secret",
+            cover_root=loaded.directory("generated") / "covers",
             allowed_media_roots=translate_roots(tuple(root for roots in loaded.locations.values() for root in roots)),
         )
 
@@ -476,8 +496,7 @@ class ScanCommandTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.db = self.root / "ledger.db"
-        upgrade(self.db, MIGRATIONS)
+        self.db = fresh_ledger(self.root)
         self.media = self.root / "media"
         (self.media / "sub").mkdir(parents=True)
         (self.media / "sub" / "a.mp4").write_bytes(b"0")
@@ -489,7 +508,6 @@ class ScanCommandTests(unittest.TestCase):
                         mounts={key: tuple(str(item) for item in value)
                                 for key, value in mounts.items()})
         for target in (mock.patch.object(settings_file, "active", lambda: fixed),
-                       mock.patch.object(cli, "location_mounts", lambda: mounts),
                        mock.patch.object(cli, "SETTINGS_ERROR", None)):
             target.start()
             self.addCleanup(target.stop)
@@ -524,10 +542,49 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(scanner.call_count, 1)
         self.assertEqual(scanner.call_args.args[1:3], ('pikpak', 'A:/'))
 
+    def test_an_smb_mount_reaches_the_scan_verbatim(self):
+        """#693：挂载表里的 `smb://` 地址原样交给扫描，不被改写成本机路径形态。"""
+        address = "smb://192.0.2.20:4450/Share"
+        fixed = replace(settings_file.active(), mounts={"local": (address,)})
+        with mock.patch.object(settings_file, "active", return_value=fixed), \
+             mock.patch.dict(os.environ, {"PEACH_MEDIA_MOUNTS": ""}), \
+             mock.patch.object(cli.scan, "scan_location") as scanner:
+            code, _ = self._run(["scan", "local", "--db", str(self.db)])
+        self.assertEqual(code, 0)
+        self.assertEqual(scanner.call_args.kwargs["mounts"], {"local": (address,)})
+
+    def test_an_unreadable_root_exits_with_a_message_and_keeps_existing_rows(self):
+        """#693：根目录列不出来时报错退出，不按 0 个文件结束、不把已有资产算作消失。"""
+        self.assertEqual(self._run(["scan", "local", "--db", str(self.db)])[0], 0)
+        connection = sqlite3.connect(self.db)
+        try:
+            before = connection.execute("SELECT path,last_seen FROM asset ORDER BY path").fetchall()
+        finally:
+            connection.close()
+        for path in sorted(self.media.rglob("*"), reverse=True):
+            path.rmdir() if path.is_dir() else path.unlink()
+        self.media.rmdir()
+        with self.assertRaises(SystemExit) as caught:
+            self._run(["scan", "local", "--db", str(self.db)])
+        self.assertTrue(str(caught.exception).startswith("✗"), caught.exception)
+        connection = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(connection.execute("SELECT path,last_seen FROM asset ORDER BY path").fetchall(), before)
+        finally:
+            connection.close()
+
     def test_an_explicit_subdirectory_is_scanned_alone(self):
         code, _ = self._run(["scan", "local", str(self.media / "sub"), "--db", str(self.db)])
         self.assertEqual(code, 0)
         self.assertEqual(self._count(), 1)
+
+    def test_a_directory_outside_every_root_exits_with_a_readable_message(self):
+        """#591：不在任何已配置媒体目录下的目录给出提示后退出，不抛 IndexError。"""
+        (self.root / "outside").mkdir()
+        with self.assertRaises(SystemExit) as caught:
+            self._run(["scan", "local", str(self.root / "outside"), "--db", str(self.db)])
+        self.assertTrue(str(caught.exception).startswith("✗"), caught.exception)
+        self.assertEqual(self._count(), 0)
 
     def test_an_undeclared_source_is_refused_and_lists_the_known_ones(self):
         with self.assertRaises(SystemExit) as caught:
@@ -535,6 +592,15 @@ class ScanCommandTests(unittest.TestCase):
         self.assertIn("nas", str(caught.exception))
         self.assertIn("local", str(caught.exception))
         self.assertEqual(self._count(), 0)
+
+    def test_a_refused_scan_target_is_said_in_the_command_language(self):
+        refused = cli.scan.ScanTargetError("errors.scan.unknownSourceNoneDeclared", {"location": "nas"})
+        with mock.patch.object(cli.scan, "scan_location", side_effect=refused), \
+                mock.patch.dict(os.environ, {"PEACH_LANGUAGE": "en"}), \
+                self.assertRaises(SystemExit) as caught:
+            self._run(["scan", "local", "--db", str(self.db)])
+        self.assertEqual(str(caught.exception),
+                         "✗ Undeclared storage nas; known in [media.locations]: (none in the settings file)")
 
     def test_a_missing_ledger_points_at_init(self):
         code, output = self._run(["scan", "local", "--db", str(self.root / "nope.db")])
@@ -548,8 +614,7 @@ class ProcessCommandTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.db = Path(self.tmp.name).resolve() / "ledger.db"
-        upgrade(self.db, MIGRATIONS)
+        self.db = fresh_ledger(self.tmp.name)
         config = settings_file.load_config(environ={}, strict=False)
         for target in (mock.patch.object(settings_file, "active", lambda: config),
                        mock.patch.object(cli, "SETTINGS_ERROR", None)):
@@ -592,7 +657,7 @@ class ProcessCommandTests(unittest.TestCase):
     def test_user_cancel_returns_a_cancelled_receipt_without_dispatching_followups(self):
         from peach.jobs import JobCancelled
         from contextlib import closing
-        with mock.patch('peach.library_processing.process_library',side_effect=JobCancelled('用户停止任务')), \
+        with mock.patch('peach.library_processing.process_library',side_effect=JobCancelled('errors.processingControl.userStopped')), \
                 redirect_stdout(io.StringIO()) as output:
             code=cli.main(['process','--db',str(self.db)])
         with closing(sqlite3.connect(self.db)) as connection:
@@ -600,6 +665,23 @@ class ProcessCommandTests(unittest.TestCase):
         self.assertEqual(code,130)
         self.assertEqual(rows,[('cancelled',None)])
         self.assertIn('已保存结果保留',output.getvalue())
+
+    def test_progress_lines_show_files_found_while_scanning_and_skip_repeats(self):
+        def process(*_args, report, **_kwargs):
+            scanning = {"stage": "扫描文件", "checked": 0, "total": 0, "current_action": "scanning_files"}
+            report({**scanning, "scanned": 0})
+            report({**scanning, "scanned": 8096})
+            report({**scanning, "scanned": 8096})
+            report({"stage": "读取时长与分辨率", "checked": 12, "total": 40, "scanned": 8096})
+            report({"stage": "整理结果", "checked": 0, "total": 0, "scanned": 8096})
+            return {"status": "complete", "followups": []}
+        with mock.patch("peach.library_processing.process_library", side_effect=process), \
+                redirect_stdout(io.StringIO()) as output:
+            code = cli.main(["process", "--db", str(self.db)])
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "扫描文件：已发现 0 个文件", "扫描文件：已发现 8,096 个文件",
+            "读取时长与分辨率：12/40", "整理结果"])
 
 
 class ReplicationAssemblyTests(unittest.TestCase):
@@ -633,8 +715,8 @@ class BrokenSettingsTests(unittest.TestCase):
     """设置文件读不出来时，命令必须响亮地失败，而不是拿默认值跑出个假状态。"""
 
     def test_commands_refuse_to_run_and_name_the_file(self):
-        broken = settings_file.SettingsFileError(
-            "设置文件读不出来：/tmp/peach-data/config.toml：TOML 语法错误")
+        broken = settings_file.SettingsFileError("errors.settingsFile.tomlSyntax", {
+            "path": "/tmp/peach-data/config.toml", "error": "Expected '=' (at line 1, column 5)"})
         with mock.patch.object(cli, "SETTINGS_ERROR", broken):
             with self.assertRaises(SystemExit) as caught:
                 cli.main(["status", "--db", "/tmp/nope.db"])
@@ -700,3 +782,13 @@ class PackagedEntryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SourceChecksCliTests(unittest.TestCase):
+    def test_source_check_selection_json_and_failed_exit_status(self):
+        result = {'ok': False, 'sources': [], 'elapsed_s': 0}
+        with mock.patch('peach.source_preflight.check_sources', return_value=result) as check, \
+                mock.patch('peach.cli.settings_file.active') as active, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cli.main(['check-sources', '--source', 'dmm', '--source', 'javdb', '--json']), 1)
+        check.assert_called_once_with(active.return_value.directory.return_value, ['dmm', 'javdb'])
+        self.assertEqual(__import__('json').loads(output.getvalue()), result)

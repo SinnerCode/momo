@@ -5,6 +5,7 @@
    层级回到站内的 popover 档：Sonner 自带的九位数会连 tooltip 一起盖住。 */
 #toasts [data-sonner-toaster]{z-index:var(--layer-popover);font:var(--board-body)}
 #toasts .processing-task-toast{width:100%;right:0}
+.peach-guiding .processing-task-toast{visibility:hidden}
 [data-processing-dock]{width:100%}
 /* 状态色叠在不透明卡面上，悬浮任务不透出底下的页面。 */
 [data-processing-dock][data-processing-tone=error]{
@@ -15,6 +16,8 @@
   --normal-border:var(--color-border-button-default);--normal-text:var(--color-text-primary);
   width:max-content;min-width:min(400px,100%);max-width:100%;right:0;
   padding:18px 20px;gap:12px;flex-wrap:wrap;font:var(--board-body)}
+/* 失败的回执自己就是那块错误框：外框线换成错误色，不在卡里再套一层红底提示；正文仍是正文色。 */
+#toasts [data-sonner-toast][data-styled=true][data-type=error]{--normal-border:var(--color-border-error-default)}
 #toasts :is([data-sonner-toast][data-styled=true],[data-processing-dock]){
   border-radius:var(--floating-radius);box-shadow:var(--elevation-xs)}
 /* 正文按实际内容参与排布，上限留出图标、间距与 Sonner 的光学校正边距。 */

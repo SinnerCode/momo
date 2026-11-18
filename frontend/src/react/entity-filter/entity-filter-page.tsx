@@ -8,27 +8,30 @@
  * 的常驻节点，换筛选、换视图都只挪不重建。源文件那两枚键仍由遗留层拼（照片详情里复用的是同一对），
  * 那一格用 `dangerouslySetInnerHTML`，React 不拥有里面的节点。 */
 import { useEffect, useRef, useState, type RefObject } from 'react';
-import { Radio, RadioGroup } from 'react-aria-components';
+import { Radio } from 'react-aria-components';
 import { icon } from '@peach/legacy/core';
 
 import { FilterGlassRows, FilterIconButton, FilterPill } from '../components/filter-glass';
 import { LibraryShortcuts } from '../library-shortcuts/shortcut-controls';
+import { AsyncText } from '../components/async-text';
 import { FolderBrowseToggle } from '../catalog-folders/catalog-folders-page';
 import { SEGMENTED_GLASS_TRACK, SEGMENT_GLASS } from '../components/segmented';
+import { GlassSegmentGroup } from '../components/glass-segments';
 import { spriteGlyph } from '../components/sprite-glyph';
-import { IconSwap } from '../components/icon-swap';
+import { SortKeys } from '../components/sort-controls';
 import { useViewGlide } from '../components/use-view-glide';
 import { useCatalogView } from '../catalog-grid/catalog-view';
 import { CatalogViewToggle } from '../catalog-grid/catalog-view-toggle';
 import { sourceIcon } from '../follow-feed/follow-marks';
 import {
   videoOnly, type EntityComboItem, type EntityFilterActions, type EntityFilterHelpers, type EntityFilterProps, type EntityOnlineHead,
-  type EntityPhotoHead, type EntitySortKey, type EntityVideoHead, type EntityView, type EntityViewKeys, type SegmentOption,
+  type EntityPhotoHead, type EntityVideoHead, type EntityView, type EntityViewKeys, type SegmentOption,
 } from './entity-filter';
+import { t } from '../../i18n';
 
 const Sep = () => <span data-entity-sep="" aria-hidden="true" />;
 const ShuffleIcon = spriteGlyph('shuffle');
-const SortUpIcon = spriteGlyph('arrow-up'), SortDownIcon = spriteGlyph('arrow-down');
+export { SortKeys } from '../components/sort-controls';
 
 export function EntityFilterPage(props: EntityFilterProps) {
   const { view, views, state, states, tags, combo, actions, helpers } = props;
@@ -65,7 +68,7 @@ export function EntityFilterPage(props: EntityFilterProps) {
   return (
     <>
       <Combo items={combo} hidden={!onVideos} actions={actions} />
-      <FilterGlassRows label="筛选与排序" topLabel="媒体与标签"
+      <FilterGlassRows label={t('catalog:catalogFilter.filterAndSort')} topLabel={t('catalog:entityFilter.mediaAndTags')}
         attrs={{ 'data-filter-frame': '', 'data-entity-filter-glass': '' }}
         topClassName="gap-1.5 overflow-visible"
         bottomClassName="min-h-12" bottomRef={bottomRow} busy={props.busy}
@@ -88,7 +91,7 @@ export function EntityFilterPage(props: EntityFilterProps) {
             </>
           ) : null}
           <div ref={scroll} data-entity-scroll="">
-            <div ref={stateRow} role="group" aria-label={online ? '状态' : '观看状态'} data-entity-states=""
+            <div ref={stateRow} role="group" aria-label={online ? t('catalog:shared.status') : t('catalog:entityFilter.watchStatus')} data-entity-states=""
               hidden={!filtered} onPointerLeave={stateGlide.leave}>
               {stateOptions.map((option) => (
                 <button key={option.k} type="button" data-entity-state={option.k} data-entity-press=""
@@ -119,7 +122,7 @@ export function EntityFilterPage(props: EntityFilterProps) {
   );
 }
 
-const ONLINE_MEDIA = [['videos', '视频', 'play', 'video'], ['images', '图片', 'pics', 'image']] as const;
+const ONLINE_MEDIA = [['videos', t('catalog:shared.videos'), 'play', 'video'], ['images', t('catalog:entityFilter.images'), 'pics', 'image']] as const;
 
 /** 在线视图左端那两枚圆键，同关注页：这一屏摆视频还是图片。 */
 function OnlineMediaKeys({ head, row, glide, onMedia }: {
@@ -129,7 +132,7 @@ function OnlineMediaKeys({ head, row, glide, onMedia }: {
   onMedia(media: 'videos' | 'images'): void;
 }) {
   return (
-    <div ref={row} role="group" aria-label="在线媒体类型" data-entity-media="" data-online-media=""
+    <div ref={row} role="group" aria-label={t('catalog:entityFilter.onlineMediaType')} data-entity-media="" data-online-media=""
       onPointerLeave={glide.leave}>
       {ONLINE_MEDIA.map(([value, text, symbol, kind]) => {
         const title = `${text} ${Math.max(0, head.mediaCounts?.[value] || 0).toLocaleString()}`;
@@ -149,7 +152,7 @@ function OnlineFilters({ head, actions }: { head: EntityOnlineHead; actions: Ent
     <>
       {head.providers.map(([key, label]) => (
         <button key={key} type="button" data-follow-provider={key} data-entity-press=""
-          aria-pressed={head.provider === key} title={label} aria-label={`来源：${label}`}
+          aria-pressed={head.provider === key} title={label} aria-label={t('catalog:entityFilter.sourceName', { source: label })}
           onClick={() => actions.onlineProvider(key)} dangerouslySetInnerHTML={{ __html: sourceIcon(key) }} />
       ))}
       {head.providers.length && head.tags.length ? <Sep /> : null}
@@ -174,9 +177,9 @@ function ViewKeys({ keys, view, row, glide, onView }: {
 }) {
   const buttons: { value: EntityView; text: string; count: number; symbol: string; kind: string }[] = [];
   if (keys.people) buttons.push({ value: 'people', text: keys.people.label, count: keys.people.count, symbol: keys.people.icon, kind: 'people' });
-  if (keys.videos) buttons.push({ value: 'videos', text: '视频', count: keys.videos.count, symbol: 'play', kind: 'video' });
-  if (keys.photos) buttons.push({ value: 'photos', text: '照片', count: keys.photos.count, symbol: 'pics', kind: 'image' });
-  if (keys.online) buttons.push({ value: 'online', text: '在线', count: keys.online.count, symbol: 'rss', kind: 'online' });
+  if (keys.videos) buttons.push({ value: 'videos', text: t('catalog:shared.videos'), count: keys.videos.count, symbol: 'play', kind: 'video' });
+  if (keys.photos) buttons.push({ value: 'photos', text: t('catalog:entityFilter.photos'), count: keys.photos.count, symbol: 'pics', kind: 'image' });
+  if (keys.online) buttons.push({ value: 'online', text: t('catalog:shared.online'), count: keys.online.count, symbol: 'rss', kind: 'online' });
   return (
     <div ref={row} role="group" aria-label={keys.label} data-entity-media="" onPointerLeave={glide.leave}>
       {buttons.map(({ value, text, count, symbol, kind }) => {
@@ -203,13 +206,13 @@ export function Combo({ items, hidden, actions }: {
           {items.map((item) => (
             <span key={`${item.kind}:${item.key}`} data-combo-chip="">
               {item.label}
-              <button type="button" aria-label={`撤掉 ${item.label}`}
+              <button type="button" aria-label={t('catalog:entityFilter.removeChip', { label: item.label })}
                 onClick={() => (item.kind === 'untag' ? actions.toggleTag(item.key) : actions.clearFilter(item.key))}>
                 ✕
               </button>
             </span>
           ))}
-          <button type="button" data-combo-clear="" onClick={actions.clearAll}>全部清除</button>
+          <button type="button" data-combo-clear="" onClick={actions.clearAll}>{t('catalog:entityFilter.clearAll')}</button>
         </>
       ) : null}
     </div>
@@ -223,7 +226,7 @@ function Head(props: EntityFilterProps) {
     <>
       {view === 'photos' && photo?.back ? (
         <button type="button" data-photo-back="" onClick={actions.photoBack}>
-          <span className="contents" dangerouslySetInnerHTML={{ __html: icon('chevron-left') }} /><span>全部照片</span>
+          <span className="contents" dangerouslySetInnerHTML={{ __html: icon('chevron-left') }} /><span>{t('catalog:entityFilter.allPhotos')}</span>
         </button>
       ) : null}
       <Readout text={readout} busy={busy} />
@@ -235,13 +238,12 @@ function Head(props: EntityFilterProps) {
   );
 }
 
-/** 读数：`视频 · N`、`艺人 · N`、`照片 · N 张`。等这一趟取数时换成一条微光，宽度同骨架那一条。 */
+/** 读数等待时保留旧文字，筛选框及其它控件保持原位。 */
 function Readout({ text, busy }: { text: string; busy: boolean }) {
   return (
     <h3 data-entity-readout="">
-      {busy
-        ? <span data-skeleton="count" aria-hidden className="relative inline-block h-3.5 w-24 rounded-md align-middle skeleton-sheen" />
-        : text}
+      <AsyncText text={busy ? undefined : text} busy={busy} placeholder={<span data-skeleton="count" aria-hidden
+        className="relative inline-block h-3.5 w-24 rounded-md align-middle skeleton-sheen" />} />
     </h3>
   );
 }
@@ -252,7 +254,7 @@ export function Segments({ name, label, value, options, onChange }: {
   name?: string; label: string; value: string; options: readonly SegmentOption[]; onChange(value: string): void;
 }) {
   return (
-    <RadioGroup name={name} aria-label={label} orientation="horizontal" value={value} onChange={onChange}
+    <GlassSegmentGroup name={name} aria-label={label} orientation="horizontal" value={value} onChange={onChange}
       data-entity-layout="" className={SEGMENTED_GLASS_TRACK}>
       {options.map(([option, text, symbol]) => {
         const Glyph = spriteGlyph(symbol);
@@ -262,13 +264,13 @@ export function Segments({ name, label, value, options, onChange }: {
           </Radio>
         );
       })}
-    </RadioGroup>
+    </GlassSegmentGroup>
   );
 }
 
 export function Shuffle({ onPress, busy = false }: { onPress(): void; busy?: boolean }) {
   return (
-    <FilterIconButton data-entity-batch="" label="换一批" busy={busy} busyStyle="strand" icon={ShuffleIcon} onPress={onPress} />
+    <FilterIconButton data-entity-batch="" label={t('catalog:entityFilter.shuffle')} busy={busy} busyStyle="strand" icon={ShuffleIcon} onPress={onPress} />
   );
 }
 
@@ -279,29 +281,12 @@ function VideoControls({ head, actions }: { head: EntityVideoHead; actions: Enti
     <span data-entity-sorts="">
       <Shuffle onPress={() => void actions.reshuffle()} />
       {head.jav && view === 'cards' ? (
-        <Segments label="JAV 卡片版式" value={head.jav.layout} options={head.jav.options} onChange={actions.setJavLayout} />
+        <Segments label={t('catalog:entityFilter.javCardLayout')} value={head.jav.layout} options={head.jav.options} onChange={actions.setJavLayout} />
       ) : null}
       <CatalogViewToggle />
       <FolderBrowseToggle />
-      <SortKeys sorts={head.sorts} onSort={actions.setSort} />
+      <SortKeys group={head.jav ? 'jav' : 'catalog'} sorts={head.sorts} onSort={actions.setSort} />
     </span>
-  );
-}
-
-/** 一排排序键。方向只画在选中的那一枚上：箭头既是当前方向，也是「再点一次能翻」的唯一提示。
- *  无障碍名称播报的是点下去会得到什么，当前状态由 `aria-pressed` 与这枚箭头各自表达。 */
-export function SortKeys({ sorts, onSort }: { sorts: readonly EntitySortKey[]; onSort(key: string): void }) {
-  return (
-    <>
-      {sorts.map((sort) => {
-        return (
-          <button key={sort.key} type="button" data-entity-sort={sort.key} data-entity-press=""
-            aria-pressed={sort.pressed} aria-label={sort.ariaLabel || undefined} onClick={() => onSort(sort.key)}>
-            {sort.label}{sort.pressed && sort.dir ? <IconSwap a={SortUpIcon} b={SortDownIcon} state={sort.dir === 'asc' ? 'a' : 'b'} className="size-(--icon-inline)" /> : null}
-          </button>
-        );
-      })}
-    </>
   );
 }
 
@@ -312,15 +297,15 @@ function OnlineControls({ head, actions }: { head: EntityOnlineHead; actions: En
       <Shuffle onPress={actions.onlineShuffle} />
       {head.media === 'images' ? (
         <>
-          <Segments label="图片布局" value={head.photoLayout} options={head.photoLayouts} onChange={actions.setPhotoLayout} />
-          <button type="button" data-follow-images-only="" aria-pressed={head.imagesOnly} title="仅显示图片"
-            aria-label="仅显示图片" onClick={() => actions.onlineImagesOnly(!head.imagesOnly)}>
+          <Segments label={t('catalog:entityFilter.imageLayout')} value={head.photoLayout} options={head.photoLayouts} onChange={actions.setPhotoLayout} />
+          <button type="button" data-follow-images-only="" aria-pressed={head.imagesOnly} title={t('catalog:entityFilter.imagesOnly')}
+            aria-label={t('catalog:entityFilter.imagesOnly')} onClick={() => actions.onlineImagesOnly(!head.imagesOnly)}>
             {head.imagesOnly ? <span data-view-glide="" aria-hidden="true" /> : null}
             <span className="contents" dangerouslySetInnerHTML={{ __html: icon('captions-off') }} />
           </button>
         </>
       ) : null}
-      <SortKeys sorts={head.sorts} onSort={actions.onlineSort} />
+      <SortKeys group="follow" sorts={head.sorts} onSort={actions.onlineSort} />
     </span>
   );
 }
@@ -341,7 +326,7 @@ function PhotoControls({ head, actions, helpers }: {
   return (
     <span data-entity-sorts="">
       {head.shuffle ? <Shuffle onPress={shuffle} busy={shuffling} /> : null}
-      <Segments label="图片布局" value={head.layout} options={head.layouts} onChange={actions.setPhotoLayout} />
+      <Segments label={t('catalog:entityFilter.imageLayout')} value={head.layout} options={head.layouts} onChange={actions.setPhotoLayout} />
       {toolsHtml ? <span ref={tools} data-entity-srctools="" dangerouslySetInnerHTML={{ __html: toolsHtml }} /> : null}
     </span>
   );

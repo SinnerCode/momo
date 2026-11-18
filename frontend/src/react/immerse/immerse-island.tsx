@@ -23,11 +23,12 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 
 import { avatarInner, representativeOf } from '@peach/card-art';
 import { fmtDur, realDuration } from '@peach/legacy/core';
-import { spinnerHtml } from '@peach/legacy/ui';
 
 import { apiSend } from '../../api';
 import {
-  cancelStreamSession, fmtSpeed, mountPlayer, newStreamSession, seekVideoBy, streamSpeedBits, toggleVideoPlayback,
+  cancelStreamSession, createSeekPreview, fmtSpeed, gestureSettings, lockLandscape, mountPlayer, newStreamSession,
+  PLAYER_SPINNER_HTML, seekVideoBy, streamSpeedBits, SubtitleControls, subtitleIcon, subtitlePanels, toggleVideoPlayback,
+  type Panels, type SeekPreview,
 } from '../../player';
 import { replaceCatalogItem } from '../catalog-grid/catalog-grid';
 import {
@@ -36,10 +37,12 @@ import {
 import { queryClient } from '../query';
 import {
   AXIS_LOCK_PX, DISLIKE_ADVANCE_MS, DOUBLE_TAP_MS, READY_TIMEOUT_MS, SLIDE_MS, SWIPE_PX, SYNTHETIC_CLICK_MS,
-  TAP_SLOP_PX, WHEEL_GAP_MS, ensureDetail, extendList, fetchImmerseList, fitMode, immerseListKey, immerseQuery,
-  isWide, ownerOf, type ImmerseItem,
+  TAP_SLOP_PX, WHEEL_GAP_MS, HOLD_MS, ensureDetail, extendList, fetchImmerseList, fitMode, immerseListKey, immerseQuery,
+  isWide, ownerOf, scrubRatio, swipeDelta, swipeSpan, tapSide, type ImmerseItem,
 } from './immerse';
 import type { ImmerseApi, ImmerseHost } from './immerse-api';
+import { t } from '../../i18n';
+import { orientLabel } from '../../core/stored-values';
 
 /* ── 状态 ── */
 
@@ -56,6 +59,8 @@ interface View {
   /** 加载提示的整句（带读取速度）；null 是收起。 */
   loading: string | null;
   shown: Shown | null;
+  /** 沉浸外框在浏览器全屏里（动作列的全屏键，#585）。 */
+  full: boolean;
 }
 
 /** 一格：外层负责上下滑动，里面的 video 交给 Video.js。当前格用变量持有，不按 id 查：Video.js
@@ -69,11 +74,17 @@ interface Slide {
   /** 拆掉时兑现：还在等片源或等出画的那一步不再干等。 */
   gone: Promise<void>;
   leave: () => void;
+  /** 这一格的字幕菜单控制：动作列的字幕键打开当前格的（#585）。 */
+  subtitles?: SubtitleControls;
 }
 
-interface Dom { root: HTMLElement; track: HTMLElement; bar: HTMLElement; progress: HTMLElement }
+interface Dom {
+  root: HTMLElement; track: HTMLElement; bar: HTMLElement; progress: HTMLElement;
+  /** 长按倍速的角标。 */
+  hold: HTMLElement;
+}
 
-const CLOSED: View = { open: false, idle: false, wide: false, loading: null, shown: null };
+const CLOSED: View = { open: false, idle: false, wide: false, loading: null, shown: null, full: false };
 
 let host: ImmerseHost | null = null;
 let dom: Dom | null = null;
@@ -96,9 +107,17 @@ let ticker = 0;
 /** 进度条拖动作用在哪一格上；第一条出画前与关掉之后没有。 */
 let scrubTarget: { video: HTMLVideoElement; duration: () => number } | null = null;
 let scrubbing = false;
+/** 进度条上方的画面预览，跟着当前格换：与详情播放器同一份取图与夹边。 */
+let seekPreview: SeekPreview | null = null;
+/** 字幕菜单的面板宿主：整场沉浸共用一个容器，换格只换各格自己的 `SubtitleControls`。 */
+let panels: Panels | null = null;
+/** 全屏看横版时内容层转了 90°（锁不上横屏的兜底）：手势坐标按内容坐标系换算。 */
+let landscape = false;
+/** 全屏期间取得的横屏锁；退出全屏、关掉或不再是横版时释放。 */
+let releaseOrientation: (() => void) | null = null;
 
 function immerseHost(): ImmerseHost {
-  if (!host) throw new Error('沉浸模式还没有接上宿主（configureImmerse）');
+  if (!host) throw new Error(t('catalog:immerse.hostMissing'));
   return host;
 }
 
@@ -166,6 +185,11 @@ function loadSlide(slide: Slide, item: ImmerseItem): Promise<void> {
     slide.release = mountPlayer(slide.video, {
       kind: 'immerse', item, session: slide.session, onLoaded: resolve,
       onEnded: () => { if (view.open) void step(1) },
+      /* 字幕菜单跟着这一格的播放器走：轨道、加载文件、在线搜索与外观和舞台同一套。CC 键是这一格私有的
+         空按钮，动作列的字幕键只管打开当前格的菜单，切片时不串到正在预载的那一格上。 */
+      onPlayer: (player) => {
+        if (panels) slide.subtitles = new SubtitleControls(player, slide.video, panels, document.createElement('button'));
+      },
     });
     void slide.gone.then(resolve);
   });
@@ -175,6 +199,7 @@ function loadSlide(slide: Slide, item: ImmerseItem): Promise<void> {
 function disposeSlide(slide: Slide | null): void {
   if (!slide || slide.disposed) return;
   slide.disposed = true;
+  slide.subtitles?.hide();
   slides.delete(slide);
   slide.leave();
   slide.release();
@@ -222,11 +247,44 @@ function applyFit(video: HTMLVideoElement): void {
   else video.addEventListener('loadedmetadata', () => fitVideo(video), { once: true });
 }
 
-/** 换舞台形状，框里每条片子的铺满判定跟着重算。 */
+/** 换舞台形状，框里每条片子的铺满判定跟着重算；全屏下的横置判定也可能翻转。 */
 function setStage(wide: boolean): void {
   view = { ...view, wide };
   paint();
   fitAll();
+  syncLandscape();
+}
+
+/* ── 全屏与横置（#585） ──
+   全屏看横版先请求横屏（和舞台全屏同一把锁）；锁不上（iOS、桌面）且视口仍是竖的，就把内容层
+   `[data-immerse-rot]` 转 -90°，手机横过来拿着看。全屏元素是外框本身，被浏览器的全屏样式钉死，
+   只能转它包着的内容。 */
+function syncLandscape(): void {
+  const root = dom?.root;
+  if (!root) return;
+  const want = view.open && document.fullscreenElement === root && view.wide;
+  if (want && !releaseOrientation) releaseOrientation = lockLandscape();
+  if (!want && releaseOrientation) { releaseOrientation(); releaseOrientation = null }
+  landscape = want && window.innerHeight > window.innerWidth;
+  root.toggleAttribute('data-landscape', landscape);
+}
+
+function toggleFullscreen(): void {
+  const root = dom?.root;
+  if (!root) return;
+  if (document.fullscreenElement) void document.exitFullscreen?.().catch(() => {});
+  else void root.requestFullscreen?.().catch(() => {});
+}
+
+function onFullscreenChange(): void {
+  if (!view.open) return;
+  view = { ...view, full: !!dom && document.fullscreenElement === dom.root };
+  paint();
+  syncLandscape();
+}
+
+function openSubtitles(): void {
+  current?.subtitles?.show();
 }
 
 /* ── 片单与换条 ── */
@@ -247,6 +305,16 @@ function wireProgress(video: HTMLVideoElement, item: ImmerseItem): void {
     if (total && dom) dom.progress.style.width = `${(video.currentTime / total * 100).toFixed(2)}%`;
   });
   scrubTarget = { video, duration };
+  seekPreview?.dispose();
+  // 进度条横贯视口，预览两端各让出 12px，与关闭键离边的距离同级。
+  seekPreview = dom ? createSeekPreview(dom.bar, item, { inset: 12 }) : null;
+}
+
+function showSeekPreview(ratio: number): void {
+  const total = scrubTarget?.duration();
+  if (!seekPreview || !total) return;
+  seekPreview.prime();
+  seekPreview.show(ratio, total);
 }
 
 async function show(direction = 0): Promise<void> {
@@ -256,7 +324,7 @@ async function show(direction = 0): Promise<void> {
   /* 当前这一条交给壳写进地址栏：竖划十条之后刷新页面，落回来的该是同一条片子，而不是重新抽一批。 */
   immerseHost().route(item.id);
   switching = true;
-  setLoading(direction ? '切换中' : '加载中', item);
+  setLoading(direction ? t('catalog:immerse.switching') : t('catalog:immerse.loading'), item);
   let incoming: Slide | null = null;
   try {
     // 这一条刚被删掉（详情回 `{error}`）照样放：作者与动作键只是没有可画的。
@@ -301,7 +369,7 @@ async function step(direction: number): Promise<void> {
   if (switching || !view.open) return;
   const mine = generation;
   index += direction;
-  setLoading('切换中', list[index] ?? null);
+  setLoading(t('catalog:immerse.switching'), list[index] ?? null);
   // 滚到尾部就续取下一批：无限流。每次都是新的随机抽样，按 id 去重接在后面。
   if (index >= list.length - 3 && !extending) {
     extending = true;
@@ -330,7 +398,7 @@ async function open(startId: number | null): Promise<void> {
   queryClient.removeQueries({ queryKey: ['immerse-list'] });
   view = { ...view, open: true, idle: true, shown: null };
   document.body.setAttribute('data-immerse-open', '');
-  setLoading('加载内容');
+  setLoading(t('catalog:immerse.loadingContent'));
   try {
     let next = await fetchDraw();
     if (startId && !next.some((item) => item.id === startId)) {
@@ -344,7 +412,7 @@ async function open(startId: number | null): Promise<void> {
     list = next;
     if (!list.length) {
       close();
-      immerseHost().warn('当前筛选下没有可直接播放的内容');
+      immerseHost().warn(t('catalog:immerse.nothingPlayable'));
       return;
     }
     index = Math.max(0, list.findIndex((item) => item.id === startId));
@@ -364,18 +432,29 @@ function teardown(): void {
   touch = null;
   scrubTarget = null;
   scrubbing = false;
+  seekPreview?.dispose();
+  seekPreview = null;
+  endPress();
   [...slides].forEach(disposeSlide);
   switching = false;
 }
 
-function close(): void {
+/** 关掉沉浸。`fromRoute` 是返回键已经把地址带回原页面：就地收起，不再让宿主导航。 */
+function close(fromRoute = false): void {
   if (!view.open) return;
   generation++;
   teardown();
+  if (dom && document.fullscreenElement === dom.root) void document.exitFullscreen?.().catch(() => {});
   view = CLOSED;
+  syncLandscape();
   document.body.removeAttribute('data-immerse-open');
   paint();
-  immerseHost().closed();
+  if (!fromRoute) immerseHost().closed();
+}
+
+/** 浏览器后退、系统返回手势落到沉浸之外的地址：退出沉浸，回到哪儿由历史决定（#585）。 */
+function onPopState(): void {
+  if (view.open && location.pathname !== '/immerse') close(true);
 }
 
 /* ── 单击、双击与触屏手势 ──
@@ -395,10 +474,10 @@ function clearTap(): void {
 }
 
 /** 左右半区：同侧两下快退快进，一下切播放（等双击窗口过去才兑现）。 */
-function handleTap(clientX: number): void {
+function handleTap(clientX: number, clientY: number): void {
   const video = current?.video;
   if (!video) return;
-  const side = clientX < window.innerWidth / 2 ? -1 : 1;
+  const side = tapSide(clientX, clientY, landscape);
   const now = Date.now();
   if (lastTap && lastTap.side === side && now - lastTap.at <= DOUBLE_TAP_MS) {
     clearTap();
@@ -436,7 +515,8 @@ function onTouchStart(event: TouchEvent): void {
 
 function onTouchMove(event: TouchEvent): void {
   if (!touch || event.touches.length !== 1) return;
-  const dx = event.touches[0]!.clientX - touch.x, dy = event.touches[0]!.clientY - touch.y;
+  // 轴锁与位移都按内容坐标系算：横置后用户眼里的横划在屏幕上是竖着走的。
+  const { x: dx, y: dy } = swipeDelta(event.touches[0]!.clientX - touch.x, event.touches[0]!.clientY - touch.y, landscape);
   if (!touch.axis) {
     if (Math.abs(dx) < AXIS_LOCK_PX && Math.abs(dy) < AXIS_LOCK_PX) return;
     touch.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
@@ -446,8 +526,9 @@ function onTouchMove(event: TouchEvent): void {
   const video = current?.video, total = video ? video.duration || 0 : 0;
   if (!total) return;
   event.preventDefault(); // 横划归进度，不交给页面滚动
-  touch.to = Math.min(total, Math.max(0, touch.from + dx / window.innerWidth * total));
+  touch.to = Math.min(total, Math.max(0, touch.from + dx / swipeSpan(landscape) * total));
   paintProgress(touch.to / total);
+  showSeekPreview(touch.to / total);
 }
 
 function onTouchEnd(event: TouchEvent): void {
@@ -456,22 +537,26 @@ function onTouchEnd(event: TouchEvent): void {
   touch = null;
   ignoreClickUntil = Date.now() + SYNTHETIC_CLICK_MS;
   setBarScrubbing(false);
+  seekPreview?.hide();
   if (gesture.axis === 'x') {
     const video = current?.video;
     if (video && gesture.to != null) video.currentTime = gesture.to;
     return;
   }
-  const end = event.changedTouches[0]!, dx = end.clientX - gesture.x, dy = gesture.y - end.clientY;
+  const end = event.changedTouches[0]!;
+  const moved = swipeDelta(end.clientX - gesture.x, end.clientY - gesture.y, landscape), dx = moved.x, dy = -moved.y;
   if (Math.abs(dy) > SWIPE_PX) { clearTap(); void step(dy > 0 ? 1 : -1); return }
   if (Math.abs(dx) <= TAP_SLOP_PX && Math.abs(dy) <= TAP_SLOP_PX) {
     event.preventDefault();
-    handleTap(end.clientX);
+    // 长按倍速刚松手：那一下不是单击。
+    if (Date.now() >= pressConsumedUntil) handleTap(end.clientX, end.clientY);
   }
 }
 
 function onTouchCancel(): void {
   touch = null;
   setBarScrubbing(false);
+  seekPreview?.hide();
 }
 
 function onWheel(event: WheelEvent): void {
@@ -481,12 +566,65 @@ function onWheel(event: WheelEvent): void {
   void step(event.deltaY > 0 ? 1 : -1);
 }
 
+/* 长按倍速（#585）：触屏与鼠标左键按住画面不动满 `HOLD_MS`，临时提到 `holdRate`（与舞台长按、右方向键
+   同一项设置），松手或一动就恢复按下前的速度，不写播放记忆。松手那一下的合成 click 与单击判定都不算。 */
+interface Press { id: number; x: number; y: number; timer: number; video?: HTMLVideoElement; rate?: number; boosted?: number }
+let press: Press | null = null;
+let pressConsumedUntil = 0;
+
+function endPress(): void {
+  const at = press;
+  if (!at) return;
+  press = null;
+  clearTimeout(at.timer);
+  removeEventListener('pointermove', pressMove);
+  removeEventListener('pointerup', pressUp);
+  removeEventListener('pointercancel', pressUp);
+  dom?.hold.removeAttribute('data-on');
+  if (at.video && at.rate !== undefined) {
+    if (at.video.playbackRate === at.boosted) at.video.playbackRate = at.rate;
+    pressConsumedUntil = Date.now() + SYNTHETIC_CLICK_MS;
+    ignoreClickUntil = Math.max(ignoreClickUntil, pressConsumedUntil);
+  }
+}
+
+function pressMove(event: globalThis.PointerEvent): void {
+  if (press && event.pointerId === press.id
+    && Math.max(Math.abs(event.clientX - press.x), Math.abs(event.clientY - press.y)) > TAP_SLOP_PX) endPress();
+}
+
+function pressUp(event: globalThis.PointerEvent): void {
+  if (press && event.pointerId === press.id) endPress();
+}
+
+function pressStart(event: PointerEvent<HTMLDivElement>): void {
+  endPress();
+  if (event.button !== 0) return;
+  const at: Press = { id: event.pointerId, x: event.clientX, y: event.clientY, timer: 0 };
+  at.timer = window.setTimeout(() => {
+    const video = current?.video;
+    if (press !== at || !video || video.paused || video.ended) return;
+    clearTap();
+    at.video = video;
+    at.rate = video.playbackRate;
+    at.boosted = Math.max(gestureSettings().holdRate, at.rate);
+    video.playbackRate = at.boosted;
+    if (dom) {
+      dom.hold.textContent = t('catalog:playerGestures.holdTouch', { rate: at.boosted });
+      dom.hold.setAttribute('data-on', '');
+    }
+  }, HOLD_MS);
+  press = at;
+  addEventListener('pointermove', pressMove);
+  addEventListener('pointerup', pressUp);
+  addEventListener('pointercancel', pressUp);
+}
+
 /* 进度条拖动。pointer 一套同时盖鼠标和触控，捕获指针后手滑出进度条也不会断。拖动中只画进度，
    松手才 seek——每帧都 seek 会让远程源一直重新缓冲。没拖动的单击走同一条路：pointerdown 已经
    画了进度，pointerup 落地。 */
 function barRatio(event: PointerEvent): number {
-  const box = dom!.bar.getBoundingClientRect();
-  return Math.min(1, Math.max(0, (event.clientX - box.left) / box.width));
+  return scrubRatio(event.clientX, event.clientY, dom!.bar.getBoundingClientRect(), landscape);
 }
 
 function scrubStart(event: PointerEvent<HTMLDivElement>): void {
@@ -495,14 +633,18 @@ function scrubStart(event: PointerEvent<HTMLDivElement>): void {
   setBarScrubbing(true);
   event.currentTarget.setPointerCapture(event.pointerId);
   paintProgress(barRatio(event));
+  showSeekPreview(barRatio(event));
   event.preventDefault();
 }
 
+/* 预览不等按下：鼠标悬停就显示，触控只在按住拖动时才有 pointermove。 */
 function scrubMove(event: PointerEvent): void {
   if (scrubbing) paintProgress(barRatio(event));
+  showSeekPreview(barRatio(event));
 }
 
 function scrubEnd(event: PointerEvent): void {
+  if (event.pointerType !== 'mouse') seekPreview?.hide();
   if (!scrubbing) return;
   scrubbing = false;
   setBarScrubbing(false);
@@ -513,6 +655,11 @@ function scrubEnd(event: PointerEvent): void {
 function scrubCancel(): void {
   scrubbing = false;
   setBarScrubbing(false);
+  seekPreview?.hide();
+}
+
+function scrubLeave(): void {
+  if (!scrubbing) seekPreview?.hide();
 }
 
 /* ── 动作键 ── */
@@ -537,9 +684,9 @@ export async function sendFeedback(id: number, kind: string): Promise<FeedbackRe
 }
 
 const ACTIONS: { kind: FeedbackKind; glyph: string; label: string }[] = [
-  { kind: 'dislike', glyph: 'thumbs-down', label: '标为不喜欢' },
-  { kind: 'seen', glyph: 'eye', label: '标为看过' },
-  { kind: 'o', glyph: 'heart', label: '记一次高潮' },
+  { kind: 'dislike', glyph: 'thumbs-down', label: t('catalog:immerse.markDisliked') },
+  { kind: 'seen', glyph: 'eye', label: t('catalog:immerse.markWatched') },
+  { kind: 'o', glyph: 'heart', label: t('catalog:immerse.logClimax') },
 ];
 
 /** 当前出画那一条的详情：出画前已经取过（`ensureDetail`），这里只读缓存、跟着写回重画。 */
@@ -550,6 +697,12 @@ function useDetail(id: number | null) {
     enabled: id != null,
     staleTime: Infinity,
   }).data;
+}
+
+/** 高潮次数：译文里 `{{num}}` 的位置换成加粗的数字，标签与数字的先后由译文决定。 */
+function ClimaxCount({ count }: { count: number }) {
+  const [before, after = ''] = t('catalog:immerse.climaxCount', { count, num: '\u0001' }).split('\u0001');
+  return <>{before}<b>{count}</b>{after}</>;
 }
 
 function ImmerseAction({ kind, glyph, label, id }: { kind: FeedbackKind; glyph: string; label: string; id: number | null }) {
@@ -571,7 +724,7 @@ function ImmerseAction({ kind, glyph, label, id }: { kind: FeedbackKind; glyph: 
       });
       if (kind === 'dislike' && result.feedback === 'dislike') setTimeout(() => { void step(1) }, DISLIKE_ADVANCE_MS);
     },
-    onError: (error) => immerseHost().failure('更新反馈', error),
+    onError: (error) => immerseHost().failure(t('catalog:immerse.updateFeedback'), error),
   });
   const busy = mutation.isPending;
   const pressed = kind !== 'o' && full ? (full.feedback === kind ? 'true' : 'false') : undefined;
@@ -583,9 +736,9 @@ function ImmerseAction({ kind, glyph, label, id }: { kind: FeedbackKind; glyph: 
         <svg viewBox="0 0 24 24"><use href={`#i-${glyph}`} /></svg>
       </button>
       <span data-immerse-label="">
-        {kind === 'dislike' ? '不喜欢' : null}
-        {kind === 'seen' ? (full?.feedback === 'seen' ? '已看' : '看过') : null}
-        {kind === 'o' ? <>高潮 <b>{full?.o_count || 0}</b></> : null}
+        {kind === 'dislike' ? t('catalog:immerse.dislike') : null}
+        {kind === 'seen' ? (full?.feedback === 'seen' ? t('catalog:immerse.watched') : t('catalog:immerse.markWatchedShort')) : null}
+        {kind === 'o' ? <ClimaxCount count={full?.o_count || 0} /> : null}
       </span>
     </div>
   );
@@ -618,28 +771,37 @@ function Caption({ shown }: { shown: Shown | null }) {
   return (
     <div data-immerse-ui="">
       <div data-immerse-author="">
-        <button type="button" data-immerse-avatar="" aria-label="打开资料" onClick={openOwner}
+        <button type="button" data-immerse-avatar="" aria-label={t('catalog:immerse.openOwner')} onClick={openOwner}
           dangerouslySetInnerHTML={{ __html: avatar }} />
         <a href="#" onClick={openOwner}>{owner?.who ?? ''}</a>
-        <span>{shown && item ? `· ${fmtDur(item.duration)} · ${item.ctx_orient || ''} · ${shown.index + 1}/${shown.length}` : ''}</span>
+        <span>{shown && item ? `· ${fmtDur(item.duration)} · ${orientLabel(item.ctx_orient)} · ${shown.index + 1}/${shown.length}` : ''}</span>
       </div>
-      <button type="button" data-immerse-title="" onClick={openTitle}>{item ? helpers.displayName(item).trim() || '未命名视频' : ''}</button>
+      <button type="button" data-immerse-title="" onClick={openTitle}>{item ? helpers.displayName(item).trim() || t('catalog:immerse.untitled') : ''}</button>
     </div>
   );
 }
 
 /* ── 外框 ── */
 
-const SPINNER = { __html: spinnerHtml('媒体加载中') };
+/* 媒体加载与播放器缓冲同一枚转圈；读屏读的是旁边那句。 */
+const SPINNER = { __html: PLAYER_SPINNER_HTML };
 
 function ImmerseView({ view: at }: { view: View }) {
   const frame = useRef<HTMLDivElement>(null);
   const track = useRef<HTMLDivElement>(null);
   const bar = useRef<HTMLDivElement>(null);
   const progress = useRef<HTMLElement>(null);
+  const holdHint = useRef<HTMLSpanElement>(null);
+  const subtitleMenu = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const el = frame.current!;
-    dom = { root: el, track: track.current!, bar: bar.current!, progress: progress.current! };
+    dom = { root: el, track: track.current!, bar: bar.current!, progress: progress.current!, hold: holdHint.current! };
+    const lifetime = new AbortController();
+    panels = subtitlePanels(subtitleMenu.current!, lifetime.signal);
+    /* 长按归倍速：浏览器原生的视频菜单（下载视频、视频帧）与文字选中框都不出现。 */
+    const swallow = (event: Event) => event.preventDefault();
+    el.addEventListener('contextmenu', swallow, { signal: lifetime.signal });
+    el.addEventListener('selectstart', swallow, { signal: lifetime.signal });
     /* 横划要 `preventDefault`，React 的触摸与滚轮事件挂在根上是被动的，拦不住页面滚动：这几条直接挂
        在节点上。 */
     el.addEventListener('touchstart', onTouchStart, { passive: true });
@@ -653,6 +815,8 @@ function ImmerseView({ view: at }: { view: View }) {
       el.removeEventListener('touchend', onTouchEnd);
       el.removeEventListener('touchcancel', onTouchCancel);
       el.removeEventListener('wheel', onWheel);
+      lifetime.abort();
+      panels = null;
       dom = null;
     };
   }, []);
@@ -660,24 +824,45 @@ function ImmerseView({ view: at }: { view: View }) {
   const flag = (on: boolean) => (on ? '' : undefined);
   return (
     <div ref={frame} data-immerse="" data-idle={flag(at.idle)} data-wide={flag(at.wide)} hidden={!at.open}>
-      <div data-immerse-stage="" data-wide={flag(at.wide)}>
-        <div ref={track} data-immerse-track="" onClick={clickTrack} />
-        <div data-immerse-actions="">
-          {ACTIONS.map((action) => <ImmerseAction key={action.kind} {...action} id={id} />)}
+      {/* 内容层：全屏看横版又锁不上横屏时转它（`data-landscape`）；平时就是外框的整块画布。 */}
+      <div data-immerse-rot="">
+        <div data-immerse-stage="" data-wide={flag(at.wide)}>
+          <div ref={track} data-immerse-track="" onClick={clickTrack} onPointerDown={pressStart} />
+          <span ref={holdHint} data-immerse-hold="" role="status" />
+          <div data-immerse-actions="">
+            {ACTIONS.map((action) => <ImmerseAction key={action.kind} {...action} id={id} />)}
+            <div data-immerse-action="">
+              <button type="button" data-immerse-circle="" data-immerse-glyph="" data-immerse-subtitles=""
+                title={t('catalog:playerControls.subtitles')} aria-label={t('catalog:playerControls.subtitles')}
+                aria-haspopup="menu" onClick={openSubtitles} dangerouslySetInnerHTML={{ __html: subtitleIcon() }} />
+              <span data-immerse-label="">{t('catalog:playerControls.subtitles')}</span>
+              <div ref={subtitleMenu} data-immerse-subtitle-menu="" className="vjs-peach-settings-menu" role="menu"
+                aria-label={t('catalog:playerControls.subtitles')} hidden />
+            </div>
+            <div data-immerse-action="">
+              <button type="button" data-immerse-circle="" data-immerse-glyph="" onClick={toggleFullscreen}
+                title={at.full ? t('catalog:playerControls.exitFullScreen') : t('catalog:playerControls.fullScreen')}
+                aria-label={at.full ? t('catalog:playerControls.exitFullScreen') : t('catalog:playerControls.fullScreen')}
+                aria-pressed={at.full ? 'true' : 'false'}>
+                <svg viewBox="0 0 24 24"><use href={at.full ? '#i-player-fullscreen-exit' : '#i-player-fullscreen-enter'} /></svg>
+              </button>
+              <span data-immerse-label="">{at.full ? t('catalog:playerControls.exitFullScreen') : t('catalog:playerControls.fullScreen')}</span>
+            </div>
+          </div>
         </div>
+        <div data-immerse-loader="" role="status" aria-live="polite" hidden={at.loading === null}>
+          <span data-immerse-spinner="" aria-hidden dangerouslySetInnerHTML={SPINNER} />
+          <span>{at.loading ?? ''}</span>
+        </div>
+        <button type="button" data-immerse-close="" title={t('catalog:shared.close')} aria-label={t('catalog:shared.close')} onClick={() => close()}>
+          <svg viewBox="0 0 24 24"><use href="#i-x" /></svg>
+        </button>
+        <div ref={bar} data-immerse-bar="" onPointerDown={scrubStart} onPointerMove={scrubMove}
+          onPointerUp={scrubEnd} onPointerCancel={scrubCancel} onPointerLeave={scrubLeave}>
+          <i ref={progress} />
+        </div>
+        <Caption shown={at.shown} />
       </div>
-      <div data-immerse-loader="" role="status" aria-live="polite" hidden={at.loading === null}>
-        <span data-immerse-spinner="" dangerouslySetInnerHTML={SPINNER} />
-        <span>{at.loading ?? ''}</span>
-      </div>
-      <button type="button" data-immerse-close="" title="关闭" aria-label="关闭" onClick={close}>
-        <svg viewBox="0 0 24 24"><use href="#i-x" /></svg>
-      </button>
-      <div ref={bar} data-immerse-bar="" onPointerDown={scrubStart} onPointerMove={scrubMove}
-        onPointerUp={scrubEnd} onPointerCancel={scrubCancel}>
-        <i ref={progress} />
-      </div>
-      <Caption shown={at.shown} />
     </div>
   );
 }
@@ -709,8 +894,11 @@ export function configureImmerse(next: ImmerseHost): ImmerseApi {
   host = next;
   if (first) {
     document.addEventListener('keydown', onKeyDown);
-    // 旋转手机或改窗口大小后，同一条视频的铺满／完整显示判定可能翻转。
-    addEventListener('resize', () => { if (view.open) fitAll() });
+    // 旋转手机或改窗口大小后，同一条视频的铺满／完整显示判定可能翻转；全屏横置的判定跟着重算。
+    addEventListener('resize', () => { if (view.open) { fitAll(); syncLandscape() } });
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    // 浏览器后退或系统返回手势落出沉浸地址时退出沉浸。
+    addEventListener('popstate', onPopState);
     addEventListener('pagehide', () => { slides.forEach((slide) => cancelStreamSession(slide.session)) });
   }
   return api;

@@ -17,6 +17,9 @@
   filter var(--motion-swap),transform var(--motion-swap)}
 .textswap.leaving{opacity:0;filter:blur(2px);transform:translateY(-4px)}
 .textswap.entering{opacity:0;filter:blur(2px);transform:translateY(4px);transition:none}
+/* 异步页头与读数原位换字，基线保持固定。 */
+[data-async-text]>.textswap{transition:opacity var(--motion-swap)}
+[data-async-text]>.textswap:is(.leaving,.entering){filter:none;transform:none}
 
 /* ── 失败的那一下 ──
    已经有红边表达「这一格不对」，抖动只是把视线拉过去，所以不另加红字、不改边框色，
@@ -53,3 +56,5 @@
    溶解的那一层（`.cleardissolve`）在 `frontend/src/ui-kit/motion.css`；这里只在溶解期间收起
    搜索框自己的占位字，免得旧字往上飘的同时占位字在原处闪出来。 */
 .search input.dissolving::placeholder{opacity:0}
+/* 占位字换一句时也一样：换的那一层在 `frontend/src/ui-kit/motion.css`。 */
+.search input.placeholderrolling::placeholder{opacity:0}

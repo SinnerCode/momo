@@ -5,6 +5,8 @@
  * 都走 `/api/batch`，由壳执行（回执、撤销与重读都归壳），做完壳推进 `revision`，查询换键重取。 */
 import { apiGet } from '../../api';
 import type { JunkKind, JunkRoute, JunkView } from '../../junk-queue';
+import { t } from '../../i18n';
+import type { TableFilters, TableFacets } from '../components/use-table-filters';
 
 export type { JunkKind, JunkRoute, JunkView };
 
@@ -14,18 +16,39 @@ export const JUNK_LIMIT = 200;
 /** `/api/ads` 的一条。只列卡片读到的字段，其余原样带着，壳的缓存要的是整条。 */
 export interface JunkItem {
   id: number;
+  /** 同名同大小的扩散附件，仅用于折叠展示。 */
+  copy_group?: string;
   name?: string;
   junk_kind?: string;
   why?: string;
+  /** `why` 按段的写法（code 与参数，词库原文是 `text` 段），前端按当前语言拼。 */
+  why_parts?: unknown;
   size?: number | null;
   location?: string;
   cost?: string;
   [field: string]: unknown;
 }
 
+/** 每组保留原始文件行和顺序，逐文件处置继续使用各自 id。 */
+export function groupJunkCopies(items: readonly JunkItem[]): JunkItem[][] {
+  const groups: JunkItem[][] = [];
+  const copies = new Map<string, JunkItem[]>();
+  for (const item of items) {
+    const previous = item.copy_group ? copies.get(item.copy_group) : undefined;
+    if (previous) previous.push(item);
+    else {
+      const group = [item];
+      groups.push(group);
+      if (item.copy_group) copies.set(item.copy_group, group);
+    }
+  }
+  return groups;
+}
+
 /** `/api/ads` 的回话：`total` 是这一视图、这一类的条数，`all_total` 是这一视图各类合计，
  *  `counts` 按类计数，`dismissed_total` 给分类条末尾那一项的徽标。 */
 export interface JunkPage {
+  column_facets?: TableFacets;
   items: JunkItem[];
   total?: number;
   all_total?: number;
@@ -38,16 +61,16 @@ export type JunkOperation = 'dismiss-junk' | 'reconsider-junk' | 'dispose';
 
 /** 卡片上的类型名与字形。网址那一类在卡上写全称。 */
 export const JUNK_KIND_META: Record<string, readonly [string, string]> = {
-  video: ['视频', 'play'], image: ['图片', 'pics'], archive: ['压缩包', 'file-archive'],
-  audio: ['音频', 'file-audio'], url: ['网址快捷方式', 'globe'], other: ['其它文件', 'hard-drive'],
+  video: [t('cleanup:junk.kindVideos'), 'play'], image: [t('cleanup:junk.kindImages'), 'pics'], archive: [t('cleanup:junk.kindArchives'), 'file-archive'],
+  audio: [t('cleanup:junk.kindAudio'), 'file-audio'], url: [t('cleanup:junk.kindUrlShortcuts'), 'globe'], other: [t('cleanup:junk.kindOtherFiles'), 'hard-drive'],
 };
 export const junkKindMeta = (item: JunkItem) => JUNK_KIND_META[item.junk_kind || 'other'] || JUNK_KIND_META.other!;
 
 /** 中间那颗判断键：待判断视图里是「不是垃圾」，已排除视图里是「重新判断」。 */
 export function junkDecision(view: JunkView): { operation: JunkOperation; label: string; glyph: string } {
   return view === 'dismissed'
-    ? { operation: 'reconsider-junk', label: '重新判断', glyph: 'rotate-ccw' }
-    : { operation: 'dismiss-junk', label: '不是垃圾', glyph: 'check' };
+    ? { operation: 'reconsider-junk', label: t('cleanup:junk.reconsider'), glyph: 'rotate-ccw' }
+    : { operation: 'dismiss-junk', label: t('cleanup:junk.notJunk'), glyph: 'check' };
 }
 
 /** 分类条上一项的计数：「全部」读这一视图的合计，其余读各类。 */
@@ -63,8 +86,10 @@ export function junkQueryString({ kind, view }: JunkRoute): string {
   return params.toString();
 }
 
-export async function fetchJunkPage(route: JunkRoute, signal: AbortSignal): Promise<JunkPage> {
-  const page = await apiGet<JunkPage>(`/api/ads?${junkQueryString(route)}`, signal);
+export async function fetchJunkPage(route: JunkRoute, signal: AbortSignal, filters?: TableFilters): Promise<JunkPage> {
+  const params = new URLSearchParams(junkQueryString(route));
+  if (filters) params.set('column_filters', JSON.stringify(filters));
+  const page = await apiGet<JunkPage>(`/api/ads?${params}`, signal);
   return { ...page, items: page.items || [] };
 }
 
@@ -79,12 +104,17 @@ export interface JunkQueueActions {
   navigate(path: string): void;
   /** 切换一张的选中；`range` 是按住 Shift 连选。 */
   toggleSelection(id: number, range: boolean): void;
+  /** 「全选」：这一批已取到的全部选上或全部取消。垃圾文件是处理队列，勾选框不经右上角开关，直接显示。 */
+  selectAll(ids: readonly number[], on: boolean): void;
   /** 点标题打开：视频进详情，本地图片在新标签页看原图。 */
   open(item: JunkItem, anchor: HTMLElement): void;
   /** 「打开位置」：在资源管理器里显示。回话是要写在卡片状态行里的一句，成功为空。 */
   reveal(item: JunkItem): Promise<string>;
   /** 三颗处置键。写 ledger，做完重读队列并给撤销；失败由壳报，再抛出。 */
   operate(item: JunkItem, operation: JunkOperation): Promise<void>;
+  /** 浮层上的「全部移入回收站」：待判断里这一类的全部 `count` 条，不止取回的这一批。壳弹确认框，
+   *  写明件数与可撤销；件数在这期间变了就整批不动、重读后请人再确认。 */
+  disposeAll(kind: JunkKind, count: number, filters?: string): void;
 }
 
 export interface JunkQueueProps extends JunkRoute {

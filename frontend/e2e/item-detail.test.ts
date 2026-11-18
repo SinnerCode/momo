@@ -74,7 +74,8 @@ describe('作品详情岛', () => {
       });
       await page.reload();
       await received;
-      const initialHeight = await page.locator('#stage [data-stage-media]').evaluate(node => node.getBoundingClientRect().height);
+      const media = page.locator('#stage [data-item-media]');
+      const initialHeight = await media.evaluate(node => node.getBoundingClientRect().height);
       release();
       const reasons = '#stage [data-item-related] [aria-label^="查看推荐理由"]';
       await page.locator(reasons).first().waitFor();
@@ -85,7 +86,7 @@ describe('作品详情岛', () => {
           .every(reason => reason.getBoundingClientRect().bottom <= bottom + 1);
       }, reasons);
       await visible();
-      const finalHeight = await page.locator('#stage [data-stage-media]').evaluate(node => node.getBoundingClientRect().height);
+      const finalHeight = await media.evaluate(node => node.getBoundingClientRect().height);
       assert.ok(Math.abs(initialHeight - finalHeight) <= 1, `${initialHeight} → ${finalHeight}`);
       const card = page.locator('#stage [data-item-related] [data-media-card]').first();
       await card.hover();
@@ -112,9 +113,13 @@ describe('作品详情岛', () => {
     const opened = await openItemPage(browser, `/assets/${ITEM.plain}`, viewport);
     try {
       const { page } = opened;
-      await page.locator('#stage [data-tag-plus]').evaluate(node => node.scrollIntoView({ block:'center', behavior:'instant' }));
-      await page.locator('#stage [data-tag-plus]').click();
-      const menu = page.locator('#stage [data-tag-picker]');
+      // 标签增删收进了「编辑资料」：选择器长在编辑框里。
+      await page.locator('#stage [data-item-edit-open]').click();
+      const editor = page.locator('dialog[data-item-edit-dialog]');
+      await editor.waitFor();
+      await editor.locator('[data-tag-plus]').evaluate(node => node.scrollIntoView({ block:'center', behavior:'instant' }));
+      await editor.locator('[data-tag-plus]').click();
+      const menu = editor.locator('[data-tag-picker]');
       await menu.waitFor({ state:'visible' });
       const scrollbar = await menu.locator('[data-tag-body]').evaluate(node => ({
         hidden:getComputedStyle(node).scrollbarWidth,
@@ -360,12 +365,15 @@ describe('作品详情岛', () => {
     try {
       const page = opened.page;
       let listed = 0;
-      // 桩里的列表行没有续播位置，卡片不给打开键；这里补上停在第一条。
+      // 列表摘要反映成功写入的续播点，关闭后卡片与再次打开都应使用它。
       await page.route((url) => url.pathname === '/api/playlists', (route) => {
         listed += 1;
+        const progress = opened.stub.writes.findLast(write => write.url === '/api/playlist'
+          && write.body.action === 'progress' && write.body.id === PLAYLIST.id);
+        const current = Number(progress?.body.asset_id || PLAYLIST.items[0]);
         return route.fulfill({ json: { items: [{
           id: PLAYLIST.id, name: PLAYLIST.name, item_count: PLAYLIST.items.length,
-          current_asset_id: PLAYLIST.items[0], preview_asset_id: PLAYLIST.items[0],
+          current_asset_id: current, preview_asset_id: current,
         }] } });
       });
       await page.goto(new URL('/playlists', page.url()).toString(), { waitUntil: 'load' });
@@ -375,14 +383,14 @@ describe('作品详情岛', () => {
         await pathIs(page, `/assets/${id}?playlist=${PLAYLIST.id}`);
         await page.locator(`#stage [data-queue-item="${id}"][aria-current="true"]`).waitFor();
       };
-      const enter = async () => {
+      const enter = async (resume: number) => {
         await card.locator('[data-mix-open]').click();
-        await pathIs(page, `/assets/${PLAYLIST.items[0]}?playlist=${PLAYLIST.id}`);
+        await pathIs(page, `/assets/${resume}?playlist=${PLAYLIST.id}`);
         await page.locator(DETAIL_READY).waitFor();
         await step(PLAYLIST.items[1]!);
         await step(PLAYLIST.items[2]!);
       };
-      const closeToList = async () => {
+      const closeToList = async (resume: number) => {
         const before = listed;
         await page.locator('#closeStage').click();
         await pathIs(page, '/playlists');
@@ -391,16 +399,17 @@ describe('作品详情岛', () => {
         assert.equal(await page.locator('#stage[open]').count(), 0);
         for (const deadline = Date.now() + 10_000; listed <= before && Date.now() < deadline;) await page.waitForTimeout(50);
         assert.ok(listed > before, '关掉之后列表页没有重读');
+        await card.locator(`img[src*="id=${resume}&"]`).first().waitFor();
       };
       await card.waitFor({ timeout: 15_000 });
-      await enter();
-      await closeToList();
-      await enter();
+      await enter(PLAYLIST.items[0]!);
+      await closeToList(PLAYLIST.items[2]!);
+      await enter(PLAYLIST.items[2]!);
       await page.goBack();
       await pathIs(page, `/assets/${PLAYLIST.items[1]}?playlist=${PLAYLIST.id}`);
       await page.locator(`#stage [data-queue-item="${PLAYLIST.items[1]}"][aria-current="true"]`).waitFor();
       await page.locator(DETAIL_READY).waitFor();
-      await closeToList();
+      await closeToList(PLAYLIST.items[1]!);
       assert.deepEqual(withoutPlayer(opened.problems), []);
     } finally {
       await opened.close();
@@ -552,27 +561,32 @@ describe('作品详情岛', () => {
     }
   });
 
-  it('标签：删一枚再撤销回来；从选择器新建一枚', { timeout: 60_000 }, async () => {
+  it('编辑资料：侧栏标签只读；框里删一枚、新建一枚，保存时一次交出去', { timeout: 60_000 }, async () => {
     const opened = await openItemPage(browser, `/assets/${ITEM.plain}`, DESKTOP);
     try {
       const page = opened.page;
-      const tag = (name: string) => page.locator(`#detailTags [data-tag="${name}"]`);
-      await page.locator('#detailTags [data-remove-tag="剧情"]').click();
+      assert.equal(await page.locator('#detailTags [data-remove-tag], #detailTags [data-edit-tag], #detailTags #tagPlus').count(), 0,
+        '侧栏的标签还带着增删改键');
+      await page.locator('#stage [data-item-edit-open]').click();
+      const editor = page.locator('dialog[data-item-edit-dialog]');
+      await editor.waitFor();
+      const tag = (name: string) => editor.locator(`[data-detail-tag] [data-tag="${name}"]`);
+      await editor.locator('[data-remove-tag="剧情"]').click();
       await tag('剧情').waitFor({ state: 'detached' });
-      await undo(page);
-      await tag('剧情').waitFor();
-      await page.locator('#tagPlus').click();
-      await page.locator('#tagPicker:not([hidden])').waitFor();
-      await page.locator('#tagPickSearch').fill('新建的标签');
-      await page.locator('#tagPicker [data-pick="新建的标签"]', { hasText: '新建“新建的标签”' }).waitFor();
-      await page.locator('#tagPickSearch').press('Enter');
+      await editor.locator('#tagPlus').click();
+      await editor.locator('#tagPicker:not([hidden])').waitFor();
+      await editor.locator('#tagPickSearch').fill('新建的标签');
+      await editor.locator('#tagPicker [data-pick="新建的标签"]', { hasText: '新建“新建的标签”' }).waitFor();
+      await editor.locator('#tagPickSearch').press('Enter');
       await tag('新建的标签').waitFor();
-      assert.equal(await page.locator('#tagPicker').isHidden(), true, '加完标签选择器没有收起');
-      assert.deepEqual(opened.stub.writes.filter((write) => write.url === '/api/item-tag').map((write) => write.body), [
-        { id: ITEM.plain, operation: 'remove', tag: '剧情' },
-        { id: ITEM.plain, operation: 'add', tag: '剧情' },
-        { id: ITEM.plain, operation: 'add', tag: '新建的标签' },
-      ]);
+      assert.equal(await editor.locator('#tagPicker').isHidden(), true, '加完标签选择器没有收起');
+      assert.equal(await editor.count(), 1, '在选择器里按回车把整个编辑框提交了');
+      assert.deepEqual(opened.stub.writes.filter((write) => write.url === '/api/item-edit'), [], '保存之前就写了');
+      await editor.locator('[data-modal-confirm]').click();
+      await editor.waitFor({ state: 'detached' });
+      const [saved] = opened.stub.writes.filter((write) => write.url === '/api/item-edit').map((write) => write.body);
+      assert.deepEqual(saved?.tags, { add: ['新建的标签'], remove: ['剧情'] });
+      assert.equal(saved?.id, ITEM.plain);
       assert.deepEqual(withoutPlayer(opened.problems), []);
     } finally {
       await opened.close();
@@ -804,20 +818,24 @@ describe('作品详情岛', () => {
     }
   });
 
-  it('取不到这一条：播放器格照 16:9 撑开，重试提示居中，不塌成一条窄条', { timeout: 60_000 }, async () => {
+  it('取不到这一条：整页一屏居中的说明加重试，不塌成一条窄条', { timeout: 60_000 }, async () => {
     const opened = await openItemPage(browser, `/assets/${ITEM.plain}`, DESKTOP);
     try {
       const page = opened.page;
       await page.route((url) => url.pathname === '/api/item', (route) => route.fulfill({ status: 500, json: { error: 'database is locked' } }));
       await page.goto(new URL('/assets/987654', page.url()).toString(), { waitUntil: 'load' });
-      await page.locator('#stage [data-item-placeholder] [data-media-error]').waitFor({ timeout: 15_000 });
+      const failure = page.locator('#stage [data-detail-failure]');
+      await failure.locator('[data-empty-state]').waitFor({ timeout: 15_000 });
+      await failure.getByRole('button', { name: '立即重试', exact: true }).waitFor();
+      assert.equal(await page.locator('#stage [data-media-error]').count(), 0, '整页失败不再在舞台里画红色横条');
       const box = await page.evaluate(() => {
-        const frame = document.querySelector('#stage [data-item-placeholder]')!.getBoundingClientRect();
-        const note = document.querySelector('#stage [data-item-placeholder] [data-media-error]')!.getBoundingClientRect();
-        return { ratio: frame.width / frame.height, offset: Math.abs((note.top + note.bottom) / 2 - (frame.top + frame.bottom) / 2) };
+        const frame = document.querySelector('#stage [data-detail-failure]')!.getBoundingClientRect();
+        const note = document.querySelector('#stage [data-detail-failure] [data-empty-state]')!.getBoundingClientRect();
+        return { height: frame.height, dy: Math.abs((note.top + note.bottom) / 2 - (frame.top + frame.bottom) / 2),
+                 dx: Math.abs((note.left + note.right) / 2 - (frame.left + frame.right) / 2) };
       });
-      assert.ok(Math.abs(box.ratio - 16 / 9) < 0.02, `播放器格不是 16:9：${JSON.stringify(box)}`);
-      assert.ok(box.offset < 2, `提示没有竖直居中：${JSON.stringify(box)}`);
+      assert.ok(box.height >= 260, `失败那一屏塌成了窄条：${JSON.stringify(box)}`);
+      assert.ok(box.dy < 2 && box.dx < 2, `说明没有居中：${JSON.stringify(box)}`);
     } finally {
       await opened.close();
     }

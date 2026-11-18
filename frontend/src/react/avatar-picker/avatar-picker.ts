@@ -4,9 +4,12 @@
  * 手填地址先交给 `/api/avatar-frame`，过了服务端的公网判据、取回来留在缓存里，才变成
  * 一个 `url:` ref；本机文件使用服务端转换后的候选预览，确认时按原字节发出去。 */
 import { ApiError, apiGet, apiSend } from '../../api';
+import { withBackoff } from '../../polling';
 import {
   centeredBox, frameWithin, isUsableSize, type CropBox, type CropSize,
 } from '../../crop-geometry';
+import { quoted, t } from '../../i18n';
+import { serverLabel } from '../../core/server-text';
 
 export const AVATAR_CHOICES_URL = '/api/avatar-choices';
 export const AVATAR_PICK_URL = '/api/avatar-pick';
@@ -24,6 +27,7 @@ export interface AvatarChoice {
   /** 这一格是按哪个名字从图库里找到的。只有一个名字命中时是空串。 */
   found_by: string;
   current: boolean;
+  user_cropped?: boolean;
   /** 这一格必须先框一块再装。作品画面是横图，整张装进圆框只剩一块背景。 */
   crop: boolean;
   /** 框选时可以换的底图，按 ref 给：封面加九宫格那九格。 */
@@ -37,6 +41,14 @@ export interface AvatarChoice {
   /** 封面那张底图的版本。封面会原地替换，预览地址带上它才不显示旧图，交框时回递它，
    *  服务端才认得出框是在哪一张上画的。别的底图不会原地变，是空串。 */
   version: string;
+  /** `label` 里来源名那一段的 code 与参数；空串表示 `label` 本身是内容（图库分类、番号、片名），原样显示。 */
+  label_code?: string;
+  label_params?: Record<string, unknown>;
+  /** 整张作品封面那一格的番号，接在来源名后面。 */
+  cover_code?: string;
+  /** `detail` 的 code 与参数；空串表示 `detail` 是内容（文件名、地址、片名）。 */
+  detail_code?: string;
+  detail_params?: Record<string, unknown>;
 }
 
 export interface AvatarChoices {
@@ -67,6 +79,8 @@ export const baseVersion = (choice: AvatarChoice, ref: string): string =>
 
 export const fetchAvatarChoices = (kind: string, id: number, signal?: AbortSignal) =>
   apiGet<AvatarChoices>(AVATAR_CHOICES_URL + query(kind, id), signal);
+/** 候选索引在后台重建时每秒读一次，建完就停；读失败按连续失败次数退避。 */
+export const choicesInterval = withBackoff<AvatarChoices>((data) => (data?.index_refreshing ? 1000 : false));
 
 /** 按番号取一张封面来框。番号不必在馆藏里：本机没有时服务端去官方渠道取。 */
 export const fetchCodeCover = (code: string) =>
@@ -93,7 +107,7 @@ async function sendBytes<T>(url: string, file: File): Promise<T> {
   const response = await fetch(url, { method: 'POST', credentials: 'same-origin', body: file });
   const payload = await response.json().catch(() => null) as (T & { error?: string }) | null;
   if (response.ok) return payload as T;
-  throw new ApiError(payload?.error || `请求失败（${response.status}）`, response.status, payload);
+  throw new ApiError(payload?.error || t('catalog:avatarPicker.requestFailed', { status: response.status }), response.status, payload);
 }
 
 /** 一张候选按 `aspect` 取景的那一块：有取景区就在它里面取，没有就整张图居中。
@@ -139,61 +153,65 @@ export function pickerNote(name: string, data: AvatarChoices | undefined): strin
   if (!data) return name;
   const elsewhere = data.matched_names.filter((one) => one !== name);
   if (elsewhere.length) {
-    const named = `「${elsewhere.slice(0, NOTE_NAMES).join('」「')}」`;
-    const more = elsewhere.length > NOTE_NAMES ? `等 ${elsewhere.length.toLocaleString()} 个名字` : '';
-    return `${name}：图库里按${named}${more}找到的。`;
+    // 中文引号自带分隔，名字之间不加顿号；英文用逗号隔开。
+    const names = elsewhere.slice(0, NOTE_NAMES).map(quoted).join(t('catalog:avatarPicker.quotedNameSeparator'));
+    return elsewhere.length > NOTE_NAMES
+      ? t('catalog:avatarPicker.foundByNamesMore', { name, names, count: elsewhere.length - NOTE_NAMES, total: elsewhere.length })
+      : t('catalog:avatarPicker.foundByNames', { name, names });
   }
-  return data.choices.length
-    ? `${name}：换上的那张留在本机，随时能换回来。`
-    : `${name}：还没有备选图片，可输入番号、图片地址或从本机选择。`;
+  return data.choices.length ? name : t('catalog:avatarPicker.noChoices', { name });
 }
 
-/** 超过两天按天数说：「124 小时」要人自己去除。 */
-const indexAge = (hours: number): string =>
-  hours < 48 ? `${Math.max(1, Math.round(hours))} 小时` : `${Math.floor(hours / 24)} 天`;
-
-/** 图库索引没取过或已过期、这一次也一张图库图都没拿到时的那句提示；别的情形是空串。
- *  没取过和过期是两回事：过期的索引照样在查，只是新收的人像查不到。 */
+/** 图库索引正在更新或更新失败时的那句提示；别的情形是空串。 */
 export function indexNote(data: AvatarChoices | undefined): string {
-  if (data?.index_refreshing) return '正在更新图库索引，候选图片会自动显示。';
-  if (data?.index_error && data.index_stale) return '图库索引未取得：' + data.index_error;
-  if (!data || !data.index_stale || data.choices.some((one) => one.source === 'gfriends')) return '';
-  return data.index_age_hours === null
-    ? '图库索引还没取过，只能从用过的图里选。'
-    : `图库索引 ${indexAge(data.index_age_hours)}没更新，新收的人像这里还查不到。`;
+  if (data?.index_refreshing) return t('catalog:avatarPicker.indexUpdating');
+  if (data?.index_error && data.index_stale) return t('catalog:avatarPicker.indexFailed', { error: data.index_error });
+  return '';
 }
 
 /** 多人合演的作品：格子上标人数，框选时提醒先找到她自己的脸。 */
 export const sharedCast = (choice: AvatarChoice): boolean => choice.cast > 1;
 
+/** 格子的名字：来源名按 code 取当前语言，再接上「已裁剪」或番号；缺译文时用服务端的原文。 */
+export function choiceLabel(choice: AvatarChoice): string {
+  const source = choice.label_code ? serverLabel(choice.label_code, '', choice.label_params) : '';
+  if (!source) return choice.label;
+  if (choice.user_cropped) return serverLabel('labels.avatarPicker.cropped', choice.label, { label: source });
+  return choice.cover_code ? `${source} ${choice.cover_code}` : source;
+}
+
+/** 格子的说明：代表作画面那句按 code 取当前语言；其余是内容，原样显示。 */
+export const choiceDetailText = (choice: AvatarChoice): string =>
+  choice.detail_code ? serverLabel(choice.detail_code, choice.detail, choice.detail_params) : choice.detail;
+
 export const cropNote = (choice: AvatarChoice): string =>
   sharedCast(choice)
-    ? `${choice.label}：${choice.cast.toLocaleString()} 人合演，先找到她自己的脸，再拖动方框选一块。`
-    : `${choice.label}：拖动方框选一块，滚轮或角上那枚方块改大小。`;
+    ? t('catalog:avatarPicker.cropNoteShared', { label: choiceLabel(choice), count: choice.cast })
+    : t('catalog:avatarPicker.cropNote', { label: choiceLabel(choice), detail: choice.source === 'social' && choice.detail ? ` · ${choiceDetailText(choice)}` : '' });
 
 const SOURCE_LABELS: Record<string, string> = {
-  gfriends: '图库', history: '用过的', asset: '作品画面', code: '番号封面',
-  url: '地址', upload: '本机', social: '社媒头像', online: '在线作品',
+  gfriends: t('catalog:avatarPicker.sourceGallery'), history: t('catalog:avatarPicker.sourceHistory'), asset: t('catalog:avatarPicker.sourceVideoStill'), code: t('catalog:avatarPicker.sourceCodeCover'),
+  url: t('catalog:avatarPicker.sourceUrl'), upload: t('catalog:avatarPicker.sourceUpload'), social: t('catalog:avatarPicker.sourceSocial'), online: t('catalog:shared.onlineVideo'),
 };
 
 /** 底图那一排每一格的名字：封面一格，九宫格九格按位置数。 */
 export function baseLabel(ref: string): string {
   if (ref.startsWith('follow:')) {
     const what = ref.split(':')[2];
-    return what === 'cover' ? '作品封面' : `内容图片 ${Number(what.replace('image', '') || 0) + 1}`;
+    return what === 'cover' ? t('catalog:avatarPicker.videoCover') : t('catalog:avatarPicker.contentImage', { number: Number(what.replace('image', '') || 0) + 1 });
   }
-  if (ref.startsWith('cover:')) return '封面';
+  if (ref.startsWith('cover:')) return t('catalog:shared.cover');
   const what = ref.split(':')[2] || '';
-  if (what === 'cover') return '封面';
+  if (what === 'cover') return t('catalog:shared.cover');
   const cell = Number(what.replace('cell', ''));
-  return Number.isFinite(cell) ? `第 ${cell + 1} 格` : what;
+  return Number.isFinite(cell) ? t('catalog:avatarPicker.gridCell', { number: cell + 1 }) : what;
 }
 
 /** 一格的完整说明，进 `title`：哪儿来的、多大、按谁找到的。作品画面再接上服务端的说明：
  *  片名，账号没有本人身份依据时还有「代表作画面，非本人」。 */
 export const choiceDetail = (choice: AvatarChoice): string =>
-  `${SOURCE_LABELS[choice.source] || choice.source} · ${choice.label}`
+  `${SOURCE_LABELS[choice.source] || choice.source} · ${choiceLabel(choice)}`
   + (choice.width ? ` · ${choice.width}×${choice.height}` : '')
-  + (sharedCast(choice) ? ` · ${choice.cast.toLocaleString()} 人合演` : '')
-  + (choice.found_by ? ` · 按「${choice.found_by}」找到` : '')
-  + (choice.source === 'asset' && choice.detail && choice.detail !== choice.label ? ` · ${choice.detail}` : '');
+  + (sharedCast(choice) ? t('catalog:avatarPicker.castDetail', { count: choice.cast }) : '')
+  + (choice.found_by ? t('catalog:avatarPicker.foundByDetail', { name: choice.found_by }) : '')
+  + (['asset', 'social', 'history'].includes(choice.source) && choice.detail && choice.detail !== choice.label ? ` · ${choiceDetailText(choice)}` : '');

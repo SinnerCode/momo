@@ -20,10 +20,12 @@ import re
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from .fsutil import atomic_write_bytes
 from .http import HttpRequest, HttpTransport
+from .user_messages import UserValueError
 
 #: 图库的 raw 根。索引和图片都挂在它下面。
 GFRIENDS_RAW = "https://raw.githubusercontent.com/gfriends/gfriends/master/"
@@ -107,14 +109,23 @@ def index_revision(cache_dir: Path | None) -> str:
         return "missing"
 
 
+@lru_cache(maxsize=1)
+def _parsed_index(path: Path, identity: tuple[int, int, int, int]) -> dict[str, list[tuple[str, str]]]:
+    """仅保留当前文件身份的解析结果，供匹配端只读复用。"""
+    return parse_filetree(path.read_bytes())
+
+
 def load_index(cache_dir: Path) -> dict[str, list[tuple[str, str]]]:
     """只读本地缓存的索引。取不到或坏了都返回空。
 
     这里从不联网：页面这一侧宁可少列几个候选，也不该在一次点击里同步拉 6 MB。
     缓存由 `fetch_index` 补，服务在后台调它（`avatar_picker.IndexRefresher`）。
+    未变化的本地文件共用解析结果；文件被更新或原子替换后重新解析。
     """
     try:
-        return parse_filetree((cache_dir / INDEX_NAME).read_bytes())
+        path = (cache_dir / INDEX_NAME).resolve()
+        stat = path.stat()
+        return _parsed_index(path, (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino))
     except (OSError, KeyError, TypeError, ValueError):
         return {}
 
@@ -128,9 +139,9 @@ def fetch_index(transport: HttpTransport, cache_dir: Path) -> dict[str, list[tup
     response = transport(HttpRequest("GET", INDEX_URL, {"Accept": "application/json"}),
                          INDEX_TIMEOUT, INDEX_MAX_BYTES)
     if response.status != 200:
-        raise ValueError(f"Gfriends 索引 HTTP {response.status}")
+        raise UserValueError("errors.gfriends.indexHttpStatus", {"status": response.status})
     if len(response.body) > INDEX_MAX_BYTES:
-        raise ValueError("Gfriends 索引超过大小上限")
+        raise UserValueError("errors.gfriends.indexTooLarge")
     index = parse_filetree(response.body)
     atomic_write_bytes(cache_dir / INDEX_NAME, response.body)
     return index

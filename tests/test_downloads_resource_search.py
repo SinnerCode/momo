@@ -135,10 +135,34 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(self.requests[1].url.params["q"], "1234567")
         self.assertEqual(len(result["items"]), 1)
 
+    def test_a_product_code_with_a_trailing_letter_is_searched_and_keeps_its_letter(self):
+        """`DANDY-851C` 这类带尾字母的商品番号能查；不带尾字母的另一部作品照旧筛掉。"""
+        result = self.search(feed(item(title="DANDY-851 1080p"), item(title="DANDY-851C 1080p")), code="DANDY-851C")
+        self.assertEqual([row["name"] for row in result["items"]], ["DANDY-851C 1080p"])
+        self.assertEqual(result["rejected"], {"code": 1})
+
     def test_filters_reject_different_code_zero_seeders_size_and_blocked_hash(self):
         result = self.search(feed(item(title="ABC-124"), item(seeders=0), item(size=1), item()),
                              filters=Filters(min_size=100), blocked=[HASH])
         self.assertEqual(result["items"], [])
+
+    def test_when_nothing_passes_the_filters_the_reasons_are_counted(self):
+        result = self.search(feed(item(title="ABC-124"), item(title="ABC-125"), item(seeders=0), item(size=1)),
+                             filters=Filters(min_size=100))
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["rejected"], {"code": 2, "seeders": 1, "size": 1})
+        self.assertEqual(result["warnings"],
+                         ["索引器返回了 4 条结果，都没通过筛选：番号不符 2 条、体积不在区间 1 条、没有人做种 1 条"])
+        # 那句带 code，列表参数里每段也是带 code 的一句，英文界面按 code 拼出英文（ADR-0159）。
+        from peach import interface_text
+        params = result["warning_params"][0]
+        counts = ", ".join(interface_text.text(f"server:{part['code']}", {
+            **part["params"], "reason": interface_text.text(f"server:{part['params']['reason']['code']}", language="en")},
+            language="en") for part in params["counts"])
+        self.assertEqual(interface_text.text(f"server:{result['warning_codes'][0]}", {**params, "counts": counts},
+                                             language="en"),
+                         "Indexers returned 4 results, but none passed the filters: "
+                         "code mismatch: 2, size out of range: 1, no seeders: 1")
 
     def test_quality_goal_precedes_size_and_only_five_candidates_are_returned(self):
         rows = [item(title=f"ABC-123 1080p {'中字' if at == 6 else ''}",

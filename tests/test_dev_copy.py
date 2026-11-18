@@ -1,4 +1,5 @@
 """改字工具保存源文案与动态模板，冲突与代码路径不能误写。"""
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,14 +9,15 @@ import threading
 import time
 import os
 from peach import dev_copy
+from support.processes import finishes_within, grandchild_alive, hanging_program, kill_grandchild
 
 
 class DevCopyTests(unittest.TestCase):
-    def test_setup_copy_sources_can_be_saved_with_digest_protection(self):
+    def test_python_copy_sources_can_be_saved_with_digest_protection(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             (root / 'src/peach').mkdir(parents=True)
-            for name in ('routes_pages.py', 'onboarding.py', 'media_sources.py'):
+            for name in ('routes_pages.py', 'onboarding.py', 'media_sources.py', 'release_updates.py'):
                 with self.subTest(name=name):
                     path = root / 'src/peach' / name
                     path.write_text("LABEL = '设置说明'", encoding='utf-8')
@@ -24,6 +26,49 @@ class DevCopyTests(unittest.TestCase):
                     self.assertEqual(path.read_text(encoding='utf-8'), "LABEL = '媒体设置说明'")
                     with self.assertRaises(ValueError):
                         dev_copy.save(root, {'original': '设置说明', 'replacement': '无效修改', 'candidate': candidate})
+
+    def test_extracted_copy_is_saved_into_the_source_language_file_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            for language, text in (('zh-CN', '首页'), ('en', 'Home')):
+                (root / 'resources/locales' / language).mkdir(parents=True)
+                (root / 'resources/locales' / language / 'navigation.json').write_text(
+                    '{\n  "sidebar": { "home": "%s" }\n}\n' % text, encoding='utf-8')
+            candidate, = dev_copy.candidates(root, '首页')
+            self.assertEqual(candidate['file'], 'resources/locales/zh-CN/navigation.json')
+            self.assertEqual(dev_copy.candidates(root, 'Home'), [])
+            dev_copy.save(root, {'original': '首页', 'replacement': '主页 "精选"', 'candidate': candidate})
+            saved = json.loads((root / candidate['file']).read_text(encoding='utf-8'))
+            self.assertEqual(saved, {'sidebar': {'home': '主页 "精选"'}})
+
+    def test_interpolated_locale_copy_is_found_by_its_rendered_text_and_keeps_placeholders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / 'resources/locales/zh-CN').mkdir(parents=True)
+            path = root / 'resources/locales/zh-CN/cleanup.json'
+            path.write_text('{\n  "trash": { "count": "{{count}} 项在回收站" }\n}\n', encoding='utf-8')
+            candidate, = dev_copy.candidates(root, '12 项在回收站')
+            self.assertEqual(candidate['template'], '{count} 项在回收站')
+            self.assertEqual(candidate['values'], {'count': '12'})
+            with self.assertRaises(ValueError):
+                dev_copy.save(root, {'original': '12 项在回收站', 'replacement': '回收站里有若干项', 'candidate': candidate})
+            result = dev_copy.save(root, {'original': '12 项在回收站', 'replacement': '回收站里有 {count} 项', 'candidate': candidate})
+            self.assertEqual(result['text'], '回收站里有 12 项')
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8')), {'trash': {'count': '回收站里有 {{count}} 项'}})
+
+    def test_number_formatted_locale_copy_preserves_the_formatter_when_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            path = root / 'resources/locales/zh-CN/cleanup.json'
+            path.parent.mkdir(parents=True)
+            path.write_text('{"selectAll": "全选（{{count, number}} 个）"}', encoding='utf-8')
+            candidate, = dev_copy.candidates(root, '全选（1,234 个）')
+            self.assertEqual(candidate['template'], '全选（{count} 个）')
+            result = dev_copy.save(root, {'original': '全选（1,234 个）',
+                'replacement': '选择全部 {count} 个', 'candidate': candidate})
+            self.assertEqual(result['text'], '选择全部 1,234 个')
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8')),
+                             {'selectAll': '选择全部 {{count, number}} 个'})
 
     def test_status_recovers_from_a_short_read_lock_and_preserves_persistent_denial(self):
         from peach import dev_copy_runtime as runtime
@@ -70,7 +115,7 @@ class DevCopyTests(unittest.TestCase):
             served = root / 'web/dist/peach-app.js'
             served.write_text('有效产物', encoding='utf-8')
             candidate, = dev_copy.candidates(root, '说明')
-            with patch('peach.dev_copy_runtime.subprocess.run', return_value=CompletedProcess([], 1, '', '语法错误')):
+            with patch('peach.dev_copy_runtime.process_job.run', return_value=CompletedProcess([], 1, '', '语法错误')):
                 result = runtime.submit(root, {'original': '说明', 'replacement': '新说明', 'candidate': candidate})
                 self._wait_for_state(runtime, root, 'error')
             self.assertEqual(served.read_text(encoding='utf-8'), '有效产物')
@@ -98,10 +143,20 @@ class DevCopyTests(unittest.TestCase):
                 tray = SimpleNamespace(_action_lock=threading.Lock(), manager=Mock(),
                                        _readiness=lambda: Step('readiness', 'current', '服务已就绪'))
                 gate = TaskGate(blocking=(ActiveRun(1, 'test', 'manual', 'running', os.getpid(), None),)) if blocked else TaskGate()
-                with patch('peach.runtime_prepare.task_gate', return_value=gate):
+                locked_at_terminal = []
+                def recording_write(target, data, write=runtime._write, lock=tray._action_lock, seen=locked_at_terminal):
+                    if data.get('state') in ('ready', 'error'):
+                        seen.append(lock.locked())
+                    return write(target, data)
+                with patch('peach.runtime_prepare.task_gate', return_value=gate), \
+                        patch.object(runtime, '_write', side_effect=recording_write):
                     runtime.poll(tray, root)
                     self._wait_for_state(runtime, root, 'error' if blocked else 'ready')
                 self.assertEqual(tray.manager.restart.call_count, 0 if blocked else 1)
+                if not blocked:
+                    tray.manager.restart.assert_called_once_with(reason='source copy edit built, reloading services')
+                # 终态写盘时托盘动作锁已经释放，看到终态的调用方不会抢在释放之前。
+                self.assertEqual(locked_at_terminal, [False])
                 self.assertFalse(tray._action_lock.locked())
 
     @staticmethod
@@ -126,7 +181,7 @@ class DevCopyTests(unittest.TestCase):
                     (stage / name).write_text('有效产物', encoding='utf-8')
                 self.assertEqual((root / 'web/dist/peach-app.js').read_text(encoding='utf-8'), '现有产物')
                 return CompletedProcess(argv, 0, stdout='构建完成', stderr='')
-            with patch('peach.dev_copy_runtime.subprocess.run', side_effect=build):
+            with patch('peach.dev_copy_runtime.process_job.run', side_effect=build):
                 dev_copy_runtime.build_frontend(root)
             self.assertEqual((root / 'web/dist/peach-app.js').read_text(encoding='utf-8'), '有效产物')
 
@@ -145,12 +200,32 @@ class DevCopyTests(unittest.TestCase):
                     (stage / name).write_text(name, encoding='utf-8')
                 (stage / 'peach-app.stats-page-New11111.js.map').write_text('{}', encoding='utf-8')
                 return CompletedProcess(argv, 0, stdout='构建完成', stderr='')
-            with patch('peach.dev_copy_runtime.subprocess.run', side_effect=build):
+            with patch('peach.dev_copy_runtime.process_job.run', side_effect=build):
                 dev_copy_runtime.build_frontend(root)
             self.assertEqual(sorted(path.name for path in dist.iterdir()),
                              sorted([*dev_copy_runtime.BUNDLES, 'peach-app.stats-page-New11111.js']))
             self.assertEqual((dist / 'peach-app.stats-page-New11111.js').read_text(encoding='utf-8'),
                              'peach-app.stats-page-New11111.js')
+
+    def test_a_build_that_never_returns_is_stopped_and_keeps_the_served_files(self):
+        """npm 再起 node 占着输出管道：到期收掉整棵进程树，按构建失败报，现有产物不动。"""
+        from peach import dev_copy_runtime
+        from peach.user_messages import UserValueError
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as programs:
+            root, programs = Path(tmp).resolve(), Path(programs)
+            self.addCleanup(kill_grandchild, programs)
+            (root / 'web/dist').mkdir(parents=True)
+            (root / 'web/dist/peach-app.js').write_text('现有产物', encoding='utf-8')
+            npm = hanging_program(programs)
+            with patch('peach.dev_copy_runtime.shutil.which', return_value=str(npm)), \
+                    patch.object(dev_copy_runtime, 'BUILD_SECONDS', 2):
+                with self.assertRaisesRegex(UserValueError, 'timed out after 2s'):
+                    finishes_within(lambda: dev_copy_runtime.build_frontend(root), 30)
+            self.assertEqual((root / 'web/dist/peach-app.js').read_text(encoding='utf-8'), '现有产物')
+            deadline = time.monotonic() + 10
+            while grandchild_alive(programs) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertFalse(grandchild_alive(programs), '构建进程树还活着')
 
     def test_processing_template_keeps_live_values_and_validates_placeholders(self):
         with tempfile.TemporaryDirectory() as tmp:

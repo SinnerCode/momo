@@ -18,6 +18,17 @@
 .video-js>video-player>media-container{display:block;width:100%;height:100%;position:absolute;inset:0}
 .video-js :is(hlsjs-video,dash-video){display:contents}
 .video-js .vjs-tech{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.video-js .vjs-tech{touch-action:pan-y pinch-zoom}
+.video-js:is(.vjs-fullscreen,.vjs-full-window,[data-peach-fullscreen]) .vjs-tech,.video-js :fullscreen .vjs-tech,body.vjs-full-window .video-js .vjs-tech{touch-action:none}
+.video-js .vjs-peach-gesture{position:absolute;z-index:5;inset:35% auto auto 50%;transform:translateX(-50%);max-width:90%;width:max-content;padding:12px 16px;border-radius:var(--control-radius);background:rgba(0,0,0,.72);color:#fff;font-size:16px;line-height:1.5;text-align:center;pointer-events:none;font-variant-numeric:tabular-nums}
+.video-js .vjs-peach-gesture[hidden]{display:none}
+.video-js[data-player-input="touch"] .vjs-button{min-width:44px;min-height:44px}
+.video-js[data-player-input="touch"] .vjs-peach-gesture{user-select:none}
+[data-stage-media] .video-js[data-player-input="touch"] .vjs-control-bar{height:63px}
+[data-stage-media] .video-js[data-player-input="touch"] .vjs-control-bar>.vjs-play-control{flex-basis:44px;width:44px;height:44px}
+[data-stage-media] .video-js[data-player-input="touch"] :is(.vjs-peach-right-controls,.vjs-peach-right-controls>.vjs-control){height:44px!important}
+[data-stage-media] .video-js[data-player-input="touch"] .vjs-progress-control{top:-22px;height:28px}
+[data-stage-media] .video-js[data-player-input="touch"] .vjs-progress-control .vjs-progress-holder{height:28px}
 .video-js .vjs-control-bar{display:flex;position:absolute;bottom:0;left:0;width:100%;height:3em;z-index:2}
 .video-js .vjs-picture-in-picture-control[data-peach-pip-supported][hidden]{display:block!important}
 .video-js .vjs-picture-in-picture-control[aria-disabled="true"]{color:rgba(255,255,255,.45);cursor:not-allowed}
@@ -36,7 +47,7 @@
 .video-js.vjs-error .vjs-error-display{display:flex;align-items:center;justify-content:center}
 .video-js.vjs-user-inactive.vjs-playing .vjs-control-bar{opacity:0;pointer-events:none}
 .video-js.vjs-fullscreen{position:fixed!important;inset:0!important;width:100%!important;height:100%!important;max-height:none!important}
-.video-js media-container:fullscreen{width:100vw;height:100vh;background:#000}
+.video-js media-container:is(:fullscreen,:-webkit-full-screen){width:100vw;height:100vh;height:100dvh;background:#000}
 .video-js .vjs-modal-dialog-content{position:absolute}
 .video-js media-slider-value{position:absolute;visibility:hidden}
 .video-js .vjs-volume-panel:hover media-slider-value,.video-js .vjs-volume-panel:focus-within media-slider-value{visibility:visible}
@@ -208,11 +219,14 @@ video.video-js{vertical-align:top;font-size:10px;line-height:1;font-family:Arial
   display:flex;flex-direction:column;align-items:center;pointer-events:none;color:#fff}
 .vjs-peach-seek-preview[hidden]{display:none}
 /* 取景框自己裁，图在里面挪。时间轴预览取回来的是一张 10×10 的接触印相，要看的那一格
-   靠把图放大十倍再往左上推整格数得到；边框和圆角画在框上，图挪动时不跟着走。 */
-.vjs-peach-seek-frame{position:relative;width:240px;aspect-ratio:16/9;display:block;overflow:hidden;
+   靠把图放大十倍再往左上推整格数得到；边框和圆角画在框上，图挪动时不跟着走。
+   框按片源比例（`--seek-aspect`）取景，宽、高各有上限：横片顶到宽，竖片顶到高，竖片不会长成一整列。 */
+.vjs-peach-seek-frame{--seek-max-w:240px;--seek-max-h:180px;position:relative;
+  width:min(var(--seek-max-w),calc(var(--seek-max-h) * var(--seek-aspect,1.7778)));aspect-ratio:var(--seek-aspect,16/9);display:block;overflow:hidden;
   border:2px solid #fff;border-radius:var(--floating-radius);background:#000;box-shadow:0 8px 24px #0009}
 .vjs-peach-seek-frame[hidden]{display:none}
-.vjs-peach-seek-preview img{position:absolute;left:0;top:0;width:100%;height:100%;display:block;object-fit:cover}
+/* 拼图要放大到 10 倍再挪格子，预检的 `img{max-width:100%}` 会把它压回一格宽：两个上限都解开。 */
+.vjs-peach-seek-preview img{position:absolute;left:0;top:0;width:100%;height:100%;max-width:none;max-height:none;display:block;object-fit:cover}
 .vjs-peach-seek-preview span{min-width:58px;margin-top:8px;padding:6px 10px;border-radius:var(--pill-radius);
   background:rgba(0,0,0,.68);font-size:var(--fs-sm);font-weight:600;line-height:1;text-align:center;box-shadow:0 2px 8px #0006}
 [data-stage-media] .video-js .vjs-custom-control-spacer{display:block;flex:1 1 auto}
@@ -355,7 +369,7 @@ video.video-js{vertical-align:top;font-size:10px;line-height:1;font-family:Arial
   [data-stage-media] .video-js.vjs-layout-small .vjs-current-time,[data-stage-media] .video-js.vjs-layout-small .vjs-duration,
   [data-stage-media] .video-js.vjs-layout-small .vjs-time-divider{display:flex}
   [data-stage-media] .video-js .vjs-time-control{font-size:var(--fs-xs)}
-  .vjs-peach-seek-frame{width:160px}
+  .vjs-peach-seek-frame{--seek-max-w:160px;--seek-max-h:120px}
   .vjs-peach-settings-menu{right:-100px;width:min(274px,calc(100vw - 16px));border-radius:var(--floating-radius)}
 }
 /* 窄屏梯度照搬 YouTube delhi-modern：base.js 9470c977 里 `v.width<528` 打开 ytp-xsmall-width-mode，
@@ -401,9 +415,9 @@ video.video-js{vertical-align:top;font-size:10px;line-height:1;font-family:Arial
   display:flex;align-items:center;justify-content:center;text-align:center;overflow-wrap:anywhere;
   transform:translate(-50%,-50%)}
 [data-stage-media] :is([data-stage-media]>.video-js.vjs-fullscreen,.video-js.vjs-fullscreen,.video-js[data-peach-fullscreen],body.vjs-full-window .video-js,.video-js:fullscreen,.video-js:-webkit-full-screen,.video-js:-moz-full-screen,[data-stage-media]:fullscreen>.video-js,[data-stage-media]:-webkit-full-screen>.video-js,[data-stage-media]:-moz-full-screen>.video-js){position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;padding:0!important;
-  max-width:none!important;max-height:none!important;aspect-ratio:auto!important;z-index:10000!important}
+  height:100dvh!important;max-width:none!important;max-height:none!important;aspect-ratio:auto!important;z-index:10000!important}
 [data-stage-media] :is([data-stage-media]>.video-js.vjs-fullscreen,.video-js.vjs-fullscreen,.video-js[data-peach-fullscreen],body.vjs-full-window .video-js,.video-js:fullscreen,.video-js:-webkit-full-screen,.video-js:-moz-full-screen,[data-stage-media]:fullscreen>.video-js,[data-stage-media]:-webkit-full-screen>.video-js,[data-stage-media]:-moz-full-screen>.video-js) .vjs-tech{
-  position:absolute!important;inset:0!important;width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;object-fit:contain!important}
+  position:absolute!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;object-fit:contain!important}
 [data-player-stats-button]{position:absolute;left:11px;top:11px;z-index:8;width:40px;height:40px;padding:0;
   display:grid;place-items:center;border:0;border-radius:50%;
   background:rgba(0,0,0,.6);color:#fff;cursor:pointer;box-shadow:none;isolation:isolate;overflow:hidden}
@@ -465,3 +479,8 @@ video.video-js{vertical-align:top;font-size:10px;line-height:1;font-family:Arial
 [data-player-menu]>span{overflow:hidden;text-overflow:ellipsis}
 [data-player-menu]>[data-player-menu-check]{grid-column:3;justify-self:center;margin:0;width:18px;height:18px;visibility:hidden}
 [data-player-menu][aria-checked="true"]>[data-player-menu-check]{visibility:visible}
+
+/* 临时倍速提示不参与点击，也不改变控制条布局。 */
+.vjs-peach-hold-speed{position:absolute;top:20px;left:50%;transform:translateX(-50%);
+  z-index:10;pointer-events:none;white-space:nowrap;padding:8px 16px;border-radius:var(--pill-radius);
+  background:rgba(0,0,0,.72);color:#fff;font-size:var(--fs-sm);font-weight:600;line-height:1.4}

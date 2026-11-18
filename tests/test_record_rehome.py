@@ -22,6 +22,23 @@ DECLARED = {"local": ("R:\\media",)}
 
 
 class RecordRehomeTests(unittest.TestCase):
+    def test_follow_reference_moves_with_the_asset_and_reverts_with_its_batch(self):
+        self.add_vanished(7, r'R:\media\old\EXM-001.mp4', code='EXM-001', records=False)
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("INSERT INTO asset(id,location,path,name,medium) "
+                               "VALUES(8,'local','new.mp4','new.mp4','video')")
+            connection.execute("INSERT INTO follow_source(id,provider,ref,label,url,created_at,updated_at) "
+                               "VALUES(1,'test','sample','sample','https://example.test/','now','now')")
+            connection.execute("INSERT INTO follow_item(id,source_id,external_id,title,release_key,asset_id,"
+                               "first_seen_at,last_seen_at) VALUES(1,1,'item','item','item',7,'now','now')")
+            baseline = connection.execute('PRAGMA foreign_key_check').fetchall()
+            batch = record_rehome.move(connection, 7, 8, source='test', rule='same-release')
+            self.assertEqual(connection.execute('SELECT asset_id FROM follow_item').fetchall(), [(8,)])
+            self.assertEqual(connection.execute('PRAGMA foreign_key_check').fetchall(), baseline)
+            record_rehome.revert_one(connection, batch)
+            self.assertEqual(connection.execute('SELECT asset_id FROM follow_item').fetchall(), [(7,)])
+            self.assertEqual(connection.execute('PRAGMA foreign_key_check').fetchall(), baseline)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -197,7 +214,7 @@ class RecordRehomeTests(unittest.TestCase):
                 "--db", str(self.db), "--logo-root", str(self.root / "logos"),
                 "--source", record_rehome.AUTO_SOURCE, "--batch", planned[0]["batch"],
                 "--apply", "--backup", str(self.root / "backup.db")]), 0)
-        self.assertIn("'撤回接回': 1", printed.getvalue())
+        self.assertIn("'reverted_rehomes': 1", printed.getvalue())
         self.assertEqual(self.query("SELECT id,disposal,rating FROM asset ORDER BY id"),
                          [(7, "vanished", 4), (new_id, None, None)])
         for table in ("asset_preference", "watch_queue", "playlist_item", "asset_quality_goal",
@@ -317,6 +334,152 @@ class RecordRehomeTests(unittest.TestCase):
                 record_rehome.move(connection, 7, 9, source=record_rehome.MANUAL_SOURCE, rule="manual")
             with self.assertRaisesRegex(ValueError, "已消失"):
                 record_rehome.move(connection, 9, 7, source=record_rehome.MANUAL_SOURCE, rule="manual")
+
+    # 以下：旧行还在库、文件已不在盘上，新文件同番号，登记前把旧行改指过去（ADR-0131）。
+    OLD = "R:\\media\\演员\\FNS-257\\FNS-257.mp4"
+
+    def add_old(self, asset_id=7, path=OLD):
+        """一条在库旧行，盘上没有它的文件；带刮削标签、探测结果与一次播放。"""
+        self.add_live(asset_id, path, code="FNS-257", duration=7208.23)
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute("UPDATE asset SET width=1920,height=1080,play_count=1 WHERE id=?", (asset_id,))
+            connection.execute("INSERT INTO asset_tag(asset_id,tag,source) VALUES(?,'刮削标签','javdb')", (asset_id,))
+            connection.commit()
+
+    def scan_new(self):
+        with redirect_stdout(io.StringIO()):
+            return scan.scan_location(self.db, "local", "R:\\media", declared_roots=DECLARED,
+                                      mounts=self.mounts, windows=False, new_only=True)
+
+    def test_a_renamed_and_reencoded_folder_keeps_its_row(self):
+        """#312：目录改名又换了编码，增量扫描不新建行，标签与播放留在原行，探测列等重探。"""
+        self.add_old()
+        new_path = self.put("演员/FNS-257 新后缀/FNS-257.mp4")
+        result = self.scan_new()
+        self.assertEqual((result.new_ids, result.relocated_ids), ((), (7,)))
+        self.assertEqual(self.query("SELECT id,path,code,duration,width,height,play_count FROM asset"),
+                         [(7, new_path, "FNS-257", None, None, None, 1)])
+        self.assertEqual(self.owner("asset_tag"), [7])
+        self.assertEqual(self.query("SELECT count(*) FROM record_rehome"), [(0,)])
+
+    def test_push_discovery_keeps_the_row_too(self):
+        self.add_old()
+        new_path = self.put("演员/FNS-257 新后缀/FNS-257.mp4")
+        result = self.ingest(new_path)
+        self.assertEqual((result.asset_id, result.new, result.relocated), (7, False, 7))
+        self.assertEqual(self.query("SELECT id,path FROM asset"), [(7, new_path)])
+
+    def test_an_old_file_still_on_disk_is_a_second_copy(self):
+        old_path = self.put("演员/FNS-257/FNS-257.mp4")
+        self.scan_all()
+        new_path = self.put("演员/FNS-257 新后缀/FNS-257.mp4")
+        result = self.scan_new()
+        self.assertEqual(result.relocated_ids, ())
+        self.assertEqual(sorted(row[0] for row in self.query("SELECT path FROM asset")), sorted([old_path, new_path]))
+
+    def test_two_old_rows_with_the_code_are_left_alone(self):
+        self.add_old(7)
+        self.add_old(8, "R:\\media\\演员\\FNS-257 4K\\FNS-257.mp4")
+        new_path = self.put("演员/FNS-257 新后缀/FNS-257.mp4")
+        result = self.scan_new()
+        self.assertEqual(result.relocated_ids, ())
+        self.assertEqual(self.query("SELECT path FROM asset WHERE id IN (7,8) ORDER BY id"),
+                         [(self.OLD,), ("R:\\media\\演员\\FNS-257 4K\\FNS-257.mp4",)])
+        self.assertEqual(len(result.new_ids), 1)
+        self.assertEqual(self.query("SELECT path FROM asset WHERE id=?", (result.new_ids[0],)), [(new_path,)])
+
+    def test_two_new_videos_with_the_code_in_one_folder_are_left_alone(self):
+        self.add_old()
+        self.put("演员/FNS-257 新后缀/FNS-257.mp4")
+        self.put("演员/FNS-257 新后缀/FNS-257.mkv")
+        result = self.scan_new()
+        self.assertEqual((result.relocated_ids, len(result.new_ids)), ((), 2))
+        self.assertEqual(self.query("SELECT path FROM asset WHERE id=7"), [(self.OLD,)])
+
+    def test_an_old_row_under_another_media_folder_is_left_alone(self):
+        """另一个媒体目录可能只是没挂上：它下面的行答「不在」不能作数。"""
+        other = self.root / "other"
+        other.mkdir()
+        self.mounts["local"] = (str(self.media), str(other))
+        self.add_old(path="R:\\other\\FNS-257\\FNS-257.mp4")
+        self.put("演员/FNS-257 新后缀/FNS-257.mp4")
+        declared = {"local": ("R:\\media", "R:\\other")}
+        with redirect_stdout(io.StringIO()):
+            result = scan.scan_location(self.db, "local", "R:\\media", declared_roots=declared,
+                                        mounts=self.mounts, windows=False, new_only=True)
+        self.assertEqual((result.relocated_ids, len(result.new_ids)), ((), 1))
+        self.assertEqual(self.query("SELECT path FROM asset WHERE id=7"), [("R:\\other\\FNS-257\\FNS-257.mp4",)])
+
+
+class CodeSiblingIdentityTests(unittest.TestCase):
+    """同番号副本缺演员、创作者时从已有归属的那一份补上（`code_siblings`）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name).resolve() / "ledger.db"
+        upgrade(self.db, ROOT / "migrations")
+        self.connection = sqlite3.connect(self.db)
+        self.addCleanup(self.connection.close)
+        rows = ((1, r"B:\FC2\FC2-PPV-1666863\FC2-PPV-1666863-CD1.mp4", "FC2-PPV-1666863"),
+                (2, r"B:\FC2\FC2-PPV-1666863\www.98T.la@FC2-1666863-CD1.mp4", "FC2-PPV-1666863"),
+                (3, r"B:\FC2\FC2-PPV-1000000\FC2-PPV-1000000.mp4", "FC2-PPV-1000000"))
+        for asset_id, path, code in rows:
+            self.connection.execute("INSERT INTO asset(id,location,path,name,medium,code) VALUES(?,'115',?,?,'video',?)",
+                                    (asset_id, path, path.rsplit("\\", 1)[1], code))
+        for entity_id, kind, name in ((10, "performer", "大村阿美香"), (20, "creator", "進撃のごろうまる"),
+                                      (30, "creator", "FC2")):
+            self.connection.execute("INSERT INTO entity(id,kind,canonical_name,normalized_name,created_at,updated_at)"
+                                    " VALUES(?,?,?,?,'x','x')", (entity_id, kind, name, name.casefold()))
+        for entity_id, role, source in ((10, "performer", "javinizer:javdb:performer"),
+                                        (20, "creator", "script:fc2-seller@t"), (30, "creator", "legacy:asset")):
+            self.connection.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source) VALUES(1,?,?,?)",
+                                    (entity_id, role, source))
+
+    def links(self, asset_id):
+        return sorted(self.connection.execute(
+            "SELECT entity_id,role FROM asset_entity WHERE asset_id=?", (asset_id,)).fetchall())
+
+    def test_a_copy_takes_cast_and_seller_but_not_the_folder_creator_and_reverts_by_batch(self):
+        from peach import auto_landing_revert, code_siblings
+        result = code_siblings.inherit(self.connection, [2, 3], now="t1")
+        self.assertEqual(self.links(2), [(10, "performer"), (20, "creator")],
+                         "演员与卖家跟着番号走，目录推出的创作者讲的是那个文件夹")
+        self.assertEqual(self.links(3), [])
+        self.assertEqual(self.connection.execute(
+            "SELECT tag FROM asset_tag WHERE asset_id=2").fetchall(), [("performer:大村阿美香",)])
+        self.assertEqual(len(result["links"]), 2)
+        self.assertEqual(code_siblings.inherit(self.connection, [2], now="t2")["links"], [],
+                         "已经有这个角色的不再补")
+        planned = auto_landing_revert.plan(self.connection, code_siblings.SOURCE, result["batch"],
+                                           logo_root=Path(self.tmp.name), cover_root=Path(self.tmp.name), files=False)
+        self.assertEqual(auto_landing_revert.apply(self.connection, planned)["deleted_sibling_links"], 2)
+        self.assertEqual(self.links(2), [])
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM asset_tag WHERE asset_id=2").fetchone()[0], 0)
+
+    def test_a_copy_that_already_has_a_performer_keeps_it(self):
+        from peach import code_siblings
+        self.connection.execute("INSERT INTO entity(id,kind,canonical_name,normalized_name,created_at,updated_at)"
+                                " VALUES(11,'performer','別の人','別の人','x','x')")
+        self.connection.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source) VALUES(2,11,'performer','user:manual')")
+        code_siblings.inherit(self.connection, [2], now="t1")
+        self.assertEqual(self.links(2), [(11, "performer"), (20, "creator")])
+
+    def test_a_whole_library_pass_normalises_each_code_once(self):
+        from unittest import mock
+
+        from peach import code_siblings
+        for asset_id in range(100, 160):
+            path = rf"B:\JAV\ABC-{asset_id}.mp4"
+            self.connection.execute("INSERT INTO asset(id,location,path,name,medium,code) VALUES(?,'115',?,?,'video',?)",
+                                    (asset_id, path, path.rsplit("\\", 1)[1], f"ABC-{asset_id}"))
+        calls = []
+        real = code_siblings.normalise_code_key
+        with mock.patch.object(code_siblings, "normalise_code_key", side_effect=lambda code: calls.append(code) or real(code)):
+            result = code_siblings.inherit(self.connection, now="t1")
+        self.assertEqual(len(calls), 63, "整库只扫一遍番号；逐部去扫全部视频会让升级补修长时间占着写锁")
+        self.assertEqual([(link["asset_id"], link["role"]) for link in result["links"]],
+                         [(2, "performer"), (2, "creator")])
 
 
 if __name__ == "__main__":

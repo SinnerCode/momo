@@ -127,10 +127,8 @@ describe('设计决定：配置控件', () => {
         assert.equal(await original.evaluate((node) => node.isConnected), true);
         assert.match(await surface.evaluate((node) => getComputedStyle(node).transitionDuration), /0.3s/);
         await tabs.getByRole('tab', { name: '添加关注', exact: true }).press('ArrowRight');
-        await tabs.getByRole('tab', { name: '标签管理', selected: true }).waitFor();
-        await tabs.getByRole('tab', { name: '标签管理', exact: true }).press('ArrowRight');
         await tabs.getByRole('tab', { name: '关注列表', selected: true }).waitFor();
-        assert.equal(await tabs.getByRole('tab').count(), 3);
+        assert.equal(await tabs.getByRole('tab').count(), 2);
         assert.equal(await surface.count(), 1);
         await page.emulateMedia({ reducedMotion: 'reduce' });
         assert.equal(await surface.evaluate((node) => getComputedStyle(node).transitionDuration), '0s');
@@ -177,6 +175,8 @@ describe('设计决定：配置控件', () => {
         const pane = await surface.boundingBox();
         assert.ok(selected && pane && Math.abs(selected.x - pane.x) <= 1 && Math.abs(selected.width - pane.width) <= 1);
         await tabs.getByRole('tab', { selected: true }).press('ArrowLeft');
+        await page.waitForURL((url) => url.pathname === '/series');
+        await tabs.getByRole('tab', { name: '系列', selected: true }).press('ArrowLeft');
         await page.waitForURL((url) => url.pathname === '/studios');
         await tabs.getByRole('tab', { name: '厂牌', selected: true }).waitFor();
         await page.emulateMedia({ reducedMotion: 'reduce' });
@@ -263,7 +263,7 @@ describe('设计决定：配置控件', () => {
       } finally { await opened.close(); }
     });
 
-    it(`媒体状态居中，辅助动作与保存有层级，安装教程是单行（${viewport.name}）`, { timeout: 60_000 }, async () => {
+    it(`媒体状态居中，辅助动作与保存有层级，新手教程入口可见（${viewport.name}）`, { timeout: 60_000 }, async () => {
       const opened = await visit(browser, '/settings/library', viewport);
       try {
         const page = opened.page;
@@ -289,10 +289,10 @@ describe('设计决定：配置控件', () => {
         assert.notEqual(await media.getByRole('button', { name: '添加媒体库', exact: true }).evaluate((node) => getComputedStyle(node).backgroundImage),
           await media.getByRole('button', { name: '保存配置', exact: true }).evaluate((node) => getComputedStyle(node).backgroundImage));
         await page.getByRole('tab', { name: '应用与维护', exact: true }).click();
-        const tutorial = page.getByRole('region', { name: '安装教程', exact: true });
+        const tutorial = page.getByRole('region', { name: '新手教程', exact: true });
         await tutorial.waitFor();
         const aligned = await tutorial.evaluate((node) => {
-          const label = [...node.querySelectorAll('p')].find((item) => item.textContent === '安装教程')!.getBoundingClientRect();
+          const label = [...node.querySelectorAll('p')].find((item) => item.textContent === '新手教程')!.parentElement!.getBoundingClientRect();
           const button = node.querySelector('button')!.getBoundingClientRect();
           return { delta: Math.abs(label.top + label.height / 2 - button.top - button.height / 2), gap: button.left - label.right };
         });
@@ -340,7 +340,7 @@ describe('设计决定：配置控件', () => {
 
   it('大量已完成后继可通过键盘展开和收起', { timeout: 60_000 }, async () => {
     const parent = settledRun(1000, 'succeeded', '订阅源拉取');
-    const children = Array.from({ length: 20 }, (_, index) => ({ ...settledRun(index + 1, 'succeeded', '补全资料图片'),
+    const children = Array.from({ length: 20 }, (_, index) => ({ ...settledRun(index + 1, 'succeeded', '资料图片补全'),
       parent_run_id: parent.id, root_run_id: parent.id, followup_key: `entity-avatar:${index}`, followup_depth: 1 }));
     const opened = await openActivity(browser, [parent, ...children]);
     try {

@@ -19,6 +19,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from filelock import FileLock, Timeout
+if str(Path(__file__).resolve().parents[1] / "src") not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from peach.interface_text import dev as t, list_separator, local_language  # noqa: E402
 
 from . import change_impact, test_environment_identity
 
@@ -59,7 +62,7 @@ def manifest(root: Path) -> dict:
             mode = stat.S_IMODE(path.stat().st_mode)
             index_mode = modes.get(name, "100755" if policy and mode & 0o111 else "100644")
             files[name] = [mode, hashlib.sha256(content).hexdigest(), index_mode]
-            if name.endswith(".py") or name in {*change_impact.PACKAGE_FILES, "pyproject.toml"}:
+            if name.endswith(".py") or name in {*change_impact.PACKAGE_FILES, "pyproject.toml", change_impact.REGISTRY}:
                 try:
                     signatures[name] = change_impact.signatures(name, content.decode("utf-8"))
                 except UnicodeError:
@@ -67,7 +70,7 @@ def manifest(root: Path) -> dict:
         elif not path.exists():
             continue
         else:
-            raise ValueError(f"无法为文件生成验证快照：{name}")
+            raise ValueError(t("test_evidence.snapshotFailed", name=name))
     version = root / "src/peach/__init__.py"
     body = version.read_text(encoding="utf-8") if version.is_file() else ""
     body = re.sub(r'(?m)^__version__ = "\d+\.\d+\.\d+"$', '__version__ = "VERSION"', body)
@@ -299,8 +302,8 @@ def valid_manifest(manifest) -> bool:
             return False
     return all(isinstance(name, str) and isinstance(value, dict)
                and all(isinstance(key, str) and (
-                           key == 'scope_entries' and name == 'scripts/test_runner.py'
-                           and change_impact.valid_scope_entries(stamp)
+                           key == 'registry' and name == change_impact.REGISTRY
+                           and change_impact.valid_registry(stamp)
                            or isinstance(stamp, str) and _STATE.fullmatch(stamp))
                        for key, stamp in value.items())
                for name, value in manifest.get('signatures', {}).items())
@@ -390,21 +393,59 @@ def _process_started(pid: int) -> float | None:
         return -1.0
 
 
+def process_alive(note: dict, now: float) -> bool:
+    """记录里的进程还在；同一 pid 被别的进程复用时创建时刻对不上，算已退出。
+
+    `note` 是票或持有记录：`pid`、`created` 与 `process_started`。读不出字段时抛 KeyError、ValueError 或 TypeError。"""
+    pid, created = int(note["pid"]), float(note["created"])
+    started = _process_started(pid)
+    if started is None:
+        return now - created < QUEUE_TICKET_SECONDS
+    recorded = note.get("process_started")
+    return started >= 0 and (not isinstance(recorded, (int, float)) or abs(started - recorded) < 1)
+
+
 def _ticket_alive(path: Path, now: float) -> bool:
-    """票主进程还在就算活票；同一 pid 被别的进程复用时创建时刻对不上，也算死票。"""
+    """票主进程还在就算活票。"""
     try:
-        ticket = json.loads(path.read_text(encoding="utf-8"))
-        pid, created = int(ticket["pid"]), float(ticket["created"])
+        return process_alive(json.loads(path.read_text(encoding="utf-8")), now)
     except FileNotFoundError:
         return False
     except (OSError, ValueError, KeyError, TypeError):
         # 写到一半或正被别的进程读写：先当它还在，下一轮再看。
         return True
-    started = _process_started(pid)
-    if started is None:
-        return now - created < QUEUE_TICKET_SECONDS
-    recorded = ticket.get("process_started")
-    return started >= 0 and (not isinstance(recorded, (int, float)) or abs(started - recorded) < 1)
+
+
+def take_ticket(lock_path: Path, **note: object) -> Path:
+    """在 `<锁>.queue/` 里放一张以纳秒时刻开头的排队票，返回票的路径。"""
+    queue = queue_path(lock_path)
+    ticket = queue / f"{time.time_ns():020d}-{os.getpid()}-{uuid.uuid4().hex[:8]}.json"
+    pending = ticket.with_suffix(".tmp")
+    content = json.dumps({"pid": os.getpid(), "created": time.time(),
+                          "process_started": _process_started(os.getpid()),
+                          "started_at": time.strftime("%Y-%m-%d %H:%M:%S"), **note},
+                         ensure_ascii=False, default=str)
+    for attempt in range(3):
+        # 队列空了的那一刻，撤票的人会顺手删掉目录；碰上就重建再写。
+        queue.mkdir(parents=True, exist_ok=True)
+        try:
+            pending.write_text(content, encoding="utf-8")
+            pending.replace(ticket)
+            break
+        except FileNotFoundError:
+            if attempt == 2:
+                raise
+    return ticket
+
+
+def drop_ticket(ticket: Path) -> None:
+    """撤票；队列空了顺手删掉目录。"""
+    ticket.unlink(missing_ok=True)
+    try:
+        ticket.parent.rmdir()
+    except OSError:
+        # 还有别人在排队，目录留给他们。
+        pass
 
 
 def tickets_ahead(lock_path: Path, mine: str) -> list[Path]:
@@ -434,23 +475,7 @@ def held(lock_path: Path, *, wait_seconds: float = 0, **note: object):
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = FileLock(lock_path)
-    queue = queue_path(lock_path)
-    ticket = queue / f"{time.time_ns():020d}-{os.getpid()}-{uuid.uuid4().hex[:8]}.json"
-    pending = ticket.with_suffix(".tmp")
-    content = json.dumps({"pid": os.getpid(), "created": time.time(),
-                          "process_started": _process_started(os.getpid()),
-                          "started_at": time.strftime("%Y-%m-%d %H:%M:%S"), **note},
-                         ensure_ascii=False, default=str)
-    for attempt in range(3):
-        # 队列空了的那一刻，撤票的人会顺手删掉目录；碰上就重建再写。
-        queue.mkdir(parents=True, exist_ok=True)
-        try:
-            pending.write_text(content, encoding="utf-8")
-            pending.replace(ticket)
-            break
-        except FileNotFoundError:
-            if attempt == 2:
-                raise
+    ticket = take_ticket(lock_path, **note)
     deadline = time.monotonic() + max(wait_seconds, 0)
     announced = None
     try:
@@ -466,17 +491,13 @@ def held(lock_path: Path, *, wait_seconds: float = 0, **note: object):
                 raise Timeout(str(lock_path))
             if announced != len(ahead):
                 announced = len(ahead)
-                place = f"；前面还有 {announced} 个在排队" if announced else ""
-                print(f"等待 {lock_path.name}（{describe_holder(lock_path)}{place}），最长 {wait_seconds:g} 秒。",
-                      file=sys.stderr, flush=True)
+                place = t("test_evidence.queueAhead", count=announced) if announced else ""
+                limit = t("test_evidence.waitLimit", seconds=f"{wait_seconds:g}") if math.isfinite(wait_seconds)                     else t("test_evidence.waitQueued")
+                print(t("test_evidence.waiting", lock=lock_path.name, holder=describe_holder(lock_path), place=place,
+                        limit=limit), file=sys.stderr, flush=True)
             time.sleep(min(QUEUE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
     finally:
-        ticket.unlink(missing_ok=True)
-        try:
-            queue.rmdir()
-        except OSError:
-            # 还有别人在排队，目录留给他们。
-            pass
+        drop_ticket(ticket)
     try:
         record = holder_path(lock_path)
         record_lock = FileLock(record.with_suffix(".lock"), timeout=5)
@@ -502,12 +523,12 @@ def describe_holder(lock_path: Path) -> str:
         with FileLock(record.with_suffix(".lock"), timeout=1):
             note = json.loads(record.read_text(encoding="utf-8"))
     except Timeout:
-        return "持有者信息暂未取得"
+        return t("test_evidence.holderUnknown")
     except (OSError, ValueError):
-        return "持有者刚退出或没留记录"
-    parts = [f"pid {note.get('pid')}", f"{note.get('started_at')} 起"]
+        return t("test_evidence.holderGone")
+    parts = [f"pid {note.get('pid')}", t("test_evidence.holderSince", time=note.get('started_at'))]
     parts.extend(f"{key} {note[key]}" for key in ("scope", "branch", "root") if note.get(key))
-    return "、".join(parts)
+    return list_separator(local_language()).join(parts)
 
 
 def run_lock(repo: Path, state: str, **note: object):

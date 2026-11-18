@@ -2,7 +2,7 @@ import { act } from 'react';
 import { QueryClientProvider, notifyManager } from '@tanstack/react-query';
 import { afterEach, expect, it, vi } from 'vitest';
 import { queryClient } from '../../src/react/query';
-import { WantMagnets, type MagnetCandidate } from '../../src/react/wants/want-magnets';
+import { WantMagnets, type MagnetCandidate, type MagnetResult } from '../../src/react/wants/want-magnets';
 import type { Want } from '../../src/react/wants/wants';
 import { WANTS_KEY, type WantsData } from '../../src/react/wants/wants';
 import { buttonNamed, click, mount, mountRoot, pending, settle } from './render';
@@ -13,16 +13,16 @@ notifyManager.setScheduler((notify) => notify());
 afterEach(() => { queryClient.clear(); localStorage.clear() });
 const candidate: MagnetCandidate = {
   id: 'magnet:abc', protocol: 'magnet', info_hash: 'abc', uri: 'magnet:?xt=urn:btih:abc',
-  name: 'DEMO-001 HD', size: '4 GB', files: '2 個文件', date: '2026-10-01', attributes: ['字幕', '高清'],
+  name: 'DEMO-001 HD', size: '4 GB', files: '2 個文件', date: '2026-10-01', attributes: ['字幕', 'chinese-subtitles', 'high-definition'],
   source: 'JavDB', source_url: 'https://javdb.com/v/demo', origins: ['https://javdb.com/v/demo'],
 };
-async function open(items = [candidate], readOnly = false, ok = true) {
+async function open(items = [candidate], readOnly = false, ok = true, result: Partial<MagnetResult> = {}) {
   vi.stubGlobal('IntersectionObserver', undefined);
   const toast = vi.fn();
   const fetcher = vi.fn(async (_url: string, init?: RequestInit) => ({ ok: true, status: 200,
     json: async () => init?.method === 'POST'
       ? { ok, outcome: ok ? 'submitted' : 'failed', task: { failure_detail: '远端拒绝' } }
-      : { state: 'ready', items, error: '', checked_at: null },
+      : { state: 'ready', items, error: '', checked_at: null, ...result },
   }));
   vi.stubGlobal('fetch', fetcher);
   const host = await mount(<QueryClientProvider client={queryClient}>
@@ -36,8 +36,8 @@ async function open(items = [candidate], readOnly = false, ok = true) {
 it('自动查询，展示来源、大小、日期与属性，直接添加到选定的云下载目录', async () => {
   const { host, fetcher, toast } = await open();
   expect(fetcher.mock.calls[0]?.[0]).toBe('/api/wants/magnets?id=1');
-  for (const text of ['4 GB', '2 个文件', '2026-10-01', '字幕', 'JavDB']) expect(host.textContent).toContain(text);
-  expect(host.querySelector('[data-resource-facts]')?.textContent).not.toContain('高清');
+  for (const text of ['4 GB', '2 个文件', '2026-10-01', '字幕', '中字', 'JavDB']) expect(host.textContent).toContain(text);
+  expect(host.querySelector('[data-resource-facts]')?.textContent).not.toContain('high-definition');
   expect([...host.querySelectorAll('[data-resource-actions] button, [data-resource-actions] a')].map(node => node.textContent)).toEqual(['链接来源', '复制链接', '添加下载']);
   await click(buttonNamed('添加下载', host));
   await settle();
@@ -83,6 +83,44 @@ it('只读时禁止提交，远端失败留在卡片并保留重试', async () =
   expect(writer.toast).not.toHaveBeenCalled();
 });
 
+it('来源查询失败显示红色回执和站标，并保留其他来源取得的资源', async () => {
+  const { host } = await open([candidate], false, true, {
+    state: 'error', error: 'partial sources', error_code: 'labels.magnetChain.incomplete',
+    warnings: ['JavDB：未取得'], warning_codes: ['labels.magnetChain.sourceUnfetched'],
+    warning_params: [{ source: 'JavDB' }],
+  });
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain('JavDB：查询未完成');
+  expect(host.querySelectorAll('[role="alert"]')).toHaveLength(1);
+  expect(host.querySelector('[role="alert"] img')?.getAttribute('src')).toBe('/site-mark?source=javdb');
+  expect(host.querySelector('[data-resource-title]')?.textContent).toBe(candidate.name);
+  expect(buttonNamed('重新查询', host)).not.toBeNull();
+});
+
+it('取得的来源页按地址去重，显示站名及对应 favicon', async () => {
+  const javbus = { ...candidate, id: 'javbus', source: 'JavBus', source_url: 'https://www.javbus.com/DEMO-001' };
+  const sukebei = { ...candidate, id: 'sukebei', source: 'sukebei', source_url: 'https://sukebei.nyaa.si/view/123' };
+  const { host } = await open([candidate, javbus, sukebei, { ...javbus, id: 'javbus-2' }], false, true,
+    { source_url: candidate.source_url });
+  const pages = [...host.querySelectorAll<HTMLAnchorElement>('[data-want-magnets] > div > a[data-button-link]')];
+  expect(pages.map(link => link.textContent)).toEqual(['JavDB', 'JavBus', 'sukebei']);
+  expect(pages.map(link => link.getAttribute('href'))).toEqual([candidate.source_url, javbus.source_url, sukebei.source_url]);
+  expect(pages.map(link => link.querySelector('img')?.getAttribute('src')))
+    .toEqual(['/site-mark?source=javdb', '/site-mark?source=javbus', '/site-mark?source=sukebei']);
+  expect([...host.querySelectorAll('[data-resource-facts] img')].map(img => img.getAttribute('src')))
+    .toEqual(['/site-mark?source=javdb', '/site-mark?source=javbus', '/site-mark?source=sukebei', '/site-mark?source=javbus']);
+});
+
+it('查询成功且没有磁链时显示普通空结果', async () => {
+  const { host } = await open([]);
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+  expect(host.querySelector('[role="note"]')?.textContent).toContain('暂未找到资源链接');
+});
+
+it('资源接口的其他失败仍显示错误回执', async () => {
+  const { host } = await open([], false, true, { state: 'error', error: '资源接口不可用' });
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain('资源接口不可用');
+});
+
 it('更多资源默认折叠且协议有独立标记', async () => {
   const { host } = await open(Array.from({ length: 8 }, (_, index) => ({ ...candidate, id: String(index) })));
   const more = host.querySelector('details')!;
@@ -101,6 +139,11 @@ it('待找清单查询多个来源，不采用快速添加的单来源持久缓�
   expect(host.textContent).toContain('sukebei');
 });
 
+it('来源没给大小时整行照常展示，提示里不出现缺值', async () => {
+  const { host } = await open([{ ...candidate, size: undefined as unknown as string }]);
+  expect(host.querySelector('[data-resource-facts]')?.textContent).toContain('大小未知');
+  expect([...host.querySelectorAll('[title]')].map(node => node.getAttribute('title')).join('|')).not.toContain('undefined');
+});
 it('ED2K 类型使用文字，字节容量按馆藏口径展示', async () => {
   const { host } = await open([{ ...candidate, protocol: 'ed2k', size: '27,311,519,717 B' }]);
   expect(host.textContent).toContain('ED2K');
@@ -141,7 +184,7 @@ it('资源缓存只接受可展示的字段和完整查询结果', () => {
   const saved = Date.now();
   const result = { state: 'ready', items: [candidate], error: '', checked_at: null };
   const { protocol: _protocol, attributes: _attributes, ...incomplete } = candidate;
-  localStorage.setItem('peach.want-resources.v2', JSON.stringify([
+  localStorage.setItem('peach.want-resources.v3', JSON.stringify([
     { code: 'DEMO-001', saved, result: { ...result, items: [{ ...incomplete, size: 1024 }] } },
     { code: 'DEMO-002', saved, result: { ...result, items: [], warnings: ['来源未取得'] } },
     { code: 'DEMO-003', saved, result },
@@ -153,7 +196,7 @@ it('资源缓存只接受可展示的字段和完整查询结果', () => {
 
 it('资源查询不复用其他规则版本的持久缓存', () => {
   const result = { state: 'ready' as const, items: [candidate], error: '', checked_at: null };
-  localStorage.setItem('peach.want-resources.v1', JSON.stringify([{ code: 'DEMO-001', saved: Date.now(), result }]));
+  localStorage.setItem('peach.want-resources.v2', JSON.stringify([{ code: 'DEMO-001', saved: Date.now(), result }]));
   expect(cachedResources('DEMO-001', null)).toBeUndefined();
   rememberResources('DEMO-001', result);
   expect(cachedResources('DEMO-001', null)?.result.items).toEqual([candidate]);
@@ -207,7 +250,7 @@ it('过期的内存缓存随卡片进入视口重新查询', async () => {
 });
 
 it('已取得磁链更新清单筛选状态，ED2K 不计作磁链', async () => {
-  queryClient.setQueryData<WantsData>(WANTS_KEY, { items: [{ id: 1 } as Want], counts: {} as WantsData['counts'], scraping: false });
+  queryClient.setQueryData<WantsData>(WANTS_KEY, { items: [{ id: 1 } as Want], counts: {} as WantsData['counts'], scraping: false, searching: false });
   await open();
   expect(queryClient.getQueryData<WantsData>(WANTS_KEY)?.items[0]?.has_magnets).toBe(true);
   queryClient.removeQueries({ queryKey: ['want-magnets'] });

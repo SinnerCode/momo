@@ -33,14 +33,14 @@ describe('设计决定：设置、口味、统计与筛选玻璃', () => {
       await page.reload({ waitUntil: 'load' });
       await page.getByRole('tab', { name: /使用空间/ }).click();
       const panel = page.locator('[role="tabpanel"]').first();
-      await panel.locator('[role="progressbar"]').first().waitFor({ state: 'visible', timeout: 15_000 });
+      await panel.locator('[role="meter"]').first().waitFor({ state: 'visible', timeout: 15_000 });
       await settle(page);
       const shown = await panel.evaluate((element) => {
         const card = element.firstElementChild!;
         const cardBox = card.getBoundingClientRect();
         const detail = card.lastElementChild!.getBoundingClientRect();
         return {
-          filled: [...element.querySelectorAll('[role="progressbar"]')].map((bar) =>
+          filled: [...element.querySelectorAll('[role="meter"]')].map((bar) =>
             Math.round(bar.querySelectorAll('rect')[1]!.getBoundingClientRect().width / bar.getBoundingClientRect().width * 100)),
           rows: [...element.querySelectorAll('article')].map((row) => getComputedStyle(row).borderBottomWidth),
           overflow: detail.right - (cardBox.right - parseFloat(getComputedStyle(card).paddingRight)),
@@ -587,6 +587,31 @@ describe('设计决定：设置、口味、统计与筛选玻璃', () => {
       assert.deepEqual(opened.problems, []);
     } finally {
       await opened.close();
+    }
+  });
+
+  it('导航顺序两张卡片的内容与卡片四边留出同样的内边距', { timeout: 60_000 }, async () => {
+    for (const viewport of [DESKTOP, MOBILE]) {
+      const opened = await openHome(browser, viewport);
+      const { page } = opened;
+      try {
+        await openPanel(page);
+        const block = page.locator(`${PANEL} [data-setting-block]:has(#sidebarOrderTitle)`);
+        await block.waitFor({ state: 'visible', timeout: 10_000 });
+        // 量的是卡片里实际内容的外包框，不是包裹层：包裹层自己的内边距算在框里，量出来就是 0。
+        const insets = await block.evaluate((node) => [...node.querySelectorAll('[data-setting-card]')].map((card) => {
+          const content = document.createRange();
+          content.selectNodeContents(card.firstElementChild!);
+          const outer = card.getBoundingClientRect(), inner = content.getBoundingClientRect();
+          return [inner.top - outer.top, outer.right - inner.right, outer.bottom - inner.bottom, inner.left - outer.left]
+            .map(Math.round);
+        }));
+        assert.equal(insets.length, 2);
+        assert.deepEqual(insets[1], insets[0], `${viewport.name}：两张卡片的内边距不一致`);
+        for (const side of insets[1]) assert.ok(side >= 8, `${viewport.name}：内容贴着卡片边缘 ${JSON.stringify(insets)}`);
+      } finally {
+        await opened.close();
+      }
     }
   });
 

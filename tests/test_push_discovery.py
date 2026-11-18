@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
@@ -16,7 +17,7 @@ import threading
 import time
 import tomllib
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
@@ -41,6 +42,47 @@ def _wait_for(check, timeout=15.0, interval=0.05):
             return found
         time.sleep(interval)
     return check()
+
+
+@contextmanager
+def _hung_mount(root: Path):
+    """`root` 下的路径在本进程里一碰就卡住，像挂死的网盘挂载；读取子进程看不到这层替身。"""
+    release = threading.Event()
+    prefix = os.path.normcase(str(root))
+
+    def hang(real):
+        def call(path, *args, **kwargs):
+            try:
+                touched = os.path.normcase(os.fsdecode(os.fspath(path))).startswith(prefix)
+            except TypeError:
+                touched = False
+            if touched:
+                release.wait(60)
+            return real(path, *args, **kwargs)
+        return call
+    with mock.patch.object(os, "stat", hang(os.stat)), mock.patch.object(os, "scandir", hang(os.scandir)), \
+            mock.patch.object(os.path, "isdir", hang(os.path.isdir)), \
+            mock.patch.object(os.path, "exists", hang(os.path.exists)), \
+            mock.patch.object(os.path, "isfile", hang(os.path.isfile)):
+        try:
+            yield
+        finally:
+            release.set()
+
+
+def _within(function, timeout=15.0):
+    """在另一个线程里跑 `function`，`timeout` 秒内跑完返回 `(True, 结果或异常)`。"""
+    outcome = {}
+
+    def run():
+        try:
+            outcome["value"] = function()
+        except Exception as error:
+            outcome["value"] = error
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return not worker.is_alive(), outcome.get("value")
 
 
 class CloudPathTests(unittest.TestCase):
@@ -196,6 +238,32 @@ class IgnoreAndSourceTests(unittest.TestCase):
                 self.assertTrue(push.ignored(name))
         self.assertFalse(push.ignored("正片.mp4"))
 
+    def test_system_directories_are_ignored_before_names_are_encoded(self):
+        for path in (r'R:\media\@eaDir\video.mp4@SynoEAStream',
+                     '/media/@snapshot/nested/video.mp4', r'R:\media\#RECYCLE\video.mp4',
+                     'R:\\media\\@eaDir\\broken\udcff.mp4@SynoEAStream',
+                     r'R:\media\video.mp4@SynoEAStream',
+                     '/vol1/1000/Movies/.@#local/trash/movie.mp4',
+                     '/vol1/@team/Movies/.@#local/trash/movie.mp4'):
+            with self.subTest(path=ascii(path)):
+                self.assertTrue(push.ignored(path))
+        self.assertFalse(push.ignored(r'R:\media\scene@home\video.mp4'))
+
+    def test_metadata_patterns_do_not_hide_unrelated_media_names(self):
+        from peach.discovery_rules import system_directory
+        for name in ('._movie.mp4', '.SYNOPPSDB123', '.wfm_upload123', 'Icon\r'):
+            with self.subTest(name=repr(name)):
+                self.assertTrue(push.ignored(str(PureWindowsPath(r'R:\media', name))))
+        for name in ('@creator', 'normal', '@eaDir-old', '#recycle-old', '.snapshot-old',
+                     'Snapshots', 'Recycle Bin', 'Temporary Items', '.Trash-', '.Trash-1000-old',
+                     '.Trash-user', '.Trash-١٠٠٠', '.snapshots-old', '.TemporaryItems-old',
+                     '.@#local-old', '@appshare', '.DocumentRevisions-V100-old', '.DocumentRevisions-V100-bad-x'):
+            with self.subTest(directory=name):
+                self.assertFalse(system_directory(name))
+                self.assertFalse(push.ignored(str(PureWindowsPath(r'R:\media', name, 'movie.mp4'))))
+        for name in ('.hidden.mp4', '@movie.mp4', 'movie_qtmp_scene.mp4', 'Icon.mp4', 'Thumbs.db.mp4'):
+            self.assertFalse(push.ignored(str(PureWindowsPath(r'R:\media', name))), name)
+
     def test_only_loopback_and_private_addresses_are_accepted(self):
         # 局域网那一档用 RFC 5737 的文档网段举例：`ipaddress` 把它判成 private，
         # 正是 `allowed_source` 看的那一位，写谁家的真实网段都不必要（`test_repo_hygiene`）。
@@ -253,6 +321,23 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.queue.snapshot()["missing"], 1)
         self.assertEqual(self.queue.snapshot()["pending"], 0)
 
+    def test_a_probe_that_cannot_answer_keeps_the_file_queued(self):
+        """读超时不等于文件没了：过一个静置窗口再测，答上了照常登记。"""
+        answers = [TimeoutError("stat timed out"), 10, 10]
+
+        def probe(_location, _path):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        queue = push.DiscoveryQueue(self._ingest, probe, debounce=5.0, settle=4.0, timeout=100.0)
+        queue.submit("local", "p", 0.0)
+        queue.tick(5.0)
+        self.assertEqual((queue.snapshot()["pending"], queue.snapshot()["missing"]), (1, 0))
+        queue.tick(9.0)
+        queue.tick(13.0)
+        self.assertEqual(self.ingested, ["p"])
+
     def test_an_event_storm_beyond_the_ceiling_is_counted_not_queued(self):
         for index in range(5):
             self.queue.submit("local", f"p{index}", 0.0)
@@ -272,7 +357,7 @@ class QueueTests(unittest.TestCase):
 
     def test_one_failing_path_does_not_take_the_queue_down(self):
         def boom(_location, _path):
-            raise OSError("数据库忙")
+            raise OSError("database is locked")
 
         queue = push.DiscoveryQueue(boom, lambda _location, _path: 1,
                                     debounce=0.0, settle=0.0)
@@ -280,9 +365,70 @@ class QueueTests(unittest.TestCase):
         queue.tick(0.0)
         with self.assertLogs("peach.push_discovery", level="ERROR") as captured:
             queue.tick(0.0)
-        self.assertIn("数据库忙", "\n".join(captured.output))
+        self.assertIn("database is locked", "\n".join(captured.output))
         self.assertEqual(queue.snapshot()["failed"], 1)
-        self.assertIn("数据库忙", queue.snapshot()["last_error"])
+        self.assertIn("database is locked", queue.snapshot()["last_error"])
+
+
+class JournalTests(unittest.TestCase):
+    """收下的待办落盘：进程重启后原样放回队列，从头去抖。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.journal = Path(tmp.name) / push.PENDING_FILENAME
+        self.sizes: dict[str, int] = {}
+        self.ingested: list[tuple] = []
+
+    def queue(self):
+        return push.DiscoveryQueue(
+            lambda location, path, move_from=None: self.ingested.append((location, path, move_from)) or True,
+            lambda _location, path: self.sizes.get(path),
+            debounce=5.0, settle=4.0, journal=self.journal)
+
+    def test_pending_paths_survive_a_restart_and_are_registered_by_the_next_process(self):
+        first = self.queue()
+        first.submit("local", "a.mp4", 0.0)
+        first.submit("local", "new.mp4", 0.0, move_from="old.mp4")
+        first.flush()
+
+        second = self.queue()
+        self.assertEqual(second.restore(1000.0), 2)
+        self.assertEqual(second.snapshot()["pending"], 2)
+        self.sizes.update({"a.mp4": 1, "new.mp4": 2})
+        second.tick(1004.0)
+        self.assertEqual(self.ingested, [], "放回来的从头去抖，不沿用上一个进程的时刻")
+        second.tick(1005.0)
+        second.tick(1009.0)
+        self.assertEqual(sorted(self.ingested), [("local", "a.mp4", None), ("local", "new.mp4", "old.mp4")])
+
+    def test_an_emptied_queue_leaves_no_journal_behind(self):
+        queue = self.queue()
+        queue.submit("local", "a.mp4", 0.0)
+        queue.flush()
+        self.assertTrue(self.journal.is_file())
+        self.sizes["a.mp4"] = 1
+        queue.tick(5.0)
+        queue.tick(9.0)
+        queue.flush()
+        self.assertFalse(self.journal.exists())
+
+    def test_a_storm_rewrites_the_journal_at_most_once_per_interval(self):
+        queue = self.queue()
+        queue.submit("local", "a.mp4", 0.0)
+        with mock.patch.object(push, "atomic_write_text", wraps=push.atomic_write_text) as written:
+            queue.flush(10.0)
+            for index in range(50):
+                queue.submit("local", f"p{index}.mp4", 10.0)
+            with queue._lock:
+                due = queue._flush_due(10.5)
+        self.assertEqual(written.call_count, 1)
+        self.assertEqual(due, 10.0 + push.JOURNAL_SECONDS)
+
+    def test_an_unreadable_journal_is_skipped_not_fatal(self):
+        self.journal.write_text("{坏的", encoding="utf-8")
+        with self.assertLogs("peach.push_discovery", level="WARNING"):
+            self.assertEqual(self.queue().restore(0.0), 0)
 
 
 class SecretTests(unittest.TestCase):
@@ -349,6 +495,43 @@ class _ServiceCase(unittest.TestCase):
 
 
 class IngestPathTests(_ServiceCase):
+    def test_system_files_never_enter_any_push_registration_path(self):
+        service = self.service()
+        path = self.ledger('local', '@eaDir', 'broken\udcff.mp4@SynoEAStream')
+        with mock.patch.object(service.queue, 'submit') as submit, \
+                mock.patch.object(service, '_ingest') as ingest:
+            self.assertFalse(service.submit('local', path))
+            service.submit_move('local', self.ledger('local', 'old.mp4'), path)
+            service.submit_move('local', path, self.ledger('local', '@eaDir'), directory=True)
+            self.assertFalse(service.ingest_now('local', path))
+        submit.assert_not_called()
+        ingest.assert_not_called()
+
+    def test_direct_ingest_does_not_register_system_directory_contents(self):
+        file = self.media / '@eaDir/video.mp4@SynoEAStream'
+        file.parent.mkdir()
+        file.write_bytes(b'metadata')
+        result = scan.ingest_path(self.db, 'local', self.ledger('local', '@eaDir', file.name),
+                                  declared_roots=self.declared, mounts=self.mounts)
+        self.assertTrue(result.sidecar)
+        self.assertEqual(self.rows(), {})
+
+    def test_nas_metadata_is_rejected_by_create_move_and_immediate_ingest(self):
+        service = self.service()
+        for parts in (('@Recently-Snapshot', 'movie.mp4'), ('.AppleDouble', 'movie.mp4'),
+                      ('.zfs', 'snapshot', 'movie.mp4'), ('$Recycle.Bin', 'movie.mp4'),
+                      ('._movie.mp4',), ('desktop.ini',), ('@eaDir',), ('.Trash-1000',),
+                      ('.snapshots',), ('.TemporaryItems',), ('.@#local',),
+                      ('.@#local', 'trash', 'movie.mp4')):
+            path = self.ledger('local', *parts)
+            with self.subTest(parts=parts), mock.patch.object(service.queue, 'submit') as submit, \
+                    mock.patch.object(service, '_ingest') as ingest:
+                self.assertFalse(service.submit('local', path))
+                service.submit_move('local', self.ledger('local', 'old.mp4'), path)
+                self.assertFalse(service.ingest_now('local', path))
+                submit.assert_not_called()
+                ingest.assert_not_called()
+
     def test_move_event_keeps_upgrade_existing_asset_without_an_identity_cache(self):
         from contextlib import closing
         old = self.media / 'old.mp4'
@@ -382,6 +565,28 @@ class IngestPathTests(_ServiceCase):
         (self.cloud / 'cloud.mp4').write_bytes(b'cloud video')
         arrival = scan.ingest_path(self.db, '115', self.ledger('115', 'cloud.mp4'), **options)
         self.assertEqual(pending(self.db), [arrival.asset_id])
+
+    def test_a_new_video_from_the_queue_leaves_one_ingest_notice(self):
+        """推送队列登记的新影片记一条入库通知；同一路径再来、图片、云下载落地与同番号云下载都不记。"""
+        from contextlib import closing
+
+        from peach.ingest_notices import IngestNotices
+        notices = IngestNotices()
+        service = self.service()
+        for name in ("SSIS-057.mp4", "photo.jpg", "landed.mp4", "ABW-123.mp4"):
+            (self.media / name).write_bytes(b"0" * 8)
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "INSERT INTO download_task(provider,source_uri,target,code,state,updated_at)"
+                " VALUES('115','magnet:?xt=urn:btih:x','/115/云下载','ABW-123','remote_done','2026-11-05T00:00:00+00:00')")
+        with mock.patch("peach.ingest_notices.NOTICES", notices):
+            self.assertTrue(service._ingest("local", self.ledger("local", "SSIS-057.mp4")))
+            self.assertTrue(service._ingest("local", self.ledger("local", "SSIS-057.mp4")))
+            self.assertTrue(service._ingest("local", self.ledger("local", "photo.jpg")))
+            self.assertTrue(service.ingest_now("local", self.ledger("local", "landed.mp4")))
+            self.assertTrue(service._ingest("local", self.ledger("local", "ABW-123.mp4")))
+        items = notices.snapshot()["items"]
+        self.assertEqual([(item["kind"], item["label"]) for item in items], [("discovered", "SSIS-057")])
 
     def test_one_file_lands_as_one_row_with_the_ledger_shape(self):
         (self.media / "创作者").mkdir()
@@ -539,6 +744,141 @@ class IngestNotifiesTests(_ServiceCase):
         self.assertEqual(notified, [True])
 
 
+class _HangingObserver:
+    """`schedule` 卡住的 watchdog 监视器替身：`release` 放行之前一直停在那里。"""
+    entered = threading.Event()
+    release = threading.Event()
+    made: list = []
+
+    def __init__(self):
+        self.started = self.stopped = False
+        type(self).made.append(self)
+
+    def schedule(self, *_args, **_kwargs):
+        type(self).entered.set()
+        type(self).release.wait(30)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def join(self, timeout=None):
+        pass
+
+
+class HungMountTests(_ServiceCase):
+    """来源挂载挂死时，推送发现的启动、保存、队列与登记都不能被它拖住。"""
+
+    def hanging_observer(self):
+        _HangingObserver.entered = threading.Event()
+        _HangingObserver.release = threading.Event()
+        _HangingObserver.made = []
+        self.addCleanup(lambda: _HangingObserver.release.set())
+        patcher = mock.patch("watchdog.observers.Observer", _HangingObserver)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_probing_a_hung_mount_does_not_hold_the_queue_thread(self):
+        (self.media / "a.mp4").write_bytes(b"0" * 4)
+        service = self.service()
+        with _hung_mount(self.media):
+            finished, size = _within(lambda: service._probe("local", self.ledger("local", "a.mp4")))
+        self.assertTrue(finished, "队列线程卡在了本进程的 stat 上")
+        self.assertEqual(size, 4)
+
+    def test_files_due_together_in_one_directory_are_probed_with_one_listing(self):
+        for name, size in (("a.mp4", 1), ("b.mp4", 2), ("c.mp4", 3)):
+            (self.media / name).write_bytes(b"0" * size)
+        (self.media / "sub").mkdir()
+        (self.media / "sub" / "d.mp4").write_bytes(b"0" * 4)
+        service = self.service()
+        items = [("local", self.ledger("local", name)) for name in ("a.mp4", "b.mp4", "c.mp4", "gone.mp4")]
+        items.append(("local", self.ledger("local", "sub", "d.mp4")))
+        listings, stats = mock.Mock(wraps=push.media_io.directory_entries), mock.Mock(wraps=push.media_io.file_stat)
+        with mock.patch.object(push.media_io, "directory_entries", listings), \
+                mock.patch.object(push.media_io, "file_stat", stats), _hung_mount(self.media):
+            finished, sizes = _within(lambda: service._probe_many(items))
+        self.assertTrue(finished, "批量探测卡在了本进程的读盘上")
+        self.assertEqual(sizes, [1, 2, 3, None, 4])
+        # 根目录四条列一次；按名字找不到的那条和单独一条的子目录各 stat 一次。
+        self.assertEqual((listings.call_count, stats.call_count), (1, 2))
+        from peach.os_errors import CodedTimeoutError
+        with mock.patch.object(push.media_io, "directory_entries",
+                               side_effect=CodedTimeoutError(errno.ETIMEDOUT, "errors.mediaIo.readTimedOut")):
+            answers = service._probe_many(items[:2])
+        self.assertTrue(all(isinstance(answer, TimeoutError) for answer in answers), answers)
+
+    def test_a_probe_that_times_out_is_not_taken_for_a_missing_file(self):
+        from peach.os_errors import CodedTimeoutError
+        service = self.service()
+        self.assertIsNone(service._probe("local", self.ledger("local", "没有这个文件.mp4")))
+        with mock.patch.object(push.media_io, "file_stat",
+                               side_effect=CodedTimeoutError(errno.ETIMEDOUT, "errors.mediaIo.readTimedOut")):
+            with self.assertRaises(OSError):
+                service._probe("local", self.ledger("local", "a.mp4"))
+
+    def test_starting_does_not_wait_for_a_hung_source_root(self):
+        service = self.service()
+        with _hung_mount(self.media):
+            finished, _ = _within(service.start, timeout=5)
+            self.assertTrue(finished, "服务启动卡在了来源目录上")
+        self.assertTrue(service.wait_local(30))
+
+    def test_a_watch_that_hangs_while_scheduling_holds_neither_start_nor_save(self):
+        self.hanging_observer()
+        service = self.service()
+        finished, _ = _within(service.start, timeout=5)
+        self.assertTrue(finished, "服务启动卡在了 observer.schedule 上")
+        self.assertTrue(_HangingObserver.entered.wait(15))
+        self.assertFalse(service.local_channel.running)
+        first = service._opening
+        with mock.patch.object(push, "LOCAL_START_WAIT_SECONDS", 0.2):
+            finished, state = _within(lambda: service.save({"enabled": True, "watch_local": True}), timeout=5)
+        self.assertTrue(finished, "设置页保存卡在了 observer.schedule 上")
+        self.assertFalse(state["local_running"])
+        _HangingObserver.release.set()
+        self.assertTrue(service.wait_local(15))
+        first.join(15)
+        self.assertTrue(service.local_channel.running)
+        # 保存前那一次起到一半被停掉：它起完的那一份要收掉，不能顶替现在的状态。
+        stale, current = _HangingObserver.made
+        self.assertEqual((stale.stopped, current.started, current.stopped), (True, True, False))
+
+    def test_registering_from_a_hung_mount_does_not_block(self):
+        (self.media / "a.mp4").write_bytes(b"0" * 4)
+        (self.media / "a.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\nhi\n", encoding="utf-8")
+        (self.media / "poster.jpg").write_bytes(b"jpg")
+        with _hung_mount(self.media):
+            finished, results = _within(lambda: [scan.ingest_path(
+                self.db, "local", self.ledger("local", name), declared_roots=self.declared, mounts=self.mounts)
+                for name in ("a.mp4", "poster.jpg", "gone.mp4")], timeout=30)
+        self.assertTrue(finished, "登记卡在了本进程的 stat 或列目录上")
+        video, poster, gone = results
+        self.assertEqual((video.found, video.subtitles), (True, 1))
+        self.assertEqual((poster.found, poster.sidecar), (True, True))
+        self.assertFalse(gone.found)
+        self.assertEqual(self.rows()[self.ledger("local", "a.mp4")], ("video", 4))
+
+    def test_identity_and_code_checks_ask_a_hung_mount_through_the_reader(self):
+        from peach.file_identity import missing
+        from peach.os_errors import CodedTimeoutError
+        from peach.record_rehome import _gone
+        (self.media / "here.mp4").write_bytes(b"0")
+        with _hung_mount(self.media):
+            finished, answers = _within(lambda: [
+                missing(str(self.media / "gone.mp4")), missing(str(self.media / "here.mp4")),
+                _gone(self.media / "gone.mp4"), _gone(self.media / "here.mp4")], timeout=30)
+        self.assertTrue(finished, "判文件在不在卡在了本进程的 stat 上")
+        self.assertEqual(answers, [True, False, True, False])
+        # 没答上不算文件没了：不按「旧路径已消失」改指或接回。
+        with mock.patch("peach.media_io.file_stat",
+                        side_effect=CodedTimeoutError(errno.ETIMEDOUT, "errors.mediaIo.readTimedOut")):
+            self.assertEqual([missing(str(self.media / "gone.mp4")), _gone(self.media / "gone.mp4")],
+                             [False, False])
+
+
 class SettingsTests(_ServiceCase):
     def test_unsaved_settings_enable_only_local_discovery_and_preserve_saved_off(self):
         service = self.service()
@@ -614,6 +954,27 @@ class CloudChannelTests(_ServiceCase):
             service.submit_cloud("/pikpak/a.mp4")
         self.assertEqual(self.rows(), {})
 
+    def test_a_notification_still_waiting_when_the_service_restarts_is_registered_after_boot(self):
+        """通知收下了、还在去抖就重启：下一次启动接着登记，不等全量扫描。"""
+        before = push.PushDiscoveryService(
+            state_root=self.root / "state", secrets_root=self.root / "secrets",
+            db_path=self.db, declared_roots=self.declared, mounts=self.mounts, debounce=3600.0)
+        self.addCleanup(before.stop)
+        before.save({"enabled": True, "watch_local": False, "cloud": True, "prefixes": [
+            {"prefix": "/115", "root": self.declared["115"][0]}]})
+        (self.cloud / "a.mp4").write_bytes(b"0" * 6)
+        before.submit_cloud("/115/a.mp4")
+        before.stop()
+        self.assertEqual(self.rows(), {})
+        self.assertTrue((self.root / "state" / push.PENDING_FILENAME).is_file())
+
+        after = self.service()
+        after.start()
+        _wait_for(lambda: self.rows())
+        self.assertEqual(self.rows(), {self.ledger("115", "a.mp4"): ("video", 6)})
+        _wait_for(lambda: not (self.root / "state" / push.PENDING_FILENAME).exists())
+        self.assertFalse((self.root / "state" / push.PENDING_FILENAME).exists())
+
 
 class LocalChannelTests(_ServiceCase):
     def test_historic_macos_events_do_not_enter_the_queue(self):
@@ -642,9 +1003,10 @@ class LocalChannelTests(_ServiceCase):
     def test_default_native_watcher_is_idle_until_new_files_arrive(self):
         (self.media/'existing.mp4').write_bytes(b'old')
         service = self.service()
-        probe = mock.Mock(wraps=service.queue.probe)
-        service.queue.probe = probe
+        probe = mock.Mock(wraps=service.queue.probe_many)
+        service.queue.probe_many = probe
         service.start()
+        self.assertTrue(service.wait_local(15))
         if not service.local_channel.running:
             self.skipTest(f'本机起不了文件监视：{service.local_channel.message}')
         started, cpu = time.monotonic(), time.process_time()
@@ -665,6 +1027,7 @@ class LocalChannelTests(_ServiceCase):
     def test_a_file_landing_in_a_watched_root_reaches_the_ledger(self):
         service = self.service()
         service.save({"enabled": True, "watch_local": True, "cloud": False, "prefixes": []})
+        self.assertTrue(service.wait_local(15))
         if not service.local_channel.running:
             self.skipTest(f"本机起不了文件监视：{service.local_channel.message}")
         (self.media / "落地.mp4").write_bytes(b"0" * 8)

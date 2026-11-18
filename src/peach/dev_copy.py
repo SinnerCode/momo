@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 from string import Formatter
 
+from .user_messages import UserValueError
+
 
 def files(root: Path):
     yield root / "web/index.html"
@@ -17,9 +19,12 @@ def files(root: Path):
     yield root / "src/peach/routes_pages.py"
     yield root / "src/peach/onboarding.py"
     yield root / "src/peach/media_sources.py"
+    yield root / "src/peach/release_updates.py"
     yield from sorted((root / "frontend/src").rglob("*.js"))
     yield from sorted((root / "frontend/src").rglob("*.tsx"))
     yield from sorted((root / "frontend/src").rglob("*.ts"))
+    # 抽进语言资源的界面文案（ADR-0156）：源文只在 zh-CN，改的是这一份；其他语言经翻译流程跟上。
+    yield from sorted((root / "resources/locales/zh-CN").glob("*.json"))
 
 
 def _template_parts(node: ast.JoinedStr):
@@ -83,20 +88,65 @@ def _python_replacement(source: str, selected: dict, replacement: str):
                 rendered.append(literal)
             if name is not None:
                 if name not in fields or spec or conversion:
-                    raise ValueError("请保留原有占位符，只修改文字")
+                    raise ValueError("placeholder not in the original template")
                 used.append(name)
                 values.append(deepcopy(fields[name]))
                 rendered.append(selected["values"][name])
     except ValueError as error:
-        raise ValueError("请保留原有占位符，只修改文字；字面花括号写成 {{ 和 }}") from error
+        raise UserValueError("errors.devCopy.placeholdersChanged", {"open": "{{", "close": "}}"}) from error
     if Counter(used) != Counter(fields.keys()):
-        raise ValueError("请保留全部占位符，各出现一次")
+        raise UserValueError("errors.devCopy.placeholdersIncomplete")
     return ast.unparse(ast.JoinedStr(values)), "".join(rendered)
+
+
+_LOCALE_VALUE = re.compile(r':\s*"(?P<raw>(?:[^"\\]|\\.)*)"')
+_I18N_FIELD = re.compile(r"\{\{\s*(\w+)(?:\s*,\s*number)?\s*\}\}")
+
+
+def _locale_candidates(source: str, original: str):
+    """语言资源里带 {{名字}} 占位的值（ADR-0156）：按页面上显示的整句反查，编辑时占位写成 {名字}。"""
+    for match in _LOCALE_VALUE.finditer(source):
+        value = json.loads('"' + match.group("raw") + '"')
+        if "{{" not in value:
+            continue
+        pieces = _I18N_FIELD.split(value)
+        names = pieces[1::2]
+        if not names or len(set(names)) != len(names) or not "".join(pieces[0::2]).strip():
+            continue
+        pattern = "".join(re.escape(piece) if i % 2 == 0 else f"(?P<{piece}>.*?)" for i, piece in enumerate(pieces))
+        found = re.fullmatch(pattern, original, re.DOTALL)
+        if not found:
+            continue
+        template = "".join(piece.replace("{", "{{").replace("}", "}}") if i % 2 == 0 else "{" + piece + "}"
+                           for i, piece in enumerate(pieces))
+        yield {"start": match.start("raw"), "end": match.end("raw"), "line": source[:match.start("raw")].count("\n") + 1,
+               "quote": '"', "i18n": True, "template": template, "values": found.groupdict()}
+
+
+def _locale_replacement(selected: dict, replacement: str, expression: str):
+    """占位按原文写回，保留数字格式声明，各出现一次。"""
+    tokens = {match[1]: match[0] for match in _I18N_FIELD.finditer(json.loads('"' + expression + '"'))}
+    values, rendered, used = [], [], []
+    try:
+        for literal, name, spec, conversion in Formatter().parse(replacement):
+            values.append(literal)
+            rendered.append(literal)
+            if name is not None:
+                if name not in selected["values"] or spec or conversion:
+                    raise ValueError("placeholder not in the original template")
+                used.append(name)
+                values.append(tokens[name])
+                rendered.append(selected["values"][name])
+    except ValueError as error:
+        raise UserValueError("errors.devCopy.placeholdersChanged", {"open": "{{", "close": "}}"}) from error
+    if Counter(used) != Counter(selected["values"].keys()):
+        raise UserValueError("errors.devCopy.placeholdersIncomplete")
+    return json.dumps("".join(values), ensure_ascii=False)[1:-1], "".join(rendered)
 
 
 def candidates(root: Path, original: str) -> list[dict]:
     if not isinstance(original, str) or not original.strip() or len(original) > 2000:
-        raise ValueError("请选择不超过 2000 字的文案")
+        raise UserValueError("errors.devCopy.textTooLong")
     found = []
     for path in files(root):
         if not path.is_file() or ".test." in path.name:
@@ -109,6 +159,10 @@ def candidates(root: Path, original: str) -> list[dict]:
                           "hash": hashlib.sha256(source.encode()).hexdigest(), **candidate}
                          for candidate in _python_candidates(source, original))
             continue
+        if path.suffix == ".json":
+            found.extend({"file": path.relative_to(root).as_posix(),
+                          "hash": hashlib.sha256(source.encode()).hexdigest(), **candidate}
+                         for candidate in _locale_candidates(source, original))
         # 只定位完整文字节点或完整字符串，避免改到标识和代码的一部分。
         pattern = re.compile(r"(?P<quote>['\"`])" + re.escape(original) + r"(?P=quote)|>\s*(?P<jsx>" + re.escape(original) + r")\s*<")
         for match in pattern.finditer(source):
@@ -123,21 +177,23 @@ def candidates(root: Path, original: str) -> list[dict]:
 
 def save(root: Path, body: dict) -> dict:
     if not isinstance(body, dict):
-        raise ValueError("修改内容必须是对象")
+        raise ValueError("edit body must be an object")
     original, replacement = body.get("original", ""), body.get("replacement", "")
     if not isinstance(replacement, str) or len(replacement) > 2000:
-        raise ValueError("新文案必须是文字，且不能超过 2000 字")
+        raise UserValueError("errors.devCopy.replacementInvalid")
     selected = body.get("candidate")
     if selected not in candidates(root, original):
-        raise ValueError("源文件已变化，请重新选择文字")
+        raise UserValueError("errors.devCopy.sourceChanged")
     path = (root / selected["file"]).resolve()
     if path not in {p.resolve() for p in files(root)}:
-        raise ValueError("不能修改这个文件")
+        raise UserValueError("errors.devCopy.fileNotEditable")
     source = path.read_text(encoding="utf-8")
     quote = selected["quote"]
     text = replacement
     if selected.get("python"):
         escaped, text = _python_replacement(source, selected, replacement)
+    elif selected.get("i18n"):
+        escaped, text = _locale_replacement(selected, replacement, source[selected['start']:selected['end']])
     elif quote:
         escaped = replacement.replace("\\", "\\\\").replace(quote, "\\" + quote).replace("\n", "\\n").replace("\r", "\\r")
         if quote == "`":

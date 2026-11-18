@@ -10,37 +10,41 @@ import { Chip } from '@/components/base/badges/chip';
 import { Button } from '@/components/base/buttons/button';
 
 import { MarkImage } from '../components/site-mark';
+import { ColumnFilterAvatar } from '../components/column-filter-avatar';
 
 import {
-  authorAvatar, authorInitial, errorHeadline, isBroken, sourceIconUrl, statusText,
+  authorAvatar, authorInitial, authorPortrait, errorHeadline, isBroken, sourceIconUrl, statusText,
   type FollowSource,
 } from './follow-manage';
+import { t } from '../../i18n';
 
 /** 关注来源的站标，尺寸与回退和采集来源站标同一枚；站名由旁边的文字或外层的读屏文字说。 */
 export function SourceIcon({ provider }: { provider: string }) {
   return <MarkImage src={sourceIconUrl(provider)} />;
 }
 
-/** 创作者圆标：官方来源的头像优先，归档来源回退，都取不到就用首字母。
+/** 创作者圆标共用实体图、作品头像、来源缓存与首字母的取图顺序。
  *
  * 首字母取自创作者名而不是某条来源的标签——那会切出「初」「一」这类和创作者无关的字。 */
-export function AuthorAvatar({ group, name }: { group: FollowSource[]; name: string }) {
+export function AuthorAvatar({ group, name, small = false }: { group: FollowSource[]; name: string; small?: boolean }) {
   const { src, fallback } = authorAvatar(group);
   const [at, setAt] = useState(0);
+  const entity = authorPortrait(group);
+  if (entity) return <ColumnFilterAvatar person={entity} kind="creator" size={small ? 'small' : 'medium'} />;
   const chain = [src, fallback].filter(Boolean);
   const current = chain[at];
   if (!current) {
     return (
-      <span title="没有可用头像"
-        className="inline-grid size-8 shrink-0 place-items-center rounded-full bg-background-tertiary-default text-caption-1-semibold text-text-secondary">
+      <span title={t('follow:sourceView.noAvatar')}
+        className={`inline-grid ${small ? 'size-6' : 'size-8'} shrink-0 place-items-center rounded-full bg-media-placeholder text-caption-1-semibold text-text-secondary`}>
         {authorInitial(name)}
       </span>
     );
   }
   return (
-    <img src={current} alt="" width={32} height={32} loading="lazy" referrerPolicy="no-referrer"
+    <img src={current} alt="" width={small ? 24 : 32} height={small ? 24 : 32} loading="lazy" referrerPolicy="no-referrer"
       onError={() => setAt(at + 1)}
-      className="size-8 shrink-0 rounded-full bg-background-tertiary-default object-cover" />
+      className={`${small ? 'size-6' : 'size-8'} shrink-0 rounded-full bg-media-placeholder object-cover`} />
   );
 }
 
@@ -55,7 +59,7 @@ export function StatusBadge({ source }: { source: FollowSource }) {
 /** 来源名连到站上的原页面，名字后跟外链字形。新标签页不继承这一页的会话，来源地址也不带走 Peach 自己的地址。 */
 export function SourceLink({ source }: { source: FollowSource }) {
   return (
-    <a href={source.url} target="_blank" rel="noopener noreferrer" title="打开原来源"
+    <a href={source.url} target="_blank" rel="noopener noreferrer" title={t('follow:sourceView.openSource')}
       className="max-w-full min-w-0 self-start text-body-medium wrap-anywhere text-text-primary underline-offset-2 hover:underline">
       {source.label}
       <RiExternalLinkLine aria-hidden className="size-(--icon-inline) shrink-0" />
@@ -89,7 +93,7 @@ export function ErrorLine({ text, prefix = '', tone = 'error' }: { text: string;
       {more ? (
         <Button variant="ghost" size="small" data-error-line-toggle="" data-error-details-toggle="" aria-expanded={open} className="-ml-2"
           onClick={() => setOpen(!open)}>
-          {open ? '收起详情' : '查看详情'}
+          {open ? t('follow:sourceView.hideDetails') : t('follow:sourceView.showDetails')}
         </Button>
       ) : null}
     </span>

@@ -1,7 +1,7 @@
 /* composition 域控制器：本域状态与动作，启动由 Application 的生命周期统一安装。 */
 import { loadingState, renderInitialSurfaceLoading } from './loading.js';
-import { clearHomeFeed, installEntityShapeBootstrap, isFeedNewPath, loadEntityShapes, prepareHomeFeed } from './feed.js';
-import { buildManageBar, closeStats, enterManagementSurface, loadSyncedSettings, mountManageHeader, mountSidebar, openManage, openSettings, paintListTitle, scheduleStickySurfaces, showHomeSurfaces, showManagementBody, syncHeaderActions } from './layout.js';
+import { clearHomeFeed, feedState, installEntityShapeBootstrap, isFeedNewPath, loadEntityShapes, prepareHomeFeed } from './feed.js';
+import { buildManageBar, closeStats, enterManagementSurface, loadSyncedSettings, mountManageHeader, mountSidebar, openManage, openSettings, paintCatalogPageTitle, paintListTitle, scheduleStickySurfaces, showHomeSurfaces, showManagementBody, syncHeaderActions } from './layout.js';
 import { disposeStage, mediaState, openItem, openJavMovie, openPlaylist, openQueue, openTok } from './media.js';
 import { currentBarsContext, entityState, openEntity, revealForIsland, routeEntityPage, showEntityMissing } from './entity.js';
 import { applyFilterStateInPlace, buildBars, catalogState, clearCatalogGrid, gridTaken, loadCatalog, onlineDefaultLoc, paintCatalogGrid, refreshFacetCounts, syncCatalogFilterScreen, toggleTag } from './catalog.js';
@@ -41,7 +41,9 @@ renderInitialSurfaceLoading();
 /* 首页标题随首屏骨架一起出现：等路由打开目录后再显示，会把骨架整页往下推一跳。其余状态页的标题仍由 `paintListTitle` 定。 */
 if(location.pathname==='/'){
   const query=new URLSearchParams(location.search);
-  if(!query.has('state')&&query.get('jav')!=='1')$('#catalogPageHeading').hidden=false;
+  if(!query.has('state')&&query.get('jav')!=='1'){
+    $('#catalogPageHeading').hidden=false;paintCatalogPageTitle($('#catalogPageHeading'),query.get('q'));
+  }
 }
 /* 新作那一行按本机记着的结论随首屏一起铺骨架，卡片与列表两种显示方式都一样。 */
 if(isFeedNewPath(decodeURIComponent(location.pathname)))prepareHomeFeed($('#feedNew'));
@@ -133,14 +135,17 @@ compositionState.shellActions = {
 
   // 索引页与资料页的元素用。
   configurable:()=>!!runtimeConfigurable,
-  /* 整页画上之后：索引页重读侧栏按下态、重排吸顶；资料页重拉侧栏与顶部横条。 */
-  surfaceShown:kind=>{if(kind==='index'){syncNavigation();scheduleStickySurfaces()}else buildBars()},
+  /* 整页画上之后：索引页重读侧栏按下态、重排吸顶；资料页重拉侧栏与顶部横条，按取到的名字重写标题（按 ID 直达时导航那一刻还不知道名字）。 */
+  surfaceShown:kind=>{if(kind==='index'){syncNavigation();scheduleStickySurfaces()}else{buildBars();loadingState.syncPageTitle(location.href)}},
   entity:{
     missing:kind=>{compositionState.shellActions.surfaceChanged('entity',location.pathname);showEntityMissing(kind)},
     /* 名单启动时就在取；深链直接落在资料页时它可能还在路上，稍等一下再画骨架，画出来就是最终的形状。等不到
        就先画，名单到了再补那两块。名单每进一页重取一遍，下一页用的就是服务端的现状。 */
     loading:(kind,name,current)=>entityState.application.loading(kind,name,current),
-    props:(kind,name,search)=>entityState.application.addressProps(kind,name,search),
+    props:(kind,name,search)=>{
+      writeShell({entityJavLayout:['performer','studio'].includes(kind)&&feedState.hasEntityPart(kind,name,'jav')});
+      return entityState.application.addressProps(kind,name,search);
+    },
     /* 后退前进落在同一位的另一份筛选上：这一页还画着就只把地址上的新筛选推过去。 */
     refresh:(kind,name,search)=>{
       const filters=entityState.parseEntityFilters(search);if(kind==='creator')filters.creator='';
@@ -164,12 +169,12 @@ compositionState.shellActions = {
     open:(path,{entering=false,retitle=false}={})=>{
       if(retitle){syncRouteChrome();syncHeaderActions();paintListTitle()}
       if(entering)dropBars();
-      if(path==='/trash'){catalogState.clearSearchField();showHomeSurfaces()}
+      if(path==='/trash'){catalogState.clearSearchField()}
       else{$('#q').value=state.q;catalogState.rememberSearchValue()}
-      syncNavigation();buildBars();preferencesState.handOff(loadCatalog());
+      syncNavigation();buildBars();return preferencesState.handOff(loadCatalog());
     },
     /* 壳认领写了地址、筛选已在 `state` 里：只重取。 */
-    load:()=>{preferencesState.handOff(loadCatalog())},
+    load:()=>preferencesState.handOff(loadCatalog()),
     /* 没有背景的作品与队列地址（深链、刷新）：详情下面那份列表一次请求都没发过，补发一次，不留一张写着在读、
        其实没有请求在跑的骨架。走 `paintCatalogGrid` 直接挂网格：`loadCatalog` 开头就 `disposeStage()`，会把这一屏
        详情一起收掉。网格已经画上（哪怕还在取第一页）就不再补发；不是启动那一条时只接着那张骨架。 */
@@ -199,7 +204,7 @@ loadRouter(compositionState.shellActions).catch(error=>console.error('客户端�
 mountManageHeader();
 mountBatchDock();
 buildManageBar();
-Promise.all([loadSourceStatus(),loadSyncedSettings(),loadingState.entityShapesReady])
+Promise.all([loadSourceStatus(),loadSyncedSettings()])
   .then(()=>{
     if(!effects.isActive)return;
     /* 顶部两排与筛选栏的两个聚合自带骨架、取回后自己落位，页面打开不等它们：作品列表与它们同时去取。 */

@@ -9,6 +9,7 @@ import { notifyManager, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, expect, it, vi } from 'vitest';
 
 import { queryClient } from '../../src/react/query';
+import { RESULT_UPDATES_KEY } from '../../src/react/running-tasks';
 import {
   currentLine, LIBRARY_PROCESSING_KEY, notesLine, prefetchLibraryProcessing, processingLine, remainingTime, type LibraryProcessingData,
 } from '../../src/react/library-processing/library-processing';
@@ -16,8 +17,15 @@ import { LibraryProcessingCard } from '../../src/react/library-processing/librar
 import { LibraryProcessingNotice } from '../../src/react/library-processing/library-processing-notice';
 import { setProcessingNoticeVisible } from '../../src/react/library-processing/processing-notice-visibility';
 import type { LibraryProcessingProps } from '../../src/react/bundle';
+import { publishLibraries } from '../../src/library-catalog';
 
 import { actionOrder, buttonNamed as textButtonNamed, click, mount, mountRoot, submit } from './render';
+
+// 取消要过真的确认框：桩里的 `confirmModal` 不画对话框。
+vi.mock('@peach/legacy/ui', async (original) => ({
+  ...await original<typeof import('@peach/legacy/ui')>(),
+  confirmModal: (await import('../../src/ui-kit/modal')).confirmModal,
+}));
 
 const buttonNamed = (name: string, root: ParentNode = document) =>
   [...root.querySelectorAll('button')].find(button => button.getAttribute('aria-label') === name)
@@ -27,6 +35,7 @@ const buttonNamed = (name: string, root: ParentNode = document) =>
 // 报过的任务号记在 `localStorage` 里，也要清，否则下一条用例的通知被当成重复的。
 afterEach(() => {
   queryClient.clear();
+  publishLibraries([]);
   localStorage.clear();
   sessionStorage.clear();
 });
@@ -57,17 +66,22 @@ it('补全待处理影片只提交已登记范围，不触发文件发现',async
   expect(calls.filter(call=>call.method==='POST').map(call=>call.body)).toEqual([{stage:'collect',scope:'new'}]);
 });
 
-it('停止请求绑定原任务，正在停止时保留进度并禁止重发',async()=>{
+it('取消先确认，请求绑定原任务，正在取消时保留进度并禁止重发',async()=>{
   let state:LibraryProcessingData={status:'running',job_id:'one',candidates:3};
   const {calls}=await open(state,(method)=>{
     if(method==='POST') state={...state,status:'stopping'};
     return state;
   });
+  const posts=()=>calls.filter(call=>call.method==='POST').map(call=>call.body);
   const host=await mount(card({toast:vi.fn()}));
-  await click(buttonNamed('停止任务',host)!);
-  expect(calls.filter(call=>call.method==='POST').map(call=>call.body)).toEqual([{action:'cancel',job_id:'one'}]);
-  expect(host.textContent).toContain('正在停止');
-  expect(buttonNamed('正在停止',host)?.disabled).toBe(true);
+  await click(buttonNamed('取消任务',host)!);
+  await click(document.querySelector('[data-modal-cancel]'));
+  expect(posts()).toEqual([]);
+  await click(buttonNamed('取消任务',host)!);
+  await click(document.querySelector('[data-modal-confirm]'));
+  await vi.waitFor(()=>expect(posts()).toEqual([{action:'cancel',job_id:'one'}]));
+  await vi.waitFor(()=>expect(host.textContent).toContain('正在取消'));
+  expect(buttonNamed('正在取消',host)?.disabled).toBe(true);
 });
 
 type Reply = (method: string, body: unknown) => LibraryProcessingData;
@@ -97,6 +111,10 @@ function serve(reply: Reply) {
 /** 走完真实的首屏路径：先 prefetch 把 `first` 落进缓存，再换上用例自己的应答。
  *  首屏那一趟不进 `calls`，断言数的就是页面挂上去之后的来往。 */
 async function open(first: LibraryProcessingData, reply: Reply = () => first) {
+  /* 上一条用例的卡片在卸下之前会被 `afterEach` 里的 `publishLibraries([])` 叫醒重画，对已清空的
+     缓存再发一次读取；那一问晚回来会落进这一条的首屏。先清掉，首屏只认这一条的应答。 */
+  queryClient.clear();
+  publishLibraries([{ id: 'library-one', name: '媒体库一', icon: 'database', color: 'blue' }]);
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => first })));
   await prefetchLibraryProcessing(new AbortController().signal);
   return serve(reply);
@@ -105,6 +123,22 @@ async function open(first: LibraryProcessingData, reply: Reply = () => first) {
 const card = (props: LibraryProcessingProps) => (
   <QueryClientProvider client={queryClient}><LibraryProcessingCard {...props} /></QueryClientProvider>
 );
+
+it('媒体库下拉显示图标并将选中范围传入估算与同步', async () => {
+  const { fetcher, posts } = await open({ status: 'idle' });
+  const host = await mount(card({ toast: vi.fn() }));
+  const select = host.querySelector('select')!;
+  await act(async () => { select.value = 'library-one'; select.dispatchEvent(new Event('change', { bubbles: true })) });
+  const selected = host.querySelector('button[aria-labelledby*="processingLibraryLabel"]')!;
+  expect(selected.textContent).toContain('媒体库一');
+  expect(selected.querySelector('[data-library="library-one"] svg')).not.toBeNull();
+  await click(buttonNamed('同步新增文件', host));
+  expect(document.querySelector('[data-processing-scope]')?.textContent).toContain('媒体库一');
+  const request = fetcher.mock.calls.find(([url]) => String(url).startsWith('/api/library-processing?'))!;
+  expect(new URL(String(request[0]), 'https://peach.test').searchParams.get('library_id')).toBe('library-one');
+  await submit(document.querySelector('dialog form'));
+  expect(posts()).toEqual([{ incremental: true, library_id: 'library-one' }]);
+});
 const notice = (props: LibraryProcessingProps) => (
   <QueryClientProvider client={queryClient}><LibraryProcessingNotice {...props} /></QueryClientProvider>
 );
@@ -133,11 +167,11 @@ it.each([
   ['同步新增文件', '同步新增文件', '新增文件与待补全影片', {incremental:true}, {stage:'all',incremental:'1'}],
   ['仅发现新增文件', '发现新增文件', '尚未登记的新增文件', {stage:'scan',incremental:true}, {stage:'scan',incremental:'1'}],
   ['补全待处理影片', '补全待处理影片', '已登记的待补全影片', {stage:'collect',scope:'new'}, {stage:'collect',scope:'new'}],
-  ['同步整个媒体库', '同步整个媒体库', '整个媒体库', {}, {stage:'all'}],
-  ['仅扫描文件', '扫描全部文件', '整个媒体库', {stage:'scan'}, {stage:'scan'}],
-  ['补全资料与预览', '补全已入库影片', '整个媒体库', {stage:'collect'}, {stage:'collect'}],
-  ['仅补全影片资料', '仅补全影片资料', '整个媒体库', {stage:'metadata'}, {stage:'metadata'}],
-  ['仅补全预览图', '仅补全预览图', '已入库的本地视频', {stage:'previews'}, {stage:'previews'}],
+  ['同步所有媒体库', '同步所有媒体库', '全部文件与影片', {}, {stage:'all'}],
+  ['仅扫描文件', '扫描全部文件', '全部文件与影片', {stage:'scan'}, {stage:'scan'}],
+  ['补全资料与预览', '补全已入库影片', '全部文件与影片', {stage:'collect'}, {stage:'collect'}],
+  ['仅补全影片资料', '仅补全影片资料', '全部文件与影片', {stage:'metadata'}, {stage:'metadata'}],
+  ['仅补全预览图', '仅补全预览图', '已入库的视频（跳过流量保护目录）', {stage:'previews'}, {stage:'previews'}],
 ] as const)('%s 的确认范围、预估请求与提交保持一致', async (label, title, scope, command, estimate) => {
   const {fetcher, posts} = await open({status:'idle',new_asset_count:2});
   const host = await mount(card({toast:vi.fn()}));
@@ -147,7 +181,7 @@ it.each([
     await click(menuItem(label));
   }
   expect(document.querySelector('dialog')?.textContent).toContain(title);
-  expect(document.querySelector('[data-processing-scope]')?.textContent).toBe(`处理范围：${scope}`);
+  expect(document.querySelector('[data-processing-scope]')?.textContent).toBe(`处理范围：所有媒体库 · ${scope}`);
   const requested = fetcher.mock.calls.map(([path]) => String(path)).find(path => path.includes('estimate=1'))!;
   const params = new URL(requested, 'https://peach.test').searchParams;
   expect(Object.fromEntries(params)).toEqual({estimate:'1',...estimate});
@@ -189,7 +223,7 @@ it('已结束的部分结果提供浏览与定向重试，中断保持错误提�
   const banner = await mount(notice({ toast: vi.fn(), mode: 'notice' }));
   for (const surface of [host, banner]) {
     expect(surface.textContent).toContain('处理已结束，部分项目需处理');
-    expect(surface.textContent).toContain('已入库的视频可在全部内容中浏览');
+    expect(surface.textContent).toContain('已入库的视频已可浏览');
     expect(surface.querySelector('a[href="/?loc=&thumb=0"]')?.textContent).toBe('查看全部内容');
     expect(surface.querySelector('[role="alert"]')).toBeNull();
   }
@@ -209,7 +243,7 @@ it('扫描与补全方式共用一颗主键加一个下拉，各自交自己的�
   await startFrom(buttonNamed('同步新增文件', host));
   await click(host.querySelector('[data-split-button] [aria-haspopup="dialog"]'));
   expect(document.querySelector('[role="group"][aria-label="全库维护"]')).not.toBeNull();
-  await startFrom(menuItem('同步整个媒体库'));
+  await startFrom(menuItem('同步所有媒体库'));
   await click(host.querySelector('[data-split-button] [aria-haspopup="dialog"]'));
   await startFrom(menuItem('仅扫描文件'));
   await click(host.querySelector('[data-split-button] [aria-haspopup="dialog"]'));
@@ -316,11 +350,13 @@ it('失败时把问题清单折叠进错误提示，重试只交失败的那些�
      不然几十条同样长短的明细连成一片，看不出哪一条结束了。 */
   expect(list.querySelector('li')!.className).toContain('border-b');
   expect(details.parentElement?.className).toContain('border-t');
-  // 完整记录是出事之后自己去翻的东西，退回灰字，旁边给一颗打开它的键。
-  const log = details.querySelector('p')!;
-  expect(log.textContent).toBe(`完整记录：${LOG}`);
-  expect(log.closest('.text-text-secondary')).not.toBeNull();
-  expect(details.querySelector('button[aria-label="在资源管理器中显示"]')).not.toBeNull();
+  /* 完整记录是出事之后自己去翻的东西，退回灰字，清单收着也看得见；旁边是打开它和
+     导出它的两颗键，导出和这份记录排在一起。 */
+  const reveal = alert!.querySelector('button[aria-label="查看文件位置"]')!;
+  expect(details.contains(reveal)).toBe(false);
+  const logRow = reveal.closest('.text-text-secondary')!;
+  expect(logRow.querySelector('p')?.textContent).toBe(`完整记录：${LOG}`);
+  expect(logRow.contains(buttonNamed('导出完整问题清单', host))).toBe(true);
   // 发现新增文件和原任务的定向重试分别保留入口。
   expect(buttonNamed('同步新增文件', host)?.textContent).toBe('同步新增文件');
 
@@ -360,6 +396,8 @@ it('读不回来时留住已有进度，只在旁边说一句连接中断', asyn
   await open({ status: 'running', checked: 3, total: 9, stage: '采集缺失资料' });
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })));
   vi.useFakeTimers();
+  // 轮询由任务面一处驱动，卡片读同一份缓存。
+  await mountRoot(notice({ toast: vi.fn(), mode: 'notice' }));
   const host = await mount(card({ toast: vi.fn() }));
   await tick(2000);
 
@@ -367,7 +405,7 @@ it('读不回来时留住已有进度，只在旁边说一句连接中断', asyn
   expect(host.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('3');
 });
 
-it('横幅从空闲发现后台任务，任务结束就收起、报一次完成，卸载之后不再敲库', async () => {
+it('横幅闲着不问，全站那一处报出任务在跑才接上，任务结束就收起、报一次完成，卸载之后不再敲库', async () => {
   vi.useFakeTimers();
   const toast = vi.fn();
   const job = { at: { status: 'running', stage: '采集缺失资料', checked: 2, total: 5 } as LibraryProcessingData };
@@ -375,10 +413,17 @@ it('横幅从空闲发现后台任务，任务结束就收起、报一次完成�
   const mounted = await mountRoot(notice({ toast, mode: 'notice' }));
 
   expect(mounted.host.textContent).toBe('');
-  await tick(10_000);
+  await tick(60_000);
+  expect(served.calls, '闲着的时候不该自己问').toHaveLength(0);
+  await act(async () => {
+    queryClient.setQueryData(RESULT_UPDATES_KEY, { running_tasks: [{ task_key: 'library-processing', run_id: 7, status: 'running' }] });
+  });
+  await tick(0);
+  expect(served.calls).toHaveLength(1);
   expect(mounted.host.textContent).toContain('采集缺失资料');
   expect(mounted.host.querySelector('a')?.getAttribute('href')).toBe('/data-cleanup#libraryProcessing');
-  expect(mounted.host.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('40');
+  const ring = mounted.host.querySelector('[role="progressbar"]');
+  expect([ring?.getAttribute('aria-valuenow'), ring?.getAttribute('aria-valuemax')], '小环形报真实计数').toEqual(['2', '5']);
 
   job.at = { status: 'complete', job_id: 'one', identified: 3, candidates: 2 };
   await tick(2000);
@@ -392,12 +437,13 @@ it('横幅从空闲发现后台任务，任务结束就收起、报一次完成�
   expect(served.posts()).toEqual([]);
 });
 
-it('卡片被叫着盯任务时一直问，只在任务结束时报一次', async () => {
+it('卡片跟着任务面的轮询读到结束，只在任务结束时报一次', async () => {
   vi.useFakeTimers();
   const toast = vi.fn();
   await open({ status: 'running', job_id: 'one' }, () => ({ status: 'complete', job_id: 'one' }));
   const onComplete = vi.fn();
-  await mount(card({ toast, monitor: true, onComplete }));
+  await mountRoot(notice({ toast, mode: 'notice' }));
+  await mount(card({ toast, onComplete }));
 
   await tick(2000);
   expect(toast).toHaveBeenCalledTimes(1);
@@ -429,7 +475,7 @@ it('两个容器读同一趟任务：一个周期只问一次，撤掉一个另�
   vi.useFakeTimers();
   const served = await open({ status: 'running', checked: 2, total: 10, stage: '采集缺失资料' });
   const banner = await mountRoot(notice({ toast: vi.fn(), mode: 'notice' }));
-  const panel = await mountRoot(card({ toast: vi.fn(), monitor: true }));
+  const panel = await mountRoot(card({ toast: vi.fn() }));
 
   await tick(2000);
   expect(served.calls, '两处各存一份状态的话，卡片说完成、横幅还挂着进度').toHaveLength(1);
@@ -449,7 +495,7 @@ it('两个容器的等待秒数每秒推进，不增加轮询请求，换文件�
     current_asset_id: 1, current_action: 'reading_local_cover', waited_seconds: 33 };
   const served = await open(state);
   const banner = await mountRoot(notice({ toast: vi.fn(), mode: 'notice' }));
-  const panel = await mountRoot(card({ toast: vi.fn(), monitor: true }));
+  const panel = await mountRoot(card({ toast: vi.fn() }));
   expect(banner.host.textContent).toContain('已等待 33 秒');
   expect(panel.host.textContent).toContain('已等待 33 秒');
   await tick(1000);
@@ -477,16 +523,44 @@ it('两个容器的等待秒数每秒推进，不增加轮询请求，换文件�
   expect(served.calls).toHaveLength(requests);
 });
 
-it('卡片卸载之后轮询就停了', async () => {
+it('同一个键只由任务面一处轮询：只有卡片时不问，任务面卸下后也停', async () => {
   vi.useFakeTimers();
   const served = await open({ status: 'running', checked: 2, total: 10 });
-  const panel = await mountRoot(card({ toast: vi.fn(), monitor: true }));
+  const panel = await mountRoot(card({ toast: vi.fn() }));
+  await tick(4000);
+  expect(served.calls, '卡片只读缓存').toHaveLength(0);
+
+  const banner = await mountRoot(notice({ toast: vi.fn(), mode: 'notice' }));
   await tick(2000);
   expect(served.calls).toHaveLength(1);
 
-  await panel.unmount();
+  await banner.unmount();
   await tick(20_000);
   expect(served.calls, '离开这一页之后那棵根还活着的话，它会照原节律接着敲库').toHaveLength(1);
+  await panel.unmount();
+});
+
+it('在跑时读失败按 4、8、16 秒退避，读到了回到两秒', async () => {
+  vi.useFakeTimers();
+  await open({ status: 'running', checked: 2, total: 10 });
+  let fail = true;
+  const fetcher = vi.fn(async () => (fail ? { ok: false, status: 503, json: async () => ({}) }
+    : { ok: true, status: 200, json: async () => ({ status: 'running', checked: 3, total: 10 }) }));
+  vi.stubGlobal('fetch', fetcher);
+  await mountRoot(notice({ toast: vi.fn(), mode: 'notice' }));
+  await tick(2000);
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  await tick(3999);
+  expect(fetcher, '失败一次后等 4 秒').toHaveBeenCalledTimes(1);
+  await tick(1);
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  await tick(8000);
+  expect(fetcher, '再失败等 8 秒').toHaveBeenCalledTimes(3);
+  fail = false;
+  await tick(16_000);
+  expect(fetcher).toHaveBeenCalledTimes(4);
+  await tick(2000);
+  expect(fetcher, '读到了回到两秒').toHaveBeenCalledTimes(5);
 });
 
 it('来源说没有的计数带千分位，等待时长按分、时、天进位', () => {
@@ -532,7 +606,7 @@ it('暂停与继续使用同一个任务号，暂停不是完成，暂停时仍�
   expect(bar[0]).toBe('任务详情');
   expect(bar.indexOf('暂停')).toBeGreaterThan(0);
   await click(buttonNamed('暂停', host));
-  expect(host.textContent).toContain('正在暂停，当前步骤结束后暂停');
+  expect(host.textContent).toContain('当前步骤结束后暂停');
   state = { ...state, status: 'paused' };
   await tick(2000);
   expect(buttonNamed('继续', host)).not.toBeNull();
@@ -556,15 +630,33 @@ it('首屏暂停状态在卡片和任务面保留进度与继续入口', async (
   expect(host.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('2');
 });
 
-it('没有逐项问题的任务失败也能归档提示，保留历史任务号', async () => {
+it('没有逐项问题的任务失败也能归档提示，可撤销，重新进来不再留那句已归档', async () => {
   const state: LibraryProcessingData = { status:'failed', job_id:'one', error:'任务未能自动恢复' };
-  const served = await open(state, () => ({...state,archived:true}));
-  const host = await mount(card({toast:vi.fn()}));
+  let archived = false;
+  const served = await open(state, (method, body) => {
+    if (method === 'POST') archived = (body as {action:string}).action === 'archive';
+    return {...state,archived};
+  });
+  const toast = vi.fn();
+  const host = await mount(card({toast}));
   expect(buttonNamed('导出完整问题清单',host)).toBeNull();
-  await click(buttonNamed('归档提示',host));
+  const archive = buttonNamed('归档提示',host)!;
+  expect(host.querySelector('[role="alert"]')!.contains(archive)).toBe(true);
+  await click(archive);
   expect(served.posts()).toEqual([{action:'archive',job_id:'one'}]);
-  expect(host.textContent).toContain('历史记录仍保留');
+  expect(host.textContent).toContain('完整记录仍保留');
   expect(host.textContent).not.toContain('任务未能自动恢复');
+  expect(toast).not.toHaveBeenCalled();
+  await click(buttonNamed('撤销',host));
+  expect(served.posts()).toEqual([{action:'archive',job_id:'one'},{action:'unarchive',job_id:'one'}]);
+  expect(host.textContent).toContain('任务未能自动恢复');
+  expect(host.textContent).not.toContain('完整记录仍保留');
+
+  await open({...state,archived:true});
+  const again = await mount(card({toast}));
+  expect(again.textContent).not.toContain('任务未能自动恢复');
+  expect(again.textContent).not.toContain('完整记录仍保留');
+  expect(buttonNamed('撤销',again)).toBeNull();
 });
 
 it('模式切换失败保留服务端选中值和原位错误，可重试', async () => {
@@ -610,7 +702,7 @@ it('处理较慢时各任务面显示等待进展，不沿用旧估时', async (
 });
 
 it('扫描总量未知时显示已发现文件数，已知阶段显示完成数', () => {
-  expect(processingLine({ status: 'running', stage: '扫描文件', scanned: 12345 }))
+  expect(processingLine({ status: 'running', stage: '扫描文件', stage_code: 'library.scanFiles', scanned: 12345 }))
     .toBe('扫描文件 · 已发现 12,345 个文件');
   expect(processingLine({ status: 'paused', checked: 38, total: 100 })).toBe('已暂停 · 38 / 100 项');
 });

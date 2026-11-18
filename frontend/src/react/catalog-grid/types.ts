@@ -2,6 +2,7 @@
  * 条目与分页的形状以 `/api/items`（`src/peach/web_router.py`）为准。 */
 
 import type { FaceRef } from '@peach/card-art';
+import type { TextPart } from '../../core/server-text';
 /** 卡片署名行上一个实体的引用：头像取图与取景都从这里来。 */
 export interface MediaEntityRef extends FaceRef { id: number }
 
@@ -47,21 +48,27 @@ export interface MediaItem {
   creator_entity?: MediaEntityRef | null;
   studio?: string;
   why?: string;
+  /** `why` 按「 · 」拆开的每一条理由的 code（`/api/related`）；没有就照原文显示。 */
+  why_codes?: string[];
+  /** 接着看：与当前作品共有的标签，稀有的在前（`/api/related`）。 */
+  why_tags?: string[];
   feedback?: string;
   disposal?: string;
   disposal_reason?: 'manual' | 'junk' | 'duplicate' | 'missing' | null;
   watch_later?: boolean;
   part_group?: {
-    key: string; seed_id: number; count: number; title?: string; total_size?: number; total_duration?: number;
+    key: string; seed_id: number; count: number; title?: string; title_code?: string; total_size?: number;
+    total_duration?: number;
   } | null;
-  edition_group?: { key: string; seed_id: number; count: number; editions: string[] } | null;
+  /** 同番号的几个版本。`editions` 是 zh-CN 原文，同序的 `editions_parts` 按段给当前语言拼。 */
+  edition_group?: { key: string; seed_id: number; count: number; editions: string[]; editions_parts?: TextPart[][] } | null;
   [field: string]: unknown;
 }
 
 /** `/api/items` 的一页。第一页带总数，往后的页只说还有没有。 */
 export interface MediaPage { items: MediaItem[]; total?: number; work_total?: number; has_more?: boolean }
 
-export interface MediaPageOptions { limit: number; sort?: string; dir?: string }
+export interface MediaPageOptions { limit: number; sort?: string; dir?: string; filters?: Readonly<Record<string, string>> }
 
 /** 这一屏卡片的版式。`active` 是番号版式开关生效（JAV 模式或首页版式），`size` 是大图／小图，
  *  `portrait` 是这一屏整列都是竖屏（显式筛了竖屏），`javImage` 是「JAV 默认封面」设置。 */
@@ -122,6 +129,8 @@ export interface CatalogGridProps {
   mode: 'catalog' | 'entity' | 'items';
   /** 独立全屏播放墙。 */
   wall?: boolean;
+  /** 历史返回时复用同一集合已经加载的分页。 */
+  restoreNavigation?: boolean;
   helpers: MediaCardHelpers;
   actions: MediaCardActions;
   layout: MediaCardLayout;
@@ -139,6 +148,8 @@ export interface CatalogGridProps {
 
   /* catalog 模式 */
   filters?: Readonly<Record<string, string>>;
+  /** 列头筛选的实体范围，与作品请求共用同一组筛选。 */
+  facetScope?: Readonly<Record<string, string>>;
   batchSize?: number;
   groupCollapse?: boolean;
   /** 首页默认列表排除竖屏（另有竖屏带承接）；判据归壳。 */
@@ -147,6 +158,8 @@ export interface CatalogGridProps {
   mix?: boolean;
   /** 每接一页插一条竖屏带。 */
   shorts?: boolean;
+  /** 竖屏带一条放几张（设置页那一项）；缺省 `SHORTS_BATCH`。 */
+  shortsLimit?: number;
   /** 每接一页报一次：总数与此刻显示的卡数（Mix 与竖屏带不算）。壳据此推筛选条的读数、重画批量条，
    *  回收站把读数写在说明行上。 */
   onCount?(total: number, shown: number): void;

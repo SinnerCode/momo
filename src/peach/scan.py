@@ -6,6 +6,7 @@
 文件消失、带着个人记录的行由资源同步标 `disposal='vanished'`（ADR-0087）。登记时把它们接回：
 同一路径的文件回来了，upsert 清掉那一行的 `disposal`；新登记的行由 `record_rehome.reattach`
 按番号或「创作者 + 文件名主干 + 时长」找它的旧行，把记录搬过来、删掉旧行，记一个可撤回的批次。
+旧行还在库、文件已不在盘上时，登记前先由 `record_rehome.CodeRelocator` 按番号把它改指到新文件。
 接着由 `wants.reconcile` 按番号对一遍「想要」清单，命中的标「已入库」，同样记可撤回的批次。
 
 两条不变量都在这里守：
@@ -34,19 +35,23 @@ import os
 import ntpath
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from functools import partial
 from itertools import chain
 from pathlib import Path, PureWindowsPath
 from filelock import FileLock
 
-from . import folder_rules, junk, record_rehome, subtitles, wants
+from . import folder_rules, interface_text, junk, record_rehome, subtitles, wants
 from .platform import is_windows_path, is_unmapped, resolve_location, resolve_root
 from .processing_control import checkpoint
 from .fsutil import atomic_write_text
+from .user_messages import UserFacingError
+from .discovery_rules import system_directory, system_path
 from .catalog_rules import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, is_local_extra
 
 VIDEO = VIDEO_EXTENSIONS
@@ -56,6 +61,11 @@ ARCHIVE = {".zip", ".rar", ".7z", ".tar", ".gz"}
 
 #: 每攒够这么多行落一次盘，并报一行进度。
 BATCH_SIZE = 2000
+#: 账本连接开写事务时打不开事务侧文件（`SQLITE_CANTOPEN`，杀毒软件或备份工具短暂占住 `-wal`/`-journal`）
+#: 时，重开连接重试当前批次的等待秒数；用完仍失败就照原样报出（#138）。
+REOPEN_DELAYS = (0.5, 1.0, 2.0)
+
+LOGGER = logging.getLogger(__name__)
 
 #: Kodi／Jellyfin 的影片图片名（单写或挂在片名后面，如 `ABC-123-fanart.jpg`）。
 #: 只在同目录有视频时算附属：没有正片的目录里，`cover.jpg` 是图集自己的封面。
@@ -81,8 +91,19 @@ _UPSERT = """INSERT INTO asset(location,path,name,medium,size,mtime,first_seen,l
                disposal=CASE WHEN asset.disposal='vanished' THEN NULL ELSE asset.disposal END"""
 
 
-class ScanTargetError(ValueError):
+class ScanTargetError(UserFacingError, ValueError):
     """来源与扫描根对不上，或者来源在本机没有落点。消息可以直接给人看。"""
+
+
+class ScanRootUnreadable(ScanTargetError):
+    """扫描根目录本身列不出来（掉线、没权限、不存在）。
+
+    这时什么都没枚举到，不能当成「这个来源空了」：照常结束会报 0 个文件，并把整个来源的
+    已有资产算进「清单中已消失」（#693）。根目录以下零星读不了的子目录仍按 `onerror` 跳过。
+    """
+
+    def __init__(self, directory, error):
+        super().__init__('errors.scan.rootUnreadable', {'root': str(directory), 'error': str(error)})
 
 
 class ScanPathConflict(ScanTargetError):
@@ -91,9 +112,8 @@ class ScanPathConflict(ScanTargetError):
     def __init__(self, entries):
         self.asset_ids = tuple(entry[0] for entry in entries)
         self.paths = tuple(entry[1] for entry in entries)
-        ids = '、'.join(str(value) for value in self.asset_ids)
-        super().__init__(f'同一规范路径有多条文件记录（记录 {ids}）：{self.paths[0]}；'
-                         '已保留全部记录，请复核；其他文件继续处理')
+        super().__init__('errors.scan.pathConflict',
+                         {'ids': [str(value) for value in self.asset_ids], 'path': self.paths[0]})
 
 
 def _registered_paths(connection, location, root):
@@ -109,6 +129,26 @@ def _registered_paths(connection, location, root):
         groups.setdefault(key, []).append((asset_id, path))
     return ({key: entries[0][1] for key, entries in groups.items() if len(entries) == 1},
             {key: ScanPathConflict(entries) for key, entries in groups.items() if len(entries) > 1})
+
+
+def _open_ledger(db_path):
+    """扫描用的账本连接：忙等时长与 `LedgerDatabase.connect` 一致，并核对日志模式真的是 WAL。
+
+    `PRAGMA journal_mode=WAL` 失败时不报错，只回实际模式；退回 delete 后每个写事务都要新建
+    `-journal`，大批扫描更容易撞上 `unable to open database file`，所以记一条告警（#138）。
+    """
+    connection = sqlite3.connect(db_path, timeout=30)
+    mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    if str(mode).lower() != "wal":
+        LOGGER.warning("Ledger journal mode is %s instead of wal; scan writes may fail to open the journal: %s",
+                       mode, db_path)
+    return connection
+
+
+def _cannot_open(error: sqlite3.OperationalError) -> bool:
+    if getattr(error, "sqlite_errorcode", None) == sqlite3.SQLITE_CANTOPEN:
+        return True
+    return "unable to open database file" in str(error)
 
 
 def _upsert_records(connection, batch, registered, conflicts):
@@ -152,16 +192,18 @@ def medium_of(name: str) -> str:
 def video_stems(names) -> frozenset[str]:
     """一个目录里视频文件的片名（casefold），`is_sidecar` 拿它判同目录有没有正片。"""
     return frozenset(os.path.splitext(name)[0].casefold() for name in names
-                     if medium_of(name) == "video" and not is_local_extra(name))
+                     if medium_of(name) == "video" and not system_path(name) and not is_local_extra(name))
 
 
 def is_sidecar(name: str, videos: frozenset[str], *, artwork_dir: bool = False,
                path: str | None = None, library_roots: tuple[str, ...] = ()) -> bool:
-    """`name` 是否为不登记的附属文件或工具隔离文件。
+    """`name` 是否为不登记的附属文件、系统元数据或工具隔离文件。
 
     `videos` 是同目录的 `video_stems`；`artwork_dir` 表示这个目录叫 `extrafanart` 之类、
     且上一层有视频。判据只看名字，不读文件内容。
     """
+    if system_path(path or name):
+        return True
     if re.fullmatch(r'peach-purge-[a-f0-9]{32}\.peach-quarantine', name, re.IGNORECASE):
         return True
     stem, suffix = os.path.splitext(name)
@@ -188,15 +230,16 @@ def check_scan_target(
     """扫描根必须落在这个来源的某个数据库路径前缀内，否则拒绝（ADR-0023 第 2 阶段的写入侧门槛）。"""
     declared = declared_roots.get(location)
     if declared is None:
-        known = "、".join(sorted(declared_roots)) or "（设置文件里一个都没有）"
-        raise ScanTargetError(f"✗ 未声明的来源 {location!r}；[media.locations] 里已知：{known}")
+        if not declared_roots:
+            raise ScanTargetError("errors.scan.unknownSourceNoneDeclared", {"location": repr(location)})
+        raise ScanTargetError("errors.scan.unknownSource",
+                              {"location": repr(location), "known": "、".join(sorted(declared_roots))})
     actual = resolve_location(root, declared_roots)[0]
     if actual != location:
-        raise ScanTargetError(
-            f"✗ 扫描目录与媒体来源不一致：{location} 的数据库路径前缀是 {'、'.join(declared)}，"
-            f"但要扫的是 {root}"
-            + (f"（该目录属于 {actual}）" if actual else "（不在任何已配置的媒体目录下）")
-        )
+        params = {"location": location, "prefixes": "、".join(declared), "root": root}
+        if actual:
+            raise ScanTargetError("errors.scan.rootBelongsElsewhere", {**params, "actual": actual})
+        raise ScanTargetError("errors.scan.rootOutsideMedia", params)
 
 
 def ledger_root_for(
@@ -238,33 +281,35 @@ def ledger_root_for(
     if is_windows_path(text):
         return text
     if not location_mounts:
-        raise ScanTargetError(
-            f"✗ 媒体来源 {location!r} 未配置本机目录，无法转换 {text} 的路径；"
-            f"请先在 [media.mounts] 中配置媒体目录")
-    shown = "、".join(os.fspath(mount) for mount in location_mounts)
-    raise ScanTargetError(f"✗ {text} 不在来源 {location!r} 的挂载点 {shown} 之下")
+        raise ScanTargetError("errors.scan.noMounts", {"location": repr(location), "path": text})
+    raise ScanTargetError("errors.scan.outsideMounts", {
+        "path": text, "location": repr(location),
+        "mounts": "、".join(os.fspath(mount) for mount in location_mounts)})
 
 
 def walk_root_for(
     location: str, root: str, *, declared_roots: Mapping[str, Sequence[str]],
     mounts: Mapping[str, Sequence[str | Path]], windows: bool | None = None,
 ) -> Path:
-    """取得数据库路径在本机对应的扫描目录。调用前先过 `check_scan_target`。"""
+    """取得数据库路径在本机对应的扫描目录。
+
+    先过 `check_scan_target`：不在这个来源任何数据库路径前缀下的目录，`resolve_root` 给的
+    序号是 -1，拿它取挂载表会越界或落到最后一个挂载点，所以在这里就报可读的错误。
+    """
     windows = os.name == "nt" if windows is None else windows
+    check_scan_target(location, root, declared_roots=declared_roots)
     _location, index, tail = resolve_root(root, declared_roots)
     location_mounts = tuple(mounts.get(location, ()))
     from .smb_media import is_address, resolve
     if index < len(location_mounts) and is_address(str(location_mounts[index])):
         resource = resolve(root)
         if resource is None:
-            raise ScanTargetError('SMB 目录尚未保存到媒体库配置')
+            raise ScanTargetError('errors.scan.smbNotSaved')
         return resource
     if index >= len(location_mounts) or str(location_mounts[index]) in ("", ".") or is_unmapped(Path(location_mounts[index])):
         if windows:
             return Path(root)
-        raise ScanTargetError(
-            f"✗ 媒体来源 {location!r} 的第 {index + 1} 个数据库路径前缀没有对应的本机目录；"
-            f"请先在 [media.mounts] 中按相同顺序配置媒体目录")
+        raise ScanTargetError("errors.scan.prefixWithoutMount", {"location": repr(location), "index": index + 1})
     return Path(location_mounts[index]).joinpath(*tail)
 
 
@@ -285,14 +330,39 @@ class IngestResult:
     reattached: int = 0
     #: 新行让几条「想要」标了已入库（`wants.reconcile`）。
     acquired: int = 0
+    #: 登记前按番号改指过来的旧行（`record_rehome.CodeRelocator`）；有它时 `new` 为假。
+    relocated: int | None = None
+
+
+def _video_names(entries) -> list[str]:
+    """同一目录里视频的文件名，按番号改指时数同目录有几个同番号视频。"""
+    return [entry.name for entry in entries if medium_of(entry.name) == "video"]
+
+
+def _relocate_ingested(connection, registered, location, ledger_path, here, *, declared_roots, mounts, windows):
+    """推送发现登记的视频接不上文件身份时，在它所在的媒体根里按番号找旧行（ADR-0131）。"""
+    key = str(ledger_path).casefold()
+    root = next((value for value in declared_roots.get(location, ())
+                 if PureWindowsPath(value) in ledger_path.parents), None)
+    if key in registered or medium_of(ledger_path.name) != "video" or root is None:
+        return None
+    relocator = record_rehome.CodeRelocator(connection, location, root, walk_root_for(
+        location, root, declared_roots=declared_roots, mounts=mounts or {}, windows=windows))
+    moved = relocator.relocate(str(ledger_path), lambda: [name for name in here or () if medium_of(name) == "video"])
+    if moved is not None:
+        registered[key] = str(ledger_path)
+    return moved
 
 
 def _directory_stats(directory: Path) -> dict[str, tuple[int, str]]:
-    """一个目录里能 stat 到的文件名 → `(size, mtime)`，读不了的条目跳过。"""
+    """一个目录里能 stat 到的文件名 → `(size, mtime)`，读不了的条目跳过。
+
+    列目录交给可终止的读取子进程：推送发现与云下载的线程不能卡在挂死的挂载上，读超时按读不了算。
+    """
+    from . import media_io
     stats: dict[str, tuple[int, str]] = {}
     try:
-        with os.scandir(directory) as scanner:
-            entries = list(scanner)
+        entries = media_io.directory_entries(directory)
     except OSError:
         return stats
     for entry in entries:
@@ -349,8 +419,9 @@ def ingest_path(
     directory = walk_root_for(
         location, str(ledger_dir), declared_roots=declared_roots,
         mounts=mounts or {}, windows=windows)
+    from . import media_io
     try:
-        stat = (directory / name).stat()
+        stat = media_io.file_stat(directory / name)
     except OSError:
         return IngestResult(location, str(ledger_path), False)
     library_roots = tuple(chain.from_iterable(declared_roots.values()))
@@ -365,10 +436,8 @@ def ingest_path(
     here = None
     if medium == "video" or subtitles.subtitle_format(name):
         here = _directory_stats(directory)
-    # 忙等时长与 `LedgerDatabase.connect` 一致。
-    connection = sqlite3.connect(db_path, timeout=30)
+    connection = _open_ledger(db_path)
     try:
-        connection.execute("PRAGMA journal_mode=WAL")
         registered, conflicts = _registered_paths(connection, location, str(ledger_dir))
         if str(ledger_path).casefold() in conflicts:
             raise conflicts[str(ledger_path).casefold()]
@@ -385,6 +454,8 @@ def ingest_path(
                 previous = (location, move_from, old_directory / old.name)
             if identities.relocate(connection, location, str(ledger_path), directory / name, stat, previous=previous):
                 registered[str(ledger_path).casefold()] = str(ledger_path)
+        relocated = _relocate_ingested(connection, registered, location, ledger_path, here,
+                                       declared_roots=declared_roots, mounts=mounts, windows=windows)
         inserted_ids = _upsert_records(connection, [(location, str(ledger_path), name, medium,
                                      stat.st_size, mtime, now, now)], registered, conflicts)
         stored_path = registered[str(ledger_path).casefold()]
@@ -407,7 +478,8 @@ def ingest_path(
     from .library_new_assets import remember
     remember(db_path, inserted_ids)
     return IngestResult(location, str(ledger_path), True, stat.st_size, tracks,
-                        asset_id=asset_id, new=new, reattached=reattached, acquired=acquired)
+                        asset_id=asset_id, new=new, reattached=reattached, acquired=acquired,
+                        relocated=relocated)
 
 
 @dataclass(frozen=True)
@@ -433,14 +505,17 @@ class ScanResult:
     junk_isolated: int = 0
     junk_review: int = 0
     path_conflicts: int = 0
+    #: 登记前按番号改指到新文件的旧行（`record_rehome.CodeRelocator`）；不在 `new_ids` 里，增量探测要并进来。
+    relocated_ids: tuple[int, ...] = ()
 
     def summary(self) -> str:
-        return (f"✓ {self.location}: {self.files:,} 文件 / "
-                f"{self.total_bytes / 1024 ** 4:.2f} TB / 耗时 {self.seconds:.0f}s；"
-                f"附属文件未登记 {self.sidecars:,} 个；清单中已消失 {self.gone:,} 个；"
-                f"字幕 {self.subtitles:,} 条（孤立 {self.orphan_subtitles:,} 条）；"
-                f"垃圾移入回收站 {self.junk_isolated:,} 个，待复核 {self.junk_review:,} 个；"
-                f"路径重复待复核 {self.path_conflicts:,} 组")
+        """命令行打印的一行摘要，跟本机语言（`labels.scan.summary`）。"""
+        return interface_text.text("server:labels.scan.summary", {
+            "location": self.location, "files": f"{self.files:,}", "size": f"{self.total_bytes / 1024 ** 4:.2f}",
+            "seconds": f"{self.seconds:.0f}", "sidecars": f"{self.sidecars:,}", "gone": f"{self.gone:,}",
+            "subtitles": f"{self.subtitles:,}", "orphans": f"{self.orphan_subtitles:,}",
+            "junk": f"{self.junk_isolated:,}", "junkReview": f"{self.junk_review:,}",
+            "conflicts": f"{self.path_conflicts:,}"}, interface_text.local_language())
 
 
 def _walk(top: Path, pending: list[str] | None = None, *, onerror=lambda error: None, read_directory=None):
@@ -448,8 +523,11 @@ def _walk(top: Path, pending: list[str] | None = None, *, onerror=lambda error: 
 
     与 `os.walk` 的差别只在一处：条目的大小与时间从 `DirEntry.stat()` 拿。Windows 的目录
     列表自带这两项，不必再对每个文件发一次 `os.stat`——网盘挂载上那一次就是一趟往返，
-    几万个文件就是几万趟。读不了的目录跳过；符号链接指向的目录列出但不进入。
+    几万个文件就是几万趟。读不了的子目录跳过，根目录本身列不出来时报 `ScanRootUnreadable`；
+    符号链接指向的目录列出但不进入。
     """
+    if system_path(str(top)):
+        return
     from .smb_media import SmbResource
     if isinstance(top, SmbResource):
         yield from _walk_smb(top, pending, onerror)
@@ -458,6 +536,8 @@ def _walk(top: Path, pending: list[str] | None = None, *, onerror=lambda error: 
     while stack:
         checkpoint('scan')
         directory = stack.pop()
+        if system_path(directory):
+            continue
         try:
             if read_directory is not None:
                 entries = read_directory(directory)
@@ -465,6 +545,8 @@ def _walk(top: Path, pending: list[str] | None = None, *, onerror=lambda error: 
                 with os.scandir(directory) as scanner:
                     entries = list(scanner)
         except OSError as error:
+            if directory == os.fspath(top):
+                raise ScanRootUnreadable(directory, error) from error
             onerror(error)
             continue
         files = []
@@ -476,7 +558,7 @@ def _walk(top: Path, pending: list[str] | None = None, *, onerror=lambda error: 
                 is_dir = False
             if is_dir:
                 try:
-                    if not entry.is_symlink() and entry.name.casefold() != "#recycle" and not entry.name.startswith("@"):
+                    if not entry.is_symlink() and not system_directory(entry.name):
                         subdirectories.append(entry.path)
                 except OSError:
                     pass
@@ -495,30 +577,51 @@ def _relative_directory(directory, top):
 
 
 def _walk_smb(top, pending, onerror):
+    """SMB 版 `_walk`：整趟遍历共用一条连接。
+
+    逐目录新建连接时，TCP 握手、会话认证与挂载共享的开销远大于列目录本身。
+    连接断开或请求超时就换一条新连接重试一次；单个路径不存在或无权访问不影响连接，照常跳过。
+    """
     from types import SimpleNamespace
+    from .smb_transport import PATH_ERRNOS
     stack = pending if pending is not None else [str(top)]
-    while stack:
-        checkpoint('scan')
-        directory = stack.pop()
-        resource = top.joinpath(*_relative_directory(directory, top))
-        try:
-            entries = resource.scandir()
-        except OSError as error:
-            onerror(error)
-            continue
-        files, children = [], []
-        for entry in entries:
-            if entry.is_symlink:
+    transport = top._transport()
+    try:
+        while stack:
+            checkpoint('scan')
+            directory = stack.pop()
+            if system_path(directory):
                 continue
-            path = str(resource / entry.name)
-            if entry.is_dir:
-                if not entry.name.startswith('@') and entry.name.casefold() != '#recycle':
-                    children.append(path)
-            else:
-                stat = SimpleNamespace(st_size=entry.size, st_mtime=entry.mtime, st_mtime_ns=entry.mtime_ns)
-                files.append(SimpleNamespace(name=entry.name, path=path, stat=lambda value=stat: value))
-        stack.extend(path for path in sorted(children, reverse=True) if path not in stack)
-        yield directory, sorted(files, key=lambda entry: entry.name)
+            resource = top.joinpath(*_relative_directory(directory, top))
+            try:
+                try:
+                    entries = resource.scandir(transport)
+                except OSError as error:
+                    if error.errno in PATH_ERRNOS:
+                        raise
+                    transport.close()
+                    transport = top._transport()
+                    entries = resource.scandir(transport)
+            except OSError as error:
+                if directory == str(top):
+                    raise ScanRootUnreadable(directory, error) from error
+                onerror(error)
+                continue
+            files, children = [], []
+            for entry in entries:
+                if entry.is_symlink:
+                    continue
+                path = str(resource / entry.name)
+                if entry.is_dir:
+                    if not system_directory(entry.name):
+                        children.append(path)
+                else:
+                    stat = SimpleNamespace(st_size=entry.size, st_mtime=entry.mtime, st_mtime_ns=entry.mtime_ns)
+                    files.append(SimpleNamespace(name=entry.name, path=path, stat=lambda value=stat: value))
+            stack.extend(path for path in sorted(children, reverse=True) if path not in stack)
+            yield directory, sorted(files, key=lambda entry: entry.name)
+    finally:
+        transport.close()
 
 
 class _ScanProgress:
@@ -536,6 +639,12 @@ class _ScanProgress:
 
 def scan_location(db_path, location, root, **kwargs) -> ScanResult:
     """命令行按来源与根目录保存断点，组合任务可提供自己的持久检查点。"""
+    if system_path(root):
+        check_scan_target(location, root, declared_roots=kwargs['declared_roots'])
+        result = ScanResult(location, root, 0, 0, 0, 0)
+        kwargs.get('progress', lambda files, total: None)(0, 0)
+        kwargs.get('report', print)(result.summary())
+        return result
     if 'save_checkpoint' in kwargs or 'resume_state' in kwargs:
         return _scan_location(db_path, location, root, **kwargs)
     from .update_tasks import state_for
@@ -563,7 +672,7 @@ def _pending_directories(previous, walk_root):
             _relative_directory(value, walk_root)
         return pending
     if any(not Path(value).is_relative_to(walk_root) for value in pending):
-        raise ScanTargetError('扫描目录与保存的断点不一致，请核对挂载设置')
+        raise ScanTargetError('errors.scan.checkpointMismatch')
     return pending
 
 
@@ -575,7 +684,8 @@ def _scan_resume_state(walk_root, resume_state):
     if previous.get('mapping') != mapping:
         previous = {}
     result = previous.get('result')
-    completed = ScanResult(**{**result, 'new_ids': tuple(result['new_ids'])}) if result else None
+    completed = ScanResult(**{**result, 'new_ids': tuple(result['new_ids']),
+                              'relocated_ids': tuple(result.get('relocated_ids', ()))}) if result else None
     return mapping, previous, completed
 
 
@@ -588,8 +698,42 @@ def _record_directory_subtitles(connection, location, directory, here, conflicts
     return subtitles.record(connection, location, unambiguous, now)
 
 
-def _scan_file_stat(connection, identities, registered, observations, location, ledger_path, directory, entry, *, direct):
-    """读取本次文件快照，接回已移动的身份，并积累提交后的身份观测。"""
+def _follow_case_rename(connection, registered, conflicts, location, ledger_root, walk_root, ledger_path, native,
+                        *, direct):
+    """文件或目录只改了大小写时，把账本路径改成磁盘上的实际写法（#487）。
+
+    账本按不区分大小写的键认旧行，区分大小写的文件系统上旧写法已经打不开。只在旧写法确实
+    不存在、或与新写法是同一个文件（不区分大小写的文件系统）时改；两种写法各是一个文件时不动，
+    交给 `conflicts`。身份、标签与观看记录都挂在资产 id 上，跟着走。只看本机直读的目录：
+    SMB 走协议读取，没有本机路径可比。
+    """
+    key = ledger_path.casefold()
+    stored = registered.get(key)
+    if not direct or stored is None or stored == ledger_path or key in conflicts:
+        return
+    # 根目录前缀的写法来自设置，不是磁盘；只跟随根以下文件与目录的改名，不批量改写整库前缀。
+    if not stored.startswith(str(ledger_root)):
+        return
+    try:
+        old_native = Path(walk_root).joinpath(*PureWindowsPath(stored).relative_to(ledger_root).parts)
+    except ValueError:
+        return
+    try:
+        old = os.stat(old_native)
+    except FileNotFoundError:
+        old = None
+    except OSError:
+        return
+    if old is not None and not os.path.samestat(old, os.stat(native)):
+        return
+    if connection.execute('UPDATE asset SET path=?, name=? WHERE location=? AND path=?',
+                          (ledger_path, native.name, location, stored)).rowcount:
+        registered[key] = ledger_path
+
+
+def _scan_file_stat(connection, identities, registered, observations, location, ledger_path, directory, entry, *,
+                    direct, relocate=lambda path: None):
+    """读取本次文件快照，接回已移动的身份或同番号的旧行，并积累提交后的身份观测。"""
     stat = entry.stat()
     if identities is not None:
         native = Path(directory) / entry.name
@@ -598,6 +742,9 @@ def _scan_file_stat(connection, identities, registered, observations, location, 
         if identities.relocate(connection, location, ledger_path, native, stat):
             registered[ledger_path.casefold()] = ledger_path
         observations.append((location, ledger_path, native, stat))
+    if (ledger_path.casefold() not in registered and medium_of(entry.name) == "video"
+            and relocate(ledger_path) is not None):
+        registered[ledger_path.casefold()] = ledger_path
     return stat
 
 
@@ -614,6 +761,34 @@ def _commit_scan_records(connection, db, batch, registered, conflicts, identitie
     batch.clear()
     observations.clear()
     return inserted
+
+
+def _commit_reopening(connection, db_path, batch, registered, conflicts, identities, observations, relocator):
+    """提交当前批次，返回（之后要用的连接, 新建的行 id）。
+
+    开写事务时打不开事务侧文件就重开连接，按原样重试这一批。只在这一批是本事务第一批写入时
+    重试：之前已有未提交的写入（大小写改名、身份接回）随回滚一起丢掉，重放这一批也补不回来，
+    那种情况照原样报出。
+    """
+    for delay in (*REOPEN_DELAYS, None):
+        pending = connection.in_transaction
+        known = dict(registered)
+        try:
+            return connection, _commit_scan_records(connection, db_path, batch, registered, conflicts,
+                                                    identities, observations)
+        except sqlite3.OperationalError as error:
+            if delay is None or pending or not _cannot_open(error):
+                # 重开过的连接调用方拿不到，在这里关掉；原连接关两次无妨。
+                connection.close()
+                raise
+            LOGGER.warning("Scan write could not open the ledger journal (%s); reopening and retrying "
+                           "%d rows in %.1fs", error, len(batch), delay)
+            registered.clear()
+            registered.update(known)
+            connection.close()
+            time.sleep(delay)
+            connection = _open_ledger(db_path)
+            relocator.connection = connection
 
 
 def _scan_location(
@@ -661,16 +836,17 @@ def _scan_location(
         video_dirs.intersection_update(artwork_parents)
         save_checkpoint(dict(mapping=mapping, scan_time=now, pending=list(pending), files=files,
                              total_bytes=total, sidecars=skipped, subtitles=tracks,
-                             orphan_subtitles=orphans, new_ids=sorted(discovered), video_dirs=sorted(video_dirs),
+                             orphan_subtitles=orphans, new_ids=sorted(discovered), relocated_ids=sorted(relocator.moved),
+                             video_dirs=sorted(video_dirs),
                              current_directory=directory, cursor=cursor, here=dict(here or {})))
     # 写事务只在每批 upsert 到 commit 之间打开，遍历与 stat 都在两次 commit 之间，不持锁。
-    # 忙等时长与 `LedgerDatabase.connect` 一致。
-    connection = sqlite3.connect(db_path, timeout=30)
+    connection = _open_ledger(db_path)
     try:
-        connection.execute("PRAGMA journal_mode=WAL")
         registered, conflicts = _registered_paths(connection, location, root)
         from .file_identity import FileIdentityIndex
         identities = FileIdentityIndex(db_path) if location == 'local' and not remote else None
+        relocator = record_rehome.CodeRelocator(connection, location, root, walk_root,
+                                                moved=previous.get('relocated_ids', ()))
         observations = []
         for conflict in conflicts.values():
             onerror(conflict)
@@ -700,9 +876,12 @@ def _scan_location(
                 if new_only and ledger_path.casefold() in registered:
                     here[name] = (None, None)
                     continue
+                _follow_case_rename(connection, registered, conflicts, location, ledger_root, walk_root,
+                                    ledger_path, Path(directory) / name, direct=read_directory is None)
                 try:
                     stat = _scan_file_stat(connection, identities, registered, observations, location,
-                                           ledger_path, directory, entry, direct=read_directory is None)
+                                           ledger_path, directory, entry, direct=read_directory is None,
+                                           relocate=partial(relocator.relocate, video_names=partial(_video_names, entries)))
                 except OSError as error:
                     onerror(error)
                     continue
@@ -714,14 +893,15 @@ def _scan_location(
                 total += stat.st_size
                 progress(files, total)
                 if len(batch) >= BATCH_SIZE:
-                    inserted_ids = _commit_scan_records(connection, db_path, batch, registered, conflicts,
-                                                       identities, observations)
+                    connection, inserted_ids = _commit_reopening(connection, db_path, batch, registered, conflicts,
+                                                                 identities, observations, relocator)
                     discovered.update(inserted_ids)
                     save_directory(directory, name, here)
-                    report(f"  {time.time() - started:5.0f}s  {files:,} 文件  "
-                           f"{total / 1024 ** 4:.2f} TB")
-            inserted_ids = _commit_scan_records(connection, db_path, batch, registered, conflicts,
-                                               identities, observations)
+                    report(interface_text.text("server:labels.scan.progress", {
+                        "seconds": f"{time.time() - started:5.0f}", "files": f"{files:,}",
+                        "size": f"{total / 1024 ** 4:.2f}"}, interface_text.local_language()))
+            connection, inserted_ids = _commit_reopening(connection, db_path, batch, registered, conflicts,
+                                                         identities, observations, relocator)
             directory_tracks, directory_orphans = _record_directory_subtitles(
                 connection, location, ledger_root.joinpath(*relative), here, conflicts, now)
             connection.commit()
@@ -730,8 +910,8 @@ def _scan_location(
             tracks += directory_tracks
             orphans += directory_orphans
             save_directory()
-        inserted_ids = _commit_scan_records(connection, db_path, batch, registered, conflicts,
-                                           identities, observations)
+        connection, inserted_ids = _commit_reopening(connection, db_path, batch, registered, conflicts,
+                                                     identities, observations, relocator)
         discovered.update(inserted_ids)
         remember(db_path, inserted_ids)
         from .media_folders import path_predicate
@@ -749,7 +929,7 @@ def _scan_location(
     checked = junk.isolate(db_path, roots=[(location, root)], asset_ids=list(new_ids) if new_only else None)
     result = ScanResult(location, root, files, total, time.time() - started, gone,
                         tracks, orphans, skipped, new_ids, reattached, acquired,
-                        checked['isolated'], checked['review'], len(conflicts))
+                        checked['isolated'], checked['review'], len(conflicts), tuple(sorted(relocator.moved)))
     save_checkpoint({'mapping': mapping, 'result': asdict(result)})
     progress(files, total, force=True)
     report(result.summary())

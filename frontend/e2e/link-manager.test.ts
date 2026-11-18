@@ -11,7 +11,7 @@ describe('链接检查身份与断链动效', () => {
   for (const viewport of VIEWPORTS) {
     it(`两种结果保留资料入口，断链短线只在检查执行时闪烁（${viewport.name}）`, async () => {
       let phase = 'complete';
-      const opened = await visit(browser, '/data-cleanup?section=links', viewport, async page => {
+      const opened = await visit(browser, '/data-cleanup/links', viewport, async page => {
         await page.emulateMedia({ reducedMotion: 'no-preference' });
         const row = { id: 1, entity: '示例作者', entity_id: 31, entity_kind: 'performer',
           face: { id: 31, name: '示例作者', has_image: true }, link_kind: 'official', label: '示例事务所',
@@ -93,7 +93,7 @@ describe('链接检查身份与断链动效', () => {
     });
 
     it(`默认头像与两类 HTTP 结果在明暗主题均可辨识（${viewport.name}）`, async () => {
-      const opened = await visit(browser, '/data-cleanup?section=links', viewport, async page => {
+      const opened = await visit(browser, '/data-cleanup/links', viewport, async page => {
         const row = { id: 1, entity: '示例作者', entity_id: 31, entity_kind: 'performer',
           face: { has_image: false }, link_kind: 'social', label: '示例站点', url: 'https://example.com', note: 'HTTP 404' };
         await page.route('**/api/links/check', route => route.fulfill({ json: { status: 'complete', check_id: 'contrast',

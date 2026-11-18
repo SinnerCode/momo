@@ -48,7 +48,7 @@ type ActionMocks = { [K in keyof FollowDetailActions]: Mock<FollowDetailActions[
 function actions(): ActionMocks {
   return {
     close: vi.fn(), openItem: vi.fn(), openAuthor: vi.fn(), openTag: vi.fn(), present: vi.fn(), mountPlayer: vi.fn(() => vi.fn()),
-    toast: vi.fn(), failure: vi.fn(),
+    toast: vi.fn(), failure: vi.fn(), canFlip: vi.fn(() => false),
   };
 }
 
@@ -84,6 +84,9 @@ async function show(given: FollowDetailData, patch: Partial<FollowDetailProps> =
   return { host, props, actions: props.actions as ActionMocks };
 }
 
+/** 标签平时只读：先点行尾「编辑标签」，才有「添加标签」入口。 */
+const editTags = (host: Element) => click(host.querySelector('[data-follow-tags-edit]'));
+
 describe('取数', () => {
   it('标签候选保留来源分类并按规范名称显示选中勾号', async () => {
     const fallback = serve();
@@ -94,6 +97,7 @@ describe('取数', () => {
         { k:'未知', n:1, cat:'unknown', aliases:[], hidden:false },
       ] }) }) : fallback(url, init)));
     const { host } = await show(data(item(8, { tags:['3d'], detail_tags:['3d'], tag_types:{ '3d':'general' } })));
+    await editTags(host);
     await click(host.querySelector('[aria-label="添加标签"]')); await settle();
     const selected = host.querySelector('[data-pick="3D"]')!;
     expect(selected.getAttribute('aria-pressed')).toBe('true');
@@ -117,6 +121,7 @@ describe('取数', () => {
     const { host, actions: receipts } = await show(data(original));
     queryClient.setQueryData(followItemKey(sibling.id), data(sibling, group(original, { variants: [sibling] })));
     expect(buttonNamed('管理标签', host)).toBeNull();
+    await editTags(host);
     await click(host.querySelector('[aria-label="添加标签"]'));
     const input = host.querySelector<HTMLInputElement>('#tagPickSearch')!;
     await type(input, '精选');
@@ -128,12 +133,33 @@ describe('取数', () => {
     expect(receipts.toast).not.toHaveBeenCalled();
     await waiting.release({ ok: true, json: async () => ({ item: updated, group: group(updated, { variants: [sibling] }) }) });
     await settle();
-    expect(host.querySelector('[data-follow-tag="精选"]')).not.toBeNull();
+    expect(host.querySelector('[data-remove-tag="精选"]')).not.toBeNull();
     expect(queryClient.getQueryData<FollowDetailData>(followItemKey(sibling.id))?.group?.primary.tags).toContain('精选');
     expect(receipts.toast).toHaveBeenCalledWith('已添加标签「精选」', expect.objectContaining({ undo: expect.any(Function) }));
     await click(host.querySelector('[aria-label="删除标签 精选"]')); await settle();
-    expect(host.querySelector('[data-follow-tag="精选"]')).toBeNull();
+    expect(host.querySelector('[data-remove-tag="精选"]')).toBeNull();
+    expect(host.querySelector('[data-remove-tag="source"]')).not.toBeNull();
+    await editTags(host);
     expect(host.querySelector('[data-follow-tag="source"]')).not.toBeNull();
+  });
+
+  it('标签收起时，刚加上的那一枚排在收起的那截里也照样露出来', async () => {
+    const many = Array.from({ length: 30 }, (_, index) => `t${String(index).padStart(2, '0')}`);
+    const original = item(8, { tags: many, detail_tags: many, custom_tags: [] });
+    const updated = item(8, { tags: [...many, 'zz'], detail_tags: [...many, 'zz'], custom_tags: ['zz'] });
+    const fallback = serve();
+    vi.stubGlobal('fetch', vi.fn((url: string, init?: RequestInit) => url === '/api/follow/tag'
+      ? Promise.resolve({ ok: true, json: async () => ({ item: updated, group: group(updated) }) })
+      : fallback(url, init)));
+    const { host } = await show(data(original));
+    expect(host.querySelectorAll('[data-detail-tag]')).toHaveLength(20);
+    await editTags(host);
+    await click(host.querySelector('[aria-label="添加标签"]'));
+    await type(host.querySelector<HTMLInputElement>('#tagPickSearch')!, 'zz');
+    await click(host.querySelector('[data-pick="zz"]'));
+    await settle();
+    expect(host.querySelector('[data-remove-tag="zz"]')).not.toBeNull();
+    expect(host.querySelector('[data-tags-more]')?.textContent).toBe('还有 10 个');
   });
 
   it('手动标签失败可重新打开选择器重试原输入并显示原因', async () => {
@@ -141,6 +167,7 @@ describe('取数', () => {
     vi.stubGlobal('fetch', vi.fn((url: string, init?: RequestInit) => url === '/api/follow/tag'
       ? Promise.resolve({ ok: false, status: 400, json: async () => ({ error: '标签名不含逗号' }) }) : fallback(url, init)));
     const { host, actions: receipts } = await show(data(item(8)));
+    await editTags(host);
     await click(host.querySelector('[aria-label="添加标签"]'));
     const input = host.querySelector<HTMLInputElement>('#tagPickSearch')!;
     await type(input, 'a,b');
@@ -201,6 +228,22 @@ describe('侧栏', () => {
     expect([...host.querySelectorAll<HTMLElement>('[data-follow-tag]')].map((tag) => [tag.dataset.followTag, tag.closest('[data-detail-tag]')?.getAttribute('data-tag-cat')]))
       .toEqual([['ow', 'r34-copyright'], ['tracer', 'r34-character'], ['kou', 'r34-artist'], ['solo', 'r34-general'],
         ['animated', 'r34-metadata'], ['odd', 'r34-unknown']]);
+  });
+
+  it('标签平时只读，行尾「编辑标签」切到增删，「完成」收回', async () => {
+    const { host } = await show(data(item(3, { detail_tags: ['solo', 'kou'] })));
+    const tags = host.querySelector('[data-follow-detail-tags]')!;
+    expect(tags.querySelectorAll('[data-remove-tag]').length).toBe(0);
+    expect(tags.querySelector('#tagPlus')).toBeNull();
+    const toggle = tags.querySelector<HTMLButtonElement>('[data-follow-tags-edit]')!;
+    expect(toggle.closest('[data-detail-tags]'), '编辑键和标签不在同一行').not.toBeNull();
+    expect(toggle.textContent).toBe('编辑标签');
+    await click(toggle);
+    expect(tags.querySelectorAll('[data-remove-tag]').length).toBe(2);
+    expect(tags.querySelector('#tagPlus')).not.toBeNull();
+    expect(toggle.textContent).toBe('完成');
+    await click(toggle);
+    expect(tags.querySelectorAll('[data-remove-tag]').length).toBe(0);
   });
 
   it('来源外链、网盘链接与下载键；发布者与署名作者不同才写', async () => {
@@ -409,6 +452,24 @@ describe('文案与排序', () => {
     const { host: disabled } = await show(data(item(43)), { relatedLimit: 0 });
     expect(disabled.querySelector('[data-follow-related]')).toBeNull();
     expect(fetcher.mock.calls.some(([url]) => String(url).startsWith('/api/follow?limit='))).toBe(false);
+  });
+
+  it('接着看里的一叠悬停时问壳能不能翻卡，判据和关注列表同一个', async () => {
+    serve();
+    const next = item(52);
+    const stack = { media: 2, copies: 2, kind: 'video', faces: [
+      { thumb_url: '/follow-cover?id=52', face: 0, media_kind: 'video' },
+      { thumb_url: '/follow-cover?id=53', face: 1, media_kind: 'video' },
+    ] };
+    queryClient.setQueryData(followRelatedKey(51, 'videos', 20), {
+      pages: [{ groups: [group(next, { stack })], sources: [], author_aliases: [], counts: {}, facets: {}, offset: 0, has_more: false }],
+      pageParams: [0],
+    });
+    const { host, actions } = await show(data(item(51)), { relatedLimit: 20 });
+    const card = host.querySelector('[data-follow-related] [data-follow-item][data-collection]')!;
+    await act(async () => { card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })) });
+    // 停稳一小会儿才起翻（`use-stack-flip.ts` 的起步延时），一掠而过的指针不翻。
+    await vi.waitFor(() => expect(actions.canFlip).toHaveBeenCalled(), { timeout: 2_000 });
   });
 
   it('合集行首：发布串不拿发布时间当版本标签，正文带上作者', () => {

@@ -50,6 +50,19 @@ class MetadataProviderTests(unittest.TestCase):
         self.assertEqual(validate_provider_code("092415_001"), "092415_001")
         self.assertEqual(validate_provider_code("092415-001"), "092415-001")
 
+    def test_the_gate_passes_registered_digit_labels_only(self):
+        self.assertEqual(validate_provider_code("t28-612"), "T28-612")
+        with self.assertRaises(ValueError):
+            validate_provider_code("T29-612")
+
+    def test_the_gate_passes_kirari_and_registered_suffix_codes(self):
+        for code in ("MKD-S62", "MKBD-S118", "IBW-483Z", "S2MCR-08", "CW3D2DBD-14"):
+            self.assertEqual(validate_provider_code(code), code)
+        # 版次尾字母不是番号：拦住，免得拿 `ADN-516C` 去问来源。
+        for code in ("ADN-516C", "ABW-483Z"):
+            with self.assertRaises(ValueError):
+                validate_provider_code(code)
+
     def test_the_gate_keeps_tokyo_hot_lowercase(self):
         # Tokyo-Hot 的规范写法是小写（`catalog_rules._TOKYO_HOT_BODY`）；跟着别的番号
         # 转大写，拿去查的就是来源不认的写法，这些片一部都查不了。
@@ -214,6 +227,11 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertFalse(identifies_code("DANDY-851C", {"content_id": "1dandy00851ch"}))
         self.assertFalse(identifies_code("DANDY-851", {"content_id": "1dandy00851c"}))
 
+    def test_digit_label_matches_the_dmm_content_id_serial(self):
+        self.assertTrue(identifies_code("T28-612", {"content_id": "55t2800612"}))
+        self.assertFalse(identifies_code("T28-612", {"content_id": "55t2800611"}))
+        self.assertFalse(identifies_code("T28-612", {"content_id": "55t3800612"}))
+
     def test_prefixed_release_requires_matching_product_evidence(self):
         dvd = {"id": "JAC-040", "content_id": "118jac040",
                "source_url": "https://www.dmm.co.jp/mono/dvd/-/detail/=/cid=118jac040/"}
@@ -235,6 +253,12 @@ class SourceIdentityTests(unittest.TestCase):
                 ("451HHH-022", {"id": "HHH-022", "content_id": "62hhh00022"}),
                 ("550ENE-006", {"id": "ENE-006", "content_id": "ene006"})):
             self.assertFalse(identifies_code(code, payload), code)
+
+    def test_a_registered_short_serial_rejects_the_padded_release(self):
+        # #296：`MCDV-24` 与 `MCDV-024` 是两部片，DMM 按补零猜出的 `mcdv00024` 是后者。
+        self.assertFalse(identifies_code("MCDV-24", {"content_id": "mcdv00024"}))
+        self.assertTrue(identifies_code("MCDV-024", {"content_id": "mcdv00024"}))
+        self.assertTrue(identifies_code("MCDV-24", {"id": "MCDV-24"}))
 
     def test_real_source_id_shapes_are_accepted(self):
         # DMM 带厂牌数字前缀，r18dev 对 IQQQ-026 会补零，259 系只在 URL 里出现番号。
@@ -293,3 +317,42 @@ class SourceIdentityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MetadataInterfaceTextTests(unittest.TestCase):
+    """登录墙的理由与候选旁证的说法带 code，英文界面按 code 拿到英文（ADR-0159）。"""
+
+    def test_an_authentication_wall_reason_renders_in_the_interface_language(self):
+        from peach import interface_text
+        from peach.metadata import auth_wall, reason_blames_credentials
+        reason = auth_wall(status_code=401)
+        self.assertEqual(interface_text.text(f"server:{reason['code']}", reason["params"], language="en"),
+                         "The source returned 401; rerun with different credentials")
+        self.assertTrue(reason_blames_credentials(reason))
+        self.assertFalse(reason_blames_credentials(auth_wall(status_code=403)))
+        # 当作鉴权报错的参数时，整句跟着同一语言渲染。
+        error = auth_error("javdb", reason, status_code=401)
+        self.assertEqual(interface_text.text(f"server:{error.code}", error.params, language="en").split(": ", 1)[1],
+                         "The source returned 401; rerun with different credentials")
+
+    def test_catalog_evidence_carries_codes_beside_the_original_wording(self):
+        from peach import interface_text
+        evidence = extract_catalog_evidence({
+            "runtime": 120,
+            "screenshot_urls": [f"https://img{index}.example/{index}.jpg" for index in range(30)],
+        })
+        screenshots = evidence["screenshot_urls"]
+        self.assertTrue(screenshots["display_value"].endswith("张截图（img0.example、img1.example 等）"))
+        self.assertEqual(
+            interface_text.text(f"server:{screenshots['display_value_code']}",
+                                {**screenshots["display_value_params"], "hosts": "img0.example, img1.example"},
+                                language="en"),
+            f"{len(screenshots['value'])} screenshots (img0.example, img1.example and more)")
+        self.assertEqual(len(screenshots["warning_codes"]), len(screenshots["warnings"]))
+        self.assertEqual(
+            interface_text.text(f"server:{screenshots['warning_codes'][0]}", screenshots["warning_params"][0],
+                                language="en").split(".")[0],
+            "The source returned 30 links")
+        self.assertEqual(evidence["runtime"]["display_value"], "120 分钟")
+        self.assertEqual(interface_text.text(f"server:{evidence['runtime']['display_value_code']}",
+                                             evidence["runtime"]["display_value_params"], language="en"), "120 min")

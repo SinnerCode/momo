@@ -4,6 +4,7 @@ import { queryClient } from '../../src/react/query';
 import { DiagnosticsPage } from '../../src/react/diagnostics/diagnostics-page';
 import { DIAGNOSTICS_KEY, type DiagnosticReport } from '../../src/react/diagnostics/diagnostics';
 import { ScrapingExport } from '../../src/react/diagnostics/scraping-export';
+import { publishLibraries } from '../../src/library-catalog';
 import { buttonNamed, click, fetchMock, linkNamed, mount, settle, type } from './render';
 
 notifyManager.setScheduler(notify => notify());
@@ -34,6 +35,7 @@ it('刮削记录显示后台进度并支持取消', async () => {
   const host = await mount(<QueryClientProvider client={queryClient}><ScrapingExport /></QueryClientProvider>);
   await settle();
   expect(host.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('2');
+  expect(host.querySelector('[data-task-progress]')?.getAttribute('data-task-progress')).toBe('embedded');
   expect((buttonNamed('导出刮削记录', host) as HTMLButtonElement).disabled).toBe(true);
   await click(buttonNamed('取消导出', host));
   await settle();
@@ -47,7 +49,7 @@ const data = (): DiagnosticReport => ({ version: 'test', status: 'warning', chec
   data_root: { label: '数据目录', status: 'failed', reason: '没有权限', action: '调整权限', target: null, details: {} },
 }, library: { issue_at: null, groups: {
   duration: { label: '缺时长', count: 2, status: 'ok', truncated: false, items: [
-    { id: 1, code: 'ABC-123', title: '作品甲', name: '甲.mp4', path: 'R:\\Media\\甲.mp4', location: 'local', duration: null, size: 1024 },
+    { id: 1, code: 'ABC-123', title: '作品甲', name: '甲.mp4', path: 'R:\\Media\\甲.mp4', location: 'local', duration: null, size: 1024, library_id: 'library-one' },
     { id: 2, code: null, title: '作品乙', name: '乙.mp4', path: 'R:\\Media\\乙.mp4', location: 'local', duration: null, size: 2048 },
   ] },
   cover: { label: '缺封面', count: 0, status: 'ok', truncated: false, items: [] },
@@ -71,13 +73,21 @@ it('诊断跳到具体配置分栏，系统权限项只显示动作', async () =
 it('展开作品表格并复制可识别信息；零结果有独立空态', async () => {
   const clipboard = vi.fn<(text: string) => Promise<void>>(async () => {});
   vi.stubGlobal('navigator', { clipboard: { writeText: clipboard } });
+  publishLibraries([{ id: 'library-one', name: '收藏', icon: 'film' }]);
   const { host, props } = await open();
   await click(host.querySelector('summary'));
   await click(buttonNamed('作品甲', host));
   expect(props.openItem).toHaveBeenCalledWith(1);
+  // 媒体库列与作品列表同一个归属：在库里的写库名，不在库里的写存储来源，都带图标。
+  const [, first, second] = [...host.querySelectorAll('[role="row"]')];
+  expect(first.textContent).toContain('收藏');
+  expect(first.querySelector('[data-source-mark="film"]')).not.toBeNull();
+  expect(second.textContent).toContain('本地');
+  expect(second.querySelector('[data-source-mark]')).not.toBeNull();
+  expect(buttonNamed('作品甲', host)?.getAttribute('title')).toBe('作品甲');
   await click(buttonNamed('复制当前清单', host));
   await settle();
-  expect(clipboard.mock.calls[0][0]).toContain('作品甲\tABC-123\t甲.mp4\t本地\tR:\\Media\\甲.mp4');
+  expect(clipboard.mock.calls[0][0]).toContain('作品甲\tABC-123\t甲.mp4\t收藏\tR:\\Media\\甲.mp4');
   expect(clipboard.mock.calls[0][0]).toContain('作品乙\t\t乙.mp4\t本地\tR:\\Media\\乙.mp4');
   expect(host.textContent).toContain('未识别');
   expect(props.receipt).toHaveBeenCalledWith('已复制清单');
@@ -118,6 +128,17 @@ it('恢复动作的名称与实际目标一致', async () => {
   expect(linkNamed('打开应用与维护', host)?.getAttribute('href')).toBe('/settings/maintenance');
   expect(linkNamed('查看任务', host)?.getAttribute('href')).toBe('/tasks');
   expect(linkNamed('打开来源和凭证', host)?.getAttribute('href')).toBe('/sources');
+});
+
+it('页头的诊断报告进度自己带框，和重新检查同排', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(url.startsWith('/api/diagnostics/exports')
+    ? { status: 'running', kind: 'support', job_id: 'report', stage: '收集日志', done: 1, total: 4 }
+    : data()))));
+  const { host } = await open();
+  await settle();
+  const report = host.querySelector('[data-guide-target="report"]')!;
+  expect(report.querySelector('[data-task-progress]')?.getAttribute('data-task-progress')).toBe('framed');
+  expect(buttonNamed('取消导出', report)?.parentElement).toBe(buttonNamed('重新检查', report)?.parentElement);
 });
 
 it('诊断报告启动时附浏览器环境，产物使用直接下载链接', async () => {

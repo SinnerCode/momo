@@ -1,5 +1,4 @@
 """采集设置与有界来源连接检查；凭据只写本机。"""
-import io
 import hashlib
 import json
 import time
@@ -7,12 +6,12 @@ import httpx
 
 from PIL import Image
 
-from .http import HttpRequest
-from .scraping_access import SOURCES, SourcePaused, SourceTransport, describe, save, record_source_check
+from .scraping_access import SOURCES, SourcePaused, SourceTransport, describe, save
 
-#: 连不上 DMM 图片主机时给的那句去处：2026-09 实测中国移动宽带直连大多在握手后被断开，
-#: 电信、联通直连正常，所以不是站点挂了，换条线路就好。
-MOBILE_BROADBAND_HINT = "中国移动宽带直连 DMM 图片主机常在握手后被断开，请把 DMM / FANZA 的连接方式设成 Peach 代理。"
+from . import interface_text
+from .coded_text import coded
+from .source_checks import check_source
+from .user_messages import UserValueError, failure_fields
 
 
 def _kept_cover_size(target, incoming, incoming_size, installed, previous):
@@ -40,51 +39,85 @@ def _kept_cover_size(target, incoming, incoming_size, installed, previous):
 def w_scraping_cover(contract, body):
     """仅处理用户指定且馆藏命中的番号；完整解码后才允许升级封面。"""
     from .catalog_rules import is_korean_mib_code
-    from .jav_cover_fetch import MIB_NOT_JAV
+    from .jav_cover_fetch import MIB_NOT_JAV_CODE
     from .metadata import validate_provider_code
     code = validate_provider_code(str(body.get("code", "")))
     if is_korean_mib_code(code):
-        raise ValueError(MIB_NOT_JAV)
+        raise UserValueError(MIB_NOT_JAV_CODE)
     with contract.database.read_connection() as connection:
         if not connection.execute("SELECT 1 FROM asset WHERE code=? LIMIT 1", (code,)).fetchone():
-            raise ValueError("馆藏未找到这个番号")
+            raise UserValueError("api.scraping.codeNotInCollection")
     return contract.scraping_cover_job.start_result(lambda: _fetch_cover(contract, code), recovery={'code': code})
 
 
-def _unavailable_reason(exc, network_failed: bool, statuses: set[int]) -> tuple[str, str]:
-    """一次封面比较没取到图时，页面上那一格的原因键与说法：先看线路，再看来源回了什么。"""
-    from .jav_cover_fetch import (CoverConnectError, HOSTS_UNREACHABLE, NO_USABLE_OFFICIAL,
-                                 OFFICIAL_PLACEHOLDER_ONLY)
+def _said(code: str, **params) -> dict:
+    return {"code": code, "params": params}
+
+
+def _rendered(parts: list[dict]) -> str:
+    """一串段落按 zh-CN 拼成的原句，给还不认段落的读者。"""
+    return "".join(interface_text.text(f"server:{part['code']}", part["params"]) for part in parts)
+
+
+def _unavailable_reason(exc, network_failed: bool, statuses: set[int]) -> tuple[str, list[dict]]:
+    """一次封面比较没取到图时，页面上那一格的原因键与说法（段落）：先看线路，再看来源回了什么。"""
+    from .jav_cover_fetch import (CoverConnectError, HOSTS_UNREACHABLE_CODE, NO_CANDIDATES_CODE,
+                                 NO_USABLE_OFFICIAL_CODES, OFFICIAL_PLACEHOLDER_ONLY_CODE)
+    # 按异常的 code 认是哪一句（`jav_cover_fetch` 抛出时带的 code），不比对原文。
+    code = getattr(exc, "code", None)
     if isinstance(exc, CoverConnectError):
-        return "network", f"{HOSTS_UNREACHABLE}，未能完成封面比较；{MOBILE_BROADBAND_HINT}"
+        return "network", [_said(HOSTS_UNREACHABLE_CODE), _said("labels.webScraping.compareIncompleteMobileHint")]
     if network_failed:
-        return "network", "来源连接失败，未能完成封面比较；请检查来源连接设置。"
+        return "network", [_said("errors.webScraping.sourceConnectionFailed")]
     if statuses & {401, 403}:
         codes = "/".join(str(s) for s in sorted(statuses & {401, 403}))
-        return "access_denied", f"来源拒绝访问（HTTP {codes}），请检查登录或来源验证状态。"
+        return "access_denied", [_said("errors.webScraping.sourceAccessDenied", status=codes)]
     if any(s >= 500 for s in statuses):
-        return "source_error", "来源服务异常（HTTP 5xx），请稍后重试。"
-    if str(exc) == "所有渠道都没有候选":
-        return "no_candidate", "来源没有返回这个番号的封面候选，无法判断是否有高清版。"
+        return "source_error", [_said("errors.webScraping.sourceServerError")]
+    if code == NO_CANDIDATES_CODE:
+        return "no_candidate", [_said("errors.webScraping.noCoverCandidates")]
     return {
-        OFFICIAL_PLACEHOLDER_ONLY: ("placeholder_only", f"{OFFICIAL_PLACEHOLDER_ONLY}。"),
-        **dict.fromkeys(NO_USABLE_OFFICIAL, (
-            "unusable_candidate", "候选封面未通过检查：图片未取得、无法解码或宽度不足 700px。")),
-    }.get(str(exc), ("download_failed", "候选封面完整下载或图片校验失败，未取得可保存的图片。"))
+        OFFICIAL_PLACEHOLDER_ONLY_CODE: ("placeholder_only", [_said(OFFICIAL_PLACEHOLDER_ONLY_CODE),
+                                                              _said("labels.webScraping.period")]),
+        **dict.fromkeys(NO_USABLE_OFFICIAL_CODES, ("unusable_candidate", [_said("errors.webScraping.unusableCandidate")])),
+    }.get(code, ("download_failed", [_said("errors.webScraping.downloadFailed")]))
+
+
+#: 候选封面没过检查的几种情形，各带张数。
+DIAGNOSTIC_LABELS = {
+    "placeholder": "labels.webScraping.diagnosticPlaceholder", "probe_failed": "labels.webScraping.diagnosticProbeFailed",
+    "invalid_image": "labels.webScraping.diagnosticInvalidImage", "too_small": "labels.webScraping.diagnosticTooSmall",
+    "download_failed": "labels.webScraping.diagnosticDownloadFailed",
+    "dimension_mismatch": "labels.webScraping.diagnosticDimensionMismatch",
+}
+
+
+def _error(code: str, **params) -> dict:
+    """封面任务失败那一句：`error` 是 zh-CN 原文，`error_code` 与 `error_params` 给界面取译文。"""
+    return {"error": interface_text.text(f"server:{code}", params), "error_code": code, "error_params": params}
+
+
+def _result(code: str, **params) -> dict:
+    """封面任务成功那一句：`result` 是 zh-CN 原文，`result_code` 与 `result_params` 给界面取译文。"""
+    return {"result": interface_text.text(f"server:{code}", params), "result_code": code, "result_params": params}
 
 
 def _fetch_cover(contract, code):
-    from .cover_artwork import install_cover
-    from .jav_cover_fetch import (best_cover, HostLimitedTransport, Unavailable,
+    from .cover_artwork import install_cover, is_user_cover
+    from .jav_cover_fetch import (best_cover, HostLimitedTransport, Unavailable, dmm_portrait,
                                  fc2_cover_candidates, logged_success_evidence)
     from .review_csv import read_rows
     target = contract.cover_root / (code + ".jpg")
+    # 编辑资料里换上的封面不联网替换；要换回刮削封面，在编辑资料里点「恢复刮削封面」（ADR-0165）。
+    if is_user_cover(target):
+        return {"ok": True, "code": code, "reason": "kept_existing", **_result("labels.webScraping.keptUserCover")}
     sidecar = target.with_suffix(".scraping.json")
     try:
         installed = json.loads(sidecar.read_text(encoding="utf-8"))
         if (time.time() - float(installed["checked_at"]) < 86400 and target.is_file()
                 and hashlib.sha256(target.read_bytes()).hexdigest() == installed["raw_sha256"]):
-            return {"ok": True, "code": code, "result": f"复用 24 小时内核验过的本机封面（{installed['width']} × {installed['height']}），没有再向来源请求。", **{
+            return {"ok": True, "code": code, **_result(
+                "labels.webScraping.reusedCover", width=installed["width"], height=installed["height"]), **{
                 key: installed[key] for key in ("width", "height", "raw_sha256")}}
     except (OSError, ValueError, KeyError, TypeError):
         installed = None
@@ -115,137 +148,95 @@ def _fetch_cover(contract, code):
                                           metadata_root=contract.follow_sources_root / "metadata" / "javinizer-go")
         kept_size = _kept_cover_size(target, candidate, size, installed, previous)
         if kept_size is not None:
-            suffix = "部分来源连接失败，未能完成全部来源比较。" if network_failed or any(s >= 400 and s != 404 for s in statuses) else "没有找到更大或更合适的封面。"
-            return {"ok": True, "code": code, "reason": "kept_existing",
-                    "result": f"本机封面 {kept_size[0]} × {kept_size[1]}，来源可用封面 {size[0]} × {size[1]}；保留本机封面。{suffix}"}
+            partial = network_failed or any(s >= 400 and s != 404 for s in statuses)
+            return {"ok": True, "code": code, "reason": "kept_existing", **_result(
+                "labels.webScraping.keptLocalPartial" if partial else "labels.webScraping.keptLocalNoBetter",
+                localWidth=kept_size[0], localHeight=kept_size[1], width=size[0], height=size[1])}
         evidence = {"code": code, "width": size[0], "height": size[1],
                     "source": candidate.source, "source_url": candidate.url,
                     "raw_sha256": hashlib.sha256(data).hexdigest(),
                     "installed_sha256": hashlib.sha256(data).hexdigest(),
                     "checked_at": time.time(), "resolver": "peach-jav-cover-v1"}
-        install_cover(target, code, data, size, evidence=evidence)
-        return {"ok": True, "code": code, "result": "高清封面已保存", "width": size[0],
+        install_cover(target, code, data, size, evidence=evidence,
+                      portrait=dmm_portrait(observed, candidate.url))
+        return {"ok": True, "code": code, **_result("labels.webScraping.coverSaved"), "width": size[0],
                 "height": size[1], "requests": raw.requests, "bytes": raw.bytes}
     except Unavailable as exc:
-        reason, message = _unavailable_reason(exc, network_failed, statuses)
-        labels = {"placeholder": "「准备中」占位图", "probe_failed": "图片头请求失败", "invalid_image": "图片无法解码",
-                  "too_small": "图片宽度不足 700px", "download_failed": "完整下载失败",
-                  "dimension_mismatch": "完整图片尺寸与探测结果不一致"}
-        details = "；".join(f"{label} {diagnostics[key]} 张" for key, label in labels.items() if diagnostics.get(key))
+        reason, parts = _unavailable_reason(exc, network_failed, statuses)
+        details = []
+        for key, label in DIAGNOSTIC_LABELS.items():
+            if diagnostics.get(key):
+                details += [*([_said("labels.webScraping.diagnosticSeparator")] if details else []),
+                            _said(label, count=diagnostics[key])]
         if details:
-            message = ("候选封面未通过检查。" if reason == "unusable_candidate" else message) + details + "。"
-        return {"ok": False, "code": code, "reason": reason, "error": message + "已有图片保留。"}
+            head = [_said("errors.webScraping.candidateChecksFailed")] if reason == "unusable_candidate" else parts
+            parts = [*head, *details, _said("labels.webScraping.keptAfterDetails")]
+        else:
+            parts = [*parts, _said("labels.webScraping.kept")]
+        # 一句由几段拼成：`error_parts` 每段一个 code，界面逐段取译文；`error` 是拼好的 zh-CN 原文。
+        return {"ok": False, "code": code, "reason": reason, "error": _rendered(parts), "error_parts": parts}
     except SourcePaused as exc:
-        return {"ok": False, "code": code, "reason": "paused", "error": str(exc)}
+        return {"ok": False, "code": code, "reason": "paused", **failure_fields(exc)}
     except httpx.TransportError:
-        return {"ok": False, "code": code, "reason": "network", "error": "来源连接失败，请检查来源连接设置；已有图片保留。"}
+        return {"ok": False, "code": code, "reason": "network",
+                **_error("api.scraping.sourceConnectionFailed")}
     except OSError:
-        return {"ok": False, "code": code, "reason": "local_file", "error": "本机封面读取或保存失败，请检查封面目录权限与磁盘空间。"}
+        return {"ok": False, "code": code, "reason": "local_file",
+                **_error("api.scraping.localCoverFailed")}
     except Exception as exc:
-        return {"ok": False, "code": code, "reason": "processing_error", "error": f"封面处理失败（{type(exc).__name__}），未能完成比较；请查看服务日志。",
+        return {"ok": False, "code": code, "reason": "processing_error",
+                **_error("api.scraping.coverProcessingFailed", errorType=type(exc).__name__),
                 "error_type": type(exc).__name__}
     finally:
         transport.close()
 
 
 def q_scraping(contract, _args):
+    from .scraping_access import browser_mode
     return {"sources": [describe(contract.follow_secrets_root, source) for source in SOURCES
                         if source != "instagram"],
-            "instagram_status": "Instagram 自动头像定位尚待独立登录会话验证"}
+            "browser_mode": browser_mode(contract.follow_secrets_root),
+            "instagram_status": interface_text.text(f"server:{INSTAGRAM_STATUS_CODE}"),
+            "instagram_status_code": INSTAGRAM_STATUS_CODE}
+
+
+#: Instagram 那一格的状态说明。
+INSTAGRAM_STATUS_CODE = "labels.webScraping.instagramPending"
 
 
 def w_scraping_settings(contract, body):
+    """一个来源的连接方式与 Cookie；只带 `browser_mode` 时改后台采集浏览器的模式（窗口／无窗口）。"""
+    if "browser_mode" in body and "source" not in body:
+        from .scraping_access import save_browser_mode
+        return {"ok": True, "browser_mode": save_browser_mode(contract.follow_secrets_root,
+                                                              str(body.get("browser_mode") or ""))}
     return {"ok": True, "saved": save(contract.follow_secrets_root, str(body.get("source", "")), body)}
 
 
-def _connection_failure(exc, label):
-    """来源连接异常对应可操作的诊断说明。"""
-    if isinstance(exc, SourcePaused):
-        detail, message = "cooldown", "来源正在冷却，请稍后重试。"
-    elif isinstance(exc, httpx.ProxyError):
-        detail, message = "proxy", "代理连接失败，请检查 Peach 代理。"
-    elif isinstance(exc, httpx.TimeoutException):
-        detail, message = "timeout", "来源连接超时，请稍后重试或检查连接方式。"
-    else:
-        detail = "network"
-        message = (f"连接未取得；{MOBILE_BROADBAND_HINT}" if label == "高清图片 CDN"
-                   else "连接未取得；此来源可能需要代理，请检查来源连接方式。")
-    return {"ok": False, "kind": "unavailable", "reason": detail,
-            "message": message, "error_type": type(exc).__name__}
-
-
-def _connection_message(detail, reason):
-    """来源响应的失败原因决定用户下一步操作。"""
-    from .metadata import reason_blames_credentials
-
-    if detail == "cloudflare_challenge":
-        return "来源返回人机验证页，请检查来源验证状态或更换出口。"
-    if detail == "rate_limited":
-        return "来源正在限流，请稍后重试。"
-    if detail == "not_found":
-        return "来源检查地址不存在，请核对站点地址。"
-    if reason_blames_credentials(reason):
-        return "来源要求登录或验证，请在官网完成登录后重试。"
-    return f"{reason}。" if reason else "来源暂不可用，请稍后重试。"
-
-
 def w_scraping_check(contract, body):
-    from .metadata import auth_wall_reason
-    source = str(body.get("source", ""))
-    if source not in SOURCES:
-        raise ValueError("未知采集来源")
-    if not SOURCES[source]["login"]:
-        return {"ok": True, "results": [{"label": "来源页面", "ok": False, "kind": "unavailable",
-                "reason": "needs_code", "message": "片商官网按番号选择，请输入馆藏番号检查高清封面。"}],
-                "session_verified": False}
-    targets = [("来源页面", SOURCES[source]["login"])]
-    if source == "dmm":
-        targets.append(("高清图片 CDN", "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/gyan00017/gyan00017pl.jpg"))
-    results = []
-    transport = SourceTransport(contract.follow_secrets_root)
-    try:
-        for label, url in targets:
-            result = {"label": label, "ok": False}
-            started = time.monotonic()
-            try:
-                response = transport(HttpRequest("GET", url, {"Range": "bytes=0-65535"}), 10, 65536)
-                # 鉴权失败与「站点挂了」是两件事，页面上要分得开：前者要人去官网登录
-                # 或换一份 Cookie，后者只要等。判据和元数据来源共用一份；重定向终点
-                # 只在真的跳转过时才算数，否则配置里本身就指向登录页的来源会自判失败。
-                reason = auth_wall_reason(
-                    status_code=response.status, body=response.body,
-                    final_url=response.url if response.url and response.url != url else "")
-                result.update(status=response.status, bytes=len(response.body),
-                              ok=response.status in {200, 206} and not reason,
-                              kind="ok" if response.status in {200, 206} and not reason
-                              else "auth" if reason else "unavailable")
-                from .browser_transport import CHALLENGE_MARKS
-                challenge = any(mark.lower() in response.body.decode("utf-8", errors="replace").lower()
-                                for mark in CHALLENGE_MARKS)
-                detail = ("cloudflare_challenge" if challenge else "auth_required" if reason
-                          else "ok" if result["ok"] else "rate_limited" if response.status == 429
-                          else "server_error" if response.status >= 500
-                          else "not_found" if response.status == 404 else "http_error")
-                result["reason"] = detail
-                if challenge:
-                    result.update(ok=False, kind="auth")
-                if label == "高清图片 CDN" and result["ok"]:
-                    with Image.open(io.BytesIO(response.body)) as image:
-                        result["width"], result["height"] = image.size
-                if not result["ok"]:
-                    # 成因锁死在凭据上才让人去登录。只剩状态码可看的 403 直接把
-                    # `auth_wall_reason` 那句原样给用户：出口 IP 被封时登录是白做，
-                    # 页面上再手写一份「请去登录」等于把人引去做错事。
-                    result["message"] = _connection_message(detail, reason)
-            except Exception as exc:
-                result.update(_connection_failure(exc, label))
-            result.update(checked_at=time.time(), elapsed_s=round(time.monotonic() - started, 2))
-            if label == "来源页面":
-                record_source_check(contract.follow_secrets_root, source, "connection", result)
-            results.append(result)
-    finally:
-        transport.close()
-    return {"ok": True, "results": results, "session_verified": False}
+    return check_source(contract.follow_secrets_root, str(body.get("source", "")))
+
+
+def w_scraping_check_all(contract, _body):
+    """全部来源跑一趟 `peach check-sources` 的同一检查。冷却中的来源在传输层直接判冷却，
+    不发请求；不登记续跑：服务重启后不该自己再打一轮来源。"""
+    from .source_preflight import check_sources, default_sources
+    job = contract.source_check_job
+    sources = default_sources()
+
+    def work(job_id):
+        def done(row):
+            with job.editing(job_id) as state:
+                if state is not None:
+                    state["results"].append(row)
+                    state["checked"] += 1
+                    state["current"] = {"label": row["label"]}
+        result = check_sources(contract.follow_secrets_root, sources, on_result=done)
+        targets = [target for row in result["sources"] for target in row["results"]]
+        job.update(job_id, status="complete", ok=result["ok"], results=result["sources"],
+                   failed=sum(target["outcome"] not in ("ok", "skipped") for target in targets),
+                   elapsed_s=result["elapsed_s"], completed_at=time.time())
+    return job.start(work, initial={"checked": 0, "total": len(sources), "results": []}, restart=True)
 
 
 def q_scraping_amane_bridge(contract, args):
@@ -259,7 +250,7 @@ def w_scraping_amane_check(contract, body):
     """只读 GitHub API 问上游最新 release。取不到就是「未取得」；升不升级由人读 diff 决定。"""
     from . import metadata_amane, peach_proxy
     latest = metadata_amane.latest_upstream_tag(peach_proxy.client_options(contract.follow_secrets_root))
-    return {"ok": True, "latest": latest, "checked_at": time.time()}
+    return {"ok": True, **coded("latest", latest), "checked_at": time.time()}
 
 
 def w_scraping_amane_rebuild(contract, body):

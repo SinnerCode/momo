@@ -176,7 +176,9 @@ class DockerPublicationTests(unittest.TestCase):
                        "candidate": {"identity": {"pipeline": "7"}, "docker": {"image_id": image["Id"]}}}
             (root / "build/ci-artifacts/release-candidate.json").write_text(json.dumps(receipt))
             driver = root / "driver.ps1"
-            driver.write_text('''function docker {
+            # 重定向时 pwsh 按系统代码页输出，中文 Windows 上失败消息是 GBK；按 UTF-8 读要先切换。
+            driver.write_text('''[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+function docker {
     param([Parameter(Position=0, ValueFromRemainingArguments=$true)][string[]]$DockerArgs,
           [Parameter(ValueFromPipeline=$true)][string]$LoginInput)
     Add-Content -LiteralPath calls.log -Value ($DockerArgs -join ' ')
@@ -194,8 +196,10 @@ try { & $env:TEST_CI_ENTRY docker-push } catch { Write-Output $_; exit 3 }
                 with self.subTest(failed=fail):
                     log = root / "calls.log"
                     log.unlink(missing_ok=True)
+                    # 中文 Windows 上 pwsh 的错误流按控制台代码页输出；输出只用于失败说明，解不了的字节替换掉。
                     result = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-File", str(driver)],
-                        cwd=root, env={**environment, "TEST_FAIL_PUSH": str(int(fail))}, text=True, encoding="utf-8", capture_output=True)
+                        cwd=root, env={**environment, "TEST_FAIL_PUSH": str(int(fail))}, text=True, encoding="utf-8",
+                        errors="replace", capture_output=True)
                     calls = log.read_text(encoding="utf-8-sig")
                     self.assertEqual(result.returncode == 0, not fail, (result.stdout or "") + (result.stderr or ""))
                     self.assertEqual("image rm peach-ci:1.2.3-7" in calls, not fail)
@@ -282,14 +286,34 @@ class GitHubCandidateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "未取得"):
                 github.select("owner/repo", "a" * 40)
 
-    def test_loaded_docker_image_must_match_the_recorded_image_id(self):
-        image = {"Id": "sha256:" + "b" * 64, "Config": {"Labels": {
-            "org.opencontainers.image.version": "1.2.3", "org.opencontainers.image.revision": "a" * 40}}}
+    def test_loaded_docker_image_must_match_the_recorded_image_content(self):
+        image = {"Id": "sha256:" + "b" * 64, "Architecture": "arm64", "Os": "linux",
+                 "RootFS": {"Type": "layers", "Layers": ["sha256:" + "1" * 64, "sha256:" + "2" * 64]},
+                 "Config": {"Entrypoint": ["/entrypoint.sh"], "Env": ["PATH=/usr/bin"], "Labels": {
+                     "org.opencontainers.image.version": "1.2.3", "org.opencontainers.image.revision": "a" * 40}}}
+        inspected = []
+        def inspect(command, **_kw):
+            inspected.append(command[-1])
+            return json.dumps(image)
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40}), \
-                mock.patch.object(github.subprocess, "check_output", side_effect=lambda *_a, **_kw: json.dumps(image)):
+                mock.patch.object(github.subprocess, "check_output", side_effect=inspect):
             receipt = Path(directory) / "image.json"
-            github.image_receipt(receipt, "1.2.3", verify=False)
-            github.image_receipt(receipt, "1.2.3", verify=True)
+            github.image_receipt(receipt, "1.2.3", "arm64", verify=False)
+            github.image_receipt(receipt, "1.2.3", "arm64", verify=True)
+            self.assertEqual(set(inspected), {"longmeidao/peach:candidate-arm64"}, "每个架构核对自己的候选标签")
+            with self.assertRaisesRegex(ValueError, "架构"):
+                github.image_receipt(receipt, "1.2.3", "amd64", verify=True)
+            # 在 arm64 runner（overlay2）记录、在 amd64 runner（containerd）载入后核对：Id 换了，内容没变。
             image["Id"] = "sha256:" + "c" * 64
+            github.image_receipt(receipt, "1.2.3", "arm64", verify=True)
+            image["RootFS"]["Layers"][-1] = "sha256:" + "3" * 64
             with self.assertRaises(ValueError):
-                github.image_receipt(receipt, "1.2.3", verify=True)
+                github.image_receipt(receipt, "1.2.3", "arm64", verify=True)
+            image["RootFS"]["Layers"][-1] = "sha256:" + "2" * 64
+            image["Config"]["Entrypoint"] = ["/other.sh"]
+            with self.assertRaises(ValueError):
+                github.image_receipt(receipt, "1.2.3", "arm64", verify=True)
+
+    def test_docker_promotion_requires_an_accepted_candidate_for_every_architecture(self):
+        self.assertTrue({"docker-candidate-amd64", "docker-candidate-arm64"} <= github.REQUIRED_ARTIFACTS)
+        self.assertTrue({"Linux amd64 镜像构建与验收", "Linux arm64 镜像构建与验收"} <= github.REQUIRED_JOBS)

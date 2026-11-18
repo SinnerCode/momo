@@ -3,6 +3,7 @@ import json
 import gzip
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -11,11 +12,25 @@ import httpx
 from starlette.applications import Starlette
 from starlette.routing import Route
 
+from peach import remote_media_cache
 from peach.preview_cache import PreviewCache
 from peach.remote_media_cache import AVATAR_REFRESH_SECONDS, FAVICON_REFRESH_SECONDS, RemoteMediaCache
 
 
 class RemoteMediaCacheTests(unittest.IsolatedAsyncioTestCase):
+    def test_capacity_denial_after_fetch_does_not_write_or_enter_upstream_cooldown(self):
+        from peach.jobs import DiskSpaceDenied
+        from peach.remote_media_cache import RemoteMediaUnavailable
+        guard = mock.Mock()
+        guard.check.side_effect = [None, DiskSpaceDenied('errors.storageBudget.cacheWritesStopped', {'reasons': '缓存超限'})]
+        self.cache.capacity_guard = guard
+        with self.assertRaises(RemoteMediaUnavailable):
+            self.cache.bytes('new-image', lambda: b'image')
+        self.assertFalse(list(self.root.rglob('*.data')))
+        self.assertFalse(list(self.root.rglob('*.failed')))
+        guard.check.side_effect = None
+        self.assertEqual(self.cache.bytes('new-image', lambda: b'image'), b'image')
+
     async def test_active_documents_are_rejected_without_forwarding_or_caching_bytes(self):
         self.payload=b'<svg><script>active()</script></svg>'
         for kind in ('image/svg+xml','text/html','application/xhtml+xml','application/xml',''):
@@ -39,6 +54,19 @@ class RemoteMediaCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.content,self.payload)
         self.assertEqual(self.calls,1)
         self.assertEqual(response.headers['cache-control'],'private, no-cache')
+
+    async def test_damaged_cache_metadata_is_a_miss_not_a_server_error(self):
+        slot = self.cache._slot('follow:1:media:0')
+        slot.parent.mkdir(parents=True)
+        slot.with_suffix('.bin').write_bytes(b'x' * 4)
+        for headers in (['content-type'], {'content-type': ['video/mp4']}):
+            with self.subTest(headers=headers):
+                slot.with_suffix('.json').write_text(json.dumps({'status': 200, 'size': 4, 'headers': headers}),
+                                                     encoding='utf-8')
+                self.assertIsNone(self.cache.stored('follow:1:media:0'))
+        response = await self.client.get('/media')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, self.payload)
 
     async def test_hls_manifests_remain_available_as_passive_media(self):
         self.payload=b'#EXTM3U\n'
@@ -82,6 +110,46 @@ class RemoteMediaCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(head.content, b"")
         self.assertEqual(self.calls, 1)
 
+    async def test_metadata_write_recovers_after_the_cache_folder_keeps_disappearing(self):
+        real = remote_media_cache.atomic_write_text
+        calls = 0
+        def flaky(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls < remote_media_cache.SIDECAR_ATTEMPTS:
+                raise FileNotFoundError
+            return real(*args, **kwargs)
+        with mock.patch.object(remote_media_cache, "atomic_write_text", side_effect=flaky):
+            first = await self.client.get("/media")
+            replay = await self.client.get("/media", headers={"Range": "bytes=2-5"})
+        self.assertEqual(first.content, self.payload)
+        self.assertEqual(replay.content, b"2345")
+        self.assertEqual(self.calls, 1)
+
+    async def test_a_new_capture_installs_its_own_data_file_and_drops_the_previous_one(self):
+        """数据文件每次用新名字、sidecar 最后写：不替换正被读着的文件，也不会新数据配旧长度。"""
+        key = "follow:1:media:0"
+        first = await self.client.get("/media")
+        self.assertEqual(first.content, self.payload)
+        slot = self.cache._slot(key)
+        before = json.loads(slot.with_suffix(".json").read_text(encoding="utf-8"))["file"]
+        self.payload = b"abcdefghij"
+        list(self.cache._capture_response(
+            slot, httpx.Response(200, headers=self.headers, stream=httpx.ByteStream(self.payload)),
+            self.headers, accepted=True, content_range=None, complete_range=False))
+        after = json.loads(slot.with_suffix(".json").read_text(encoding="utf-8"))["file"]
+        self.assertNotEqual(before, after)
+        self.assertEqual([path.name for path in slot.parent.glob("*.bin")], [after])
+        path, _metadata = self.cache.stored(key)
+        self.assertEqual(path.read_bytes(), b"abcdefghij")
+
+    async def test_missing_cache_folder_falls_back_to_the_live_response(self):
+        with mock.patch.object(remote_media_cache, "atomic_path", side_effect=FileNotFoundError):
+            response = await self.client.get("/media")
+        self.assertEqual(response.content, self.payload)
+        self.assertEqual(self.calls, 1)
+        self.assertIsNone(self.cache.stored("follow:1:media:0"))
+
     async def test_partial_response_is_reused_only_for_its_range(self):
         self.status, self.payload = 206, b"2345"
         self.headers.update({"content-range": "bytes 2-5/10", "content-length": "4"})
@@ -105,6 +173,39 @@ class RemoteMediaCacheTests(unittest.IsolatedAsyncioTestCase):
         responses = await asyncio.gather(self.client.get("/media"), self.client.get("/media"))
         self.assertEqual([response.content for response in responses], [self.payload] * 2)
         self.assertEqual(self.calls, 1)
+
+    async def test_another_range_is_not_queued_behind_a_playing_download(self):
+        """在线播放时整段还在送，拖动或读尾部 moov 的另一个 Range 当场取上游，不排在它后面。"""
+        started, release = threading.Event(), threading.Event()
+
+        class Held(httpx.SyncByteStream):
+            def __iter__(self):
+                yield b"01"
+                started.set()
+                release.wait(10)
+                yield b"23456789"
+
+        def fetch(request):
+            self.calls += 1
+            if "range" not in request.headers:
+                return httpx.Response(200, headers=self.headers, stream=Held())
+            return httpx.Response(206, headers={"content-type": "video/mp4", "content-length": "4",
+                                               "content-range": "bytes 2-5/10"}, stream=httpx.ByteStream(b"2345"))
+
+        def endpoint(request):
+            return self.cache.stream("follow:1:media:0", request, lambda: fetch(request))
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=Starlette(routes=[Route("/media", endpoint)])),
+                                   base_url="http://test")
+        self.addAsyncCleanup(client.aclose)
+        playing = asyncio.create_task(client.get("/media"))
+        try:
+            await asyncio.to_thread(started.wait, 5)
+            seek = await asyncio.wait_for(client.get("/media", headers={"Range": "bytes=2-5"}), 5)
+            self.assertEqual((seek.status_code, seek.content), (206, b"2345"))
+        finally:
+            release.set()
+        self.assertEqual((await playing).content, self.payload)
+        self.assertEqual(self.calls, 2)
 
     async def test_a_complete_range_can_serve_other_ranges(self):
         self.status = 206
@@ -170,6 +271,29 @@ class RemoteMediaCacheTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PreviewCacheTests(unittest.TestCase):
+    def test_new_sources_use_the_short_layout_that_stays_under_max_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = RemoteMediaCache(Path(directory).resolve())
+            ref = PreviewCache(cache).register('ABP-123', 'https://cdn.example/root.m3u8')
+            [saved] = (cache.root / 'p').rglob('*.source.json')
+            self.assertEqual(saved.name, f'{ref}.source.json')
+            self.assertLess(len(saved.relative_to(cache.root).as_posix()), 100)
+            self.assertFalse(cache.folder('preview:ABP-123').exists())
+            self.assertEqual(PreviewCache(cache).source('ABP-123', ref)['url'], 'https://cdn.example/root.m3u8')
+
+    def test_saved_sources_keep_reading_from_the_earlier_cache_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = RemoteMediaCache(Path(directory).resolve())
+            ref = 'a' * 64
+            legacy = cache.folder('preview:ABP-123') / f'{ref}.source.json'
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(json.dumps({'url': 'https://cdn.example/root.m3u8', 'playlist': True}))
+
+            self.assertEqual(
+                PreviewCache(cache).source('ABP-123', ref),
+                {'url': 'https://cdn.example/root.m3u8', 'playlist': True},
+            )
+
     def test_nested_playlists_keys_and_init_segments_are_local_and_persistent(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = RemoteMediaCache(Path(directory).resolve())

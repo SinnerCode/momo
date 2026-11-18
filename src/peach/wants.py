@@ -13,29 +13,42 @@
 同样输入同样输出，按 ADR-0052 直接落库，记归属串 `AUTO_SOURCE` 与批次 `<source>@<登记时刻>`，
 `revert` 按它们整批撤回成待找。
 
-**查找状态。** 真正的查资源归第 41–43 条的下载模块；这里留状态与计数，给它一个记账入口
-`record_search`。照 SakuraMedia 的口径：发售 90 天内的新片查不到也不计数，一直待找；老片
-（发行日缺失也按老片算）查满 `STALE_ATTEMPT_LIMIT` 次无果标「暂时放弃」，`reset_search` 手动重置。
-还没发售的不催：`phase` 按发行日现算出「未发售」，`pending_targets` 不交出它。
+**查找状态。** 查资源的是 `want_search` 的定时任务与浏览器添加队列；这里留状态与计数，给它们
+一个记账入口 `record_search`。照 SakuraMedia 的口径：发售 90 天内的新片查不到也不计数，一直待找；老片
+（发行日缺失也按老片算）查满放弃次数无果标「暂时放弃」，`reset_search` 手动重置。老片多久再查一次、
+查几次放弃（0 表示一直查）是跟着账本走的设置，由 `cadence` 读出，缺省为每周一次、三次放弃。
+还没发售的不催：`phase` 按发行日现算出「未发售」，`pending_targets` 不交出它。`due_targets`
+在待找里挑出到了再查时间的：新片每天、老片按设置的间隔、上次来源失败的隔几小时。
 
 调用方负责事务：这里的函数只在给定连接上写，不提交。
 """
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 from .catalog_rules import normalise_code_key, release_code_from_text
 from .record_rehome import code_key as asset_code_key
+from .user_messages import UserValueError
 
 #: 入库自动对账写下的归属串。
 AUTO_SOURCE = "auto:want-acquired"
 
 #: 发售多少天之内算新片：查不到也不计数，持续待找。
 FRESH_DAYS = 90
-#: 老片查满几次无果就暂时放弃。
+#: 老片查满几次无果就暂时放弃；0 表示一直查。设置里的 `wantStaleAttemptLimit` 从这几档里选。
 STALE_ATTEMPT_LIMIT = 3
+STALE_ATTEMPT_LIMITS = (0, 1, 3, 5, 10)
+#: 老片多久再查一次（天）。设置里的 `wantStaleSearchDays` 从这几档里选。
+STALE_SEARCH_DAYS = 7
+STALE_SEARCH_DAY_CHOICES = (1, 3, 7, 14, 30)
+#: 待找的多久再查一次。新片每天查：刚发售的资源一两天内就会出现；老片默认每周查，
+#: 查满 `STALE_ATTEMPT_LIMIT` 次约三周后暂时放弃。上次是来源失败的，隔几小时再试。
+FRESH_SEARCH_EVERY = timedelta(days=1)
+STALE_SEARCH_EVERY = timedelta(days=STALE_SEARCH_DAYS)
+ERROR_SEARCH_EVERY = timedelta(hours=6)
 
 #: 三种状态，含义见迁移 0042。
 WANTED, GIVEN_UP, ACQUIRED = "wanted", "given_up", "acquired"
@@ -53,6 +66,51 @@ _COLUMNS = ("id,code,code_key,follow_item_id,origin,title,link,cover_url,release
             "performers,scraped_at,scrape_error,state,search_count,last_search_at,"
             "last_search_outcome,last_search_note,given_up_at,acquired_asset_id,acquired_at,"
             "acquired_source,acquired_batch,created_at,updated_at")
+
+
+def _choice(raw, choices: tuple[int, ...]) -> int | None:
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value in choices else None
+
+
+def normalise_stale_search_days(raw) -> int | None:
+    """老片再查间隔的一档；不在档位里就是 None，由调用方决定报错还是用默认。"""
+    return _choice(raw, STALE_SEARCH_DAY_CHOICES)
+
+
+def normalise_stale_attempt_limit(raw) -> int | None:
+    """放弃前查几次的一档，0 表示一直查；不在档位里就是 None。"""
+    return _choice(raw, STALE_ATTEMPT_LIMITS)
+
+
+@dataclass(frozen=True)
+class Cadence:
+    """老片的查找节奏：多久再查一次、查满几次无果暂时放弃（0 表示一直查）。"""
+
+    stale_every: timedelta = STALE_SEARCH_EVERY
+    attempt_limit: int = STALE_ATTEMPT_LIMIT
+
+
+def cadence(connection) -> Cadence:
+    """账本设置（`profile.settings_json`）里的节奏。"""
+    from .profiles import read_settings
+    try:
+        return cadence_from(read_settings(connection))
+    except sqlite3.Error:
+        return Cadence()
+
+
+def cadence_from(stored: dict) -> Cadence:
+    """一份设置载荷里的节奏，没设过或存坏了的项用默认值。"""
+    days = normalise_stale_search_days(stored.get("wantStaleSearchDays"))
+    limit = normalise_stale_attempt_limit(stored.get("wantStaleAttemptLimit"))
+    return Cadence(stale_every=timedelta(days=days) if days is not None else STALE_SEARCH_EVERY,
+                   attempt_limit=STALE_ATTEMPT_LIMIT if limit is None else limit)
 
 
 def stamp(moment: datetime | None = None) -> str:
@@ -83,7 +141,10 @@ def parse_code(text: str | None) -> tuple[str, str]:
     code = release_code_from_text(str(text or "").strip())
     key = normalise_code_key(code) if code else ""
     if not key:
-        raise ValueError(f"认不出番号：{str(text or '').strip() or '（空）'}")
+        shown = str(text or '').strip()
+        if not shown:
+            raise UserValueError("errors.wants.codeEmpty")
+        raise UserValueError("errors.wants.codeUnrecognized", {"text": shown})
     return code, key
 
 
@@ -138,10 +199,10 @@ def wanted_keys(connection, keys: Iterable[str]) -> set[str]:
 
 
 def in_library(connection, key: str) -> bool:
-    """这个番号键在库里有没有一部：与 `feeds.in_library` 同一口径，已消失的不算，回收站里的算。"""
+    """这个番号键在库里有没有一部：与 `feeds.in_library` 同一口径，只算视频，已消失的不算，回收站里的算。"""
     _register(connection)
     return connection.execute(
-        "SELECT 1 FROM asset WHERE code IS NOT NULL AND COALESCE(disposal,'')<>'vanished'"
+        "SELECT 1 FROM asset WHERE medium='video' AND code IS NOT NULL AND COALESCE(disposal,'')<>'vanished'"
         " AND normalise_code_key(code)=? LIMIT 1", (key,)).fetchone() is not None
 
 
@@ -164,7 +225,7 @@ def add_code(connection, text: str, *, origin: str = "code", now: str | None = N
         raise ValueError(f"unknown want origin: {origin}")
     code, key = parse_code(text)
     if in_library(connection, key):
-        raise ValueError(f"{code} 已经在库里")
+        raise UserValueError("errors.wants.alreadyInLibrary", {"code": code})
     moment = now or stamp()
     shell = _shell(connection, key)
     if shell is not None:
@@ -206,7 +267,7 @@ def add_feed(connection, discovery_id: int, *, now: str | None = None) -> dict:
     found = connection.execute(
         "SELECT code FROM feed_discovery WHERE id=?", (int(discovery_id),)).fetchone()
     if found is None:
-        raise ValueError("找不到这条新作")
+        raise UserValueError("errors.wants.feedItemMissing")
     return add_code(connection, found[0], origin="feed", now=now)
 
 
@@ -215,7 +276,7 @@ def add_follow(connection, item_id: int, *, now: str | None = None) -> dict:
     found = _rows(connection, "SELECT id,title,url,published_at,status FROM follow_item WHERE id=?",
                   (int(item_id),))
     if not found:
-        raise ValueError("找不到这条关注条目")
+        raise UserValueError("errors.wants.followItemMissing")
     item = found[0]
     if item["status"] == "ignored":
         connection.execute("UPDATE follow_item SET status='seen' WHERE id=?", (item["id"],))
@@ -239,6 +300,32 @@ def remove(connection, want_ids: Iterable[int]) -> int:
         removed += connection.execute(
             f"DELETE FROM want_item WHERE id IN ({','.join('?' * len(batch))})", batch).rowcount or 0
     return removed
+
+
+def snapshot(connection, want_ids: Iterable[int]) -> list[dict]:
+    """移除或重置之前这几条的整行，回执交给前端，撤销时原样写回。"""
+    ids = sorted({int(value) for value in want_ids})
+    rows: list[dict] = []
+    for batch in _chunks(ids):
+        rows.extend(dict(row) for row in connection.execute(
+            f"SELECT * FROM want_item WHERE id IN ({','.join('?' * len(batch))})", batch))
+    return rows
+
+
+def restore_rows(connection, rows: Iterable[dict]) -> int:
+    """撤销移除或重置：按 `snapshot` 交回的整行写回，已存在的按 id 覆盖。只认表里有的列。"""
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(want_item)")]
+    restored = 0
+    for row in rows:
+        if not isinstance(row, dict) or type(row.get("id")) is not int:
+            raise ValueError("each restored want needs its integer id")
+        keys = [column for column in columns if column in row]
+        updates = ",".join(f"{column}=excluded.{column}" for column in keys if column != "id")
+        connection.execute(
+            f"INSERT INTO want_item({','.join(keys)}) VALUES({','.join('?' * len(keys))}) "
+            f"ON CONFLICT(id) DO UPDATE SET {updates}", [row[column] for column in keys])
+        restored += 1
+    return restored
 
 
 def drop_codes(connection, codes: Iterable[str]) -> int:
@@ -267,7 +354,7 @@ def reconcile(connection, asset_ids: Iterable[int], *, now: str | None = None) -
     """新登记的这几行命中了哪些想要，标「已入库」并返回它们的 id。
 
     番号键用 `record_rehome.code_key`：刚登记的行 `code` 还空着，从文件名解析。判在库与
-    `feeds.in_library` 同一口径，只看 `disposal` 为空的行。关注条目按 `follow_item.asset_id`
+    `feeds.in_library` 同一口径，只看 `disposal` 为空的视频，先入库的封面图不算到手。关注条目按 `follow_item.asset_id`
     认：保存进账本的那条就是它。同一个批次号记这一轮的时刻，整批撤回按它认。
     """
     ids = sorted({int(value) for value in asset_ids})
@@ -281,7 +368,7 @@ def reconcile(connection, asset_ids: Iterable[int], *, now: str | None = None) -
     for batch in _chunks(ids):
         marks = ",".join("?" * len(batch))
         for row in _rows(connection, f"SELECT id,code,name FROM asset WHERE id IN ({marks})"
-                         " AND disposal IS NULL", batch):
+                         " AND disposal IS NULL AND medium='video'", batch):
             key = asset_code_key(row)
             if key:
                 by_key.setdefault(key, int(row["id"]))
@@ -330,13 +417,13 @@ def record_search(connection, want_id: int, outcome: str, *, note: str = "",
     """下载模块查了一次资源，记一笔，返回这一条现在的段（`phase`）。
 
     `found` 清零计数、取消暂时放弃；`error` 只记下这次失败，不算查过；`none` 只给老片计数，
-    满 `STALE_ATTEMPT_LIMIT` 次标暂时放弃。已入库的不再记。
+    满设置的放弃次数（`cadence`，0 表示一直查）标暂时放弃。已入库的不再记。
     """
     if outcome not in SEARCH_OUTCOMES:
         raise ValueError(f"unknown search outcome: {outcome}")
     row = get(connection, want_id)
     if row is None:
-        raise ValueError("找不到这条想要")
+        raise UserValueError("errors.wants.wantMissing")
     day = today or date.today()
     if row["state"] == ACQUIRED:
         return ACQUIRED
@@ -346,7 +433,8 @@ def record_search(connection, want_id: int, outcome: str, *, note: str = "",
         count, state, given_up = 0, WANTED, None
     elif outcome == "none" and not is_fresh(row["release_date"], day):
         count += 1
-        if count >= STALE_ATTEMPT_LIMIT and state != GIVEN_UP:
+        limit = cadence(connection).attempt_limit
+        if limit and count >= limit and state != GIVEN_UP:
             state, given_up = GIVEN_UP, moment
     connection.execute(
         "UPDATE want_item SET search_count=?,state=?,given_up_at=?,last_search_at=?,"
@@ -389,6 +477,8 @@ class WantTarget:
     fresh: bool
     search_count: int
     last_search_at: str | None
+    #: 上次查找的结果（`SEARCH_OUTCOMES` 之一），没查过为 None。
+    last_search_outcome: str | None = None
 
 
 def pending_targets(connection, *, today: date | None = None) -> list[WantTarget]:
@@ -402,7 +492,7 @@ def pending_targets(connection, *, today: date | None = None) -> list[WantTarget
     rows = _rows(
         connection,
         "SELECT w.id,w.code,w.code_key,w.title,w.release_date,w.studio,w.performers,w.link,"
-        "w.follow_item_id,f.url AS follow_url,w.search_count,w.last_search_at,w.state"
+        "w.follow_item_id,f.url AS follow_url,w.search_count,w.last_search_at,w.last_search_outcome,w.state"
         " FROM want_item w LEFT JOIN follow_item f ON f.id=w.follow_item_id"
         " WHERE w.state='wanted' AND (w.code_key IS NULL OR NOT EXISTS"
         " (SELECT 1 FROM asset a WHERE a.code IS NOT NULL AND COALESCE(a.disposal,'')<>'vanished'"
@@ -413,9 +503,40 @@ def pending_targets(connection, *, today: date | None = None) -> list[WantTarget
         release_date=row["release_date"], studio=row["studio"], performers=row["performers"],
         link=row["link"], follow_item_id=row["follow_item_id"], follow_url=row["follow_url"],
         fresh=is_fresh(row["release_date"], day), search_count=int(row["search_count"] or 0),
-        last_search_at=row["last_search_at"])
+        last_search_at=row["last_search_at"], last_search_outcome=row["last_search_outcome"])
         for row in rows if phase(row, day) == SEARCHING]
     return sorted(targets, key=lambda target: not target.fresh)
+
+
+def _moment(value: str | None) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def search_due(target: WantTarget, now: datetime, stale_every: timedelta = STALE_SEARCH_EVERY) -> bool:
+    """这一条到没到再查的时间：没查过的马上查，其余按上次结果与新旧隔开。"""
+    last = _moment(target.last_search_at)
+    if last is None:
+        return True
+    every = (ERROR_SEARCH_EVERY if target.last_search_outcome == "error"
+             else FRESH_SEARCH_EVERY if target.fresh else stale_every)
+    return now - last >= every
+
+
+def due_targets(connection, *, now: datetime | None = None,
+                today: date | None = None) -> list[WantTarget]:
+    """定时查找这一轮要查的：有番号的待找里到了再查时间的，没查过的在前，其后新片在前。
+
+    关注条目没有番号，资源查询认不了，交给用户在清单上手动处理。
+    """
+    moment = now or datetime.now(timezone.utc)
+    every = cadence(connection).stale_every
+    due = [target for target in pending_targets(connection, today=today)
+           if target.code and search_due(target, moment, every)]
+    return sorted(due, key=lambda target: (target.last_search_at is not None, not target.fresh))
 
 
 def list_rows(connection) -> list[dict]:

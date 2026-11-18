@@ -10,6 +10,7 @@
 import { apiGet, apiSend } from '../../api';
 import { prefetchMediaSources } from '../media-sources';
 import { queryClient } from '../query';
+import { t } from '../../i18n';
 
 /** 120 组够铺满这一页，再多的由「可回收」排序挤到后面。 */
 export const DUPLICATES_URL = '/api/duplicates?limit=120';
@@ -22,6 +23,10 @@ export const BATCH_LIMIT = 200;
 /** `/api/duplicates` 里的一个文件。字段与 `web_batch.q_duplicates` 对齐。 */
 export interface DuplicateFile {
   id: number;
+  code?: string | null;
+  has_cover?: boolean;
+  cover_key?: string;
+  cover_version?: string;
   name: string;
   path: string | null;
   location: string;
@@ -30,6 +35,8 @@ export interface DuplicateFile {
   duration: number | null;
   is_largest: boolean;
   is_longest: boolean;
+  /** 这组保留过、这一份是之后才加入的。 */
+  is_new?: boolean;
 }
 
 export interface DuplicateGroup {
@@ -43,6 +50,8 @@ export interface DuplicateGroup {
   drives: string[];
   cross_drive: boolean;
   reclaimable: number;
+  /** 保留过的组又加入了几份；为 0 或缺省时这组从没保留过。 */
+  new_files?: number;
 }
 
 export interface DuplicatesData {
@@ -51,39 +60,52 @@ export interface DuplicatesData {
   reclaimable: number;
   groups: DuplicateGroup[];
   has_more?: boolean;
+  /** 标过「都保留」、当前组员都在保留记录里的组数；待处理那一份的各项不含它们。 */
+  kept?: number;
 }
+
+/** 整组标记都保留，或撤销这个标记。服务端按组员 id 集合记：当前组员都在记录里就算已保留，
+ *  少一份不会回来，只有新文件加入才重新列出。 */
+export const keepGroup = (ids: readonly number[], keep: boolean) =>
+  apiSend(BATCH_URL, { ids, operation: keep ? 'keep-duplicates' : 'reconsider-duplicates' });
+
+/** 几组一起标都保留或取消保留。按整组装进请求，一次不超过 200 个文件。 */
+export async function keepGroups(groups: readonly DuplicateGroup[], keep: boolean): Promise<void> {
+  let batch: number[][] = [];
+  let size = 0;
+  const send = async () => {
+    if (!batch.length) return;
+    await apiSend(BATCH_URL, { groups: batch, operation: keep ? 'keep-duplicates' : 'reconsider-duplicates' });
+    batch = [];
+    size = 0;
+  };
+  for (const group of groups) {
+    const ids = group.files.map((file) => file.id);
+    if (size + ids.length > BATCH_LIMIT) await send();
+    batch.push(ids);
+    size += ids.length;
+  }
+  await send();
+}
+
+/** 已保留的那几组：「已保留」视图读它，能逐组或成批取消保留。 */
+export const KEPT_DUPLICATES_URL = '/api/duplicates?limit=120&view=kept';
+export const KEPT_DUPLICATES_KEY = ['duplicates', 'kept'] as const;
 
 export const fetchDuplicates = (signal?: AbortSignal) =>
   apiGet<DuplicatesData>(DUPLICATES_URL, signal);
 
-/* 名字之间在哪里断开算一个词：空格、连字符、下划线、点、括号与路径分隔符。 */
-const NAME_BREAK = /[\s\-_.()[\]【】/\\]/;
+export const fetchKeptDuplicates = (signal?: AbortSignal) =>
+  apiGet<DuplicatesData>(KEPT_DUPLICATES_URL, signal);
 
-/** 一组副本共有的开头，退到最后一个断词处：同一部片子的几份常只在中段不同（分辨率、
- *  转载站、序号），整名中段截断正好把唯一的差别切掉。共有段不足 8 个字或只有一份时为空。 */
-export function sharedNamePrefix(names: readonly string[]): string {
-  if (names.length < 2) return '';
-  let end = 0;
-  const first = names[0]!;
-  while (end < first.length && names.every((name) => name[end] === first[end])) end += 1;
-  // 共有段一直到某一个名字的结尾时，那个名字整个都是共有段，退一格留出能显示的部分。
-  if (names.some((name) => name.length <= end)) end = Math.max(0, end - 1);
-  let cut = end;
-  while (cut > 0 && !NAME_BREAK.test(first[cut - 1]!)) cut -= 1;
-  return cut >= 8 ? first.slice(0, cut) : '';
-}
+/** 一组的文件 id 连起来，当作这组在选择集里的键。 */
+export const groupKey = (group: DuplicateGroup) => group.files.map((file) => file.id).join(',');
 
-/** 组内显示的名字：去掉组里共有的开头，用「…」顶替；组头已经写着番号。 */
-export const distinctName = (name: string, prefix: string) =>
-  prefix && name.startsWith(prefix) && name.length > prefix.length ? `…${name.slice(prefix.length)}` : name;
-
-/** 首屏：重复分组与配了根目录的网盘（「留 115」那几颗键要它），取完才画。不给 `staleTime`，
+/** 首屏分组就绪后显示；来源独立读取，供「留 115」等可选规则使用。不给 `staleTime`，
  *  `/duplicates` 是 `refresh:'reopen'`，进来就重取。 */
 export async function prefetchDuplicates(signal: AbortSignal): Promise<void> {
-  await Promise.all([
-    queryClient.fetchQuery({ queryKey: DUPLICATES_KEY, queryFn: () => fetchDuplicates(signal) }),
-    prefetchMediaSources(signal),
-  ]);
+  void prefetchMediaSources(signal).catch(() => {});
+  await queryClient.fetchQuery({ queryKey: DUPLICATES_KEY, queryFn: () => fetchDuplicates(signal) });
 }
 
 /** 每组保留哪一个的口径。`all` 是一个不留——整组都是广告时才用得上。其余是网盘代号。 */
@@ -91,8 +113,8 @@ export type KeepRule = 'largest' | 'longest' | 'all' | (string & {});
 
 /** 确认弹层里「每组保留……」那半句。 */
 export const KEEP_LABELS: Record<string, string> = {
-  largest: '最大的一个', longest: '最长的一个',
-  '115': '115（没有则留最大）', pikpak: 'PikPak（没有则留最大）', all: '零个文件',
+  largest: t('cleanup:duplicates.keepRuleLargest'), longest: t('cleanup:duplicates.keepRuleLongest'),
+  '115': t('cleanup:duplicates.keepRule115'), pikpak: t('cleanup:duplicates.keepRulePikpak'), all: t('cleanup:duplicates.keepRuleNone'),
 };
 
 /** 这一批文件里真正出现过的网盘来源。 */
@@ -153,4 +175,4 @@ export async function batchOperate(ids: readonly number[], operation: 'dispose' 
 
 /** 页头说明行与汇总块那一句。 */
 export const duplicatesLede = (data: DuplicatesData, formatSize: (bytes: number) => string) =>
-  `${data.total} 组 · ${data.files} 个文件 · 可回收 ${formatSize(data.reclaimable)}`;
+  t('cleanup:duplicates.lede', { count: data.total, files: data.files, size: formatSize(data.reclaimable) });

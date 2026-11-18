@@ -4,12 +4,13 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,9 +18,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from peach import feed_followup, feeds, web_feeds, web_settings, web_state  # noqa: E402
+from peach import feed_followup, feeds, web_entity, web_feeds, web_settings, web_state  # noqa: E402
+from peach import web_jav_browser_performer as performer  # noqa: E402
 from peach.http import HttpResponse  # noqa: E402
 from peach.web_contract import WebContract  # noqa: E402
+from peach.task_outcomes import part  # noqa: E402
 from peach.web_router import dispatch_api_get, dispatch_api_post  # noqa: E402
 from support.ledger import fresh_ledger  # noqa: E402
 
@@ -39,7 +42,8 @@ SAMPLE = """
 
 
 class FakeTransport:
-    """按地址回一份事先备好的响应。记下每次请求，好核对条件请求头。"""
+    """按地址回一份事先备好的响应，可调用的按请求现答（GraphQL 同一个地址答不同的查询）。
+    记下每次请求，好核对条件请求头。"""
 
     def __init__(self, responses):
         self.responses = responses
@@ -47,7 +51,32 @@ class FakeTransport:
 
     def __call__(self, request, timeout, max_bytes):
         self.requests.append(request)
-        return self.responses[request.url]
+        response = self.responses[request.url]
+        return response(request) if callable(response) else response
+
+
+DMM_ENDPOINT = "https://api.video.dmm.co.jp/graphql"
+
+
+def dmm_catalogue(rows, codes):
+    """DMM GraphQL 的假答复：片单一页 `rows`（cid, 发售日, 预购, 出演人数），官方番号按 `codes`。"""
+    def answer(request):
+        payload = json.loads(request.body)
+        if "legacySearchPPV" in payload["query"]:
+            contents = [{"id": cid, "title": "作品", "deliveryStartAt": f"{date}T00:00:00+09:00",
+                         "releaseStatus": "PRE_ORDER" if pre_order else None,
+                         "actresses": [{"id": "1051912", "name": "涼森れむ"},
+                                       *({"id": str(index), "name": f"女優{index}"}
+                                         for index in range(cast - 1))],
+                         "maker": {"id": "1", "name": "エスワン"}}
+                        for cid, date, pre_order, cast in rows]
+            data = {"legacySearchPPV": {"result": {
+                "pageInfo": {"totalCount": len(rows), "hasNext": False}, "contents": contents}}}
+        else:
+            cids = re.findall(r'ppvContent\(id: "([^"]+)"\)', payload["query"])
+            data = {f"a{index}": {"id": cid, "makerContentId": codes[cid]} for index, cid in enumerate(cids)}
+        return HttpResponse(200, {}, json.dumps({"data": data}, ensure_ascii=False).encode(), request.url)
+    return answer
 
 
 def remove_when_released(temporary: tempfile.TemporaryDirectory, timeout: float = 15.0) -> None:
@@ -80,6 +109,8 @@ class FeedWebFixture(unittest.TestCase):
         # assert 之后才写完，也可能在临时目录删掉之后才醒。这里关掉自动领取，
         # 要跑后继的用例自己 `drain()`。
         self.contract.followups.stop()
+        # 来源冷却记录读写这里：每轮拉取前都要看 JavDB 是否在冷却，不能读到本机真实的那份。
+        self.contract.follow_secrets_root = Path(self.temporary.name) / "secrets"
         self.url = "https://javdb.com/actors/Smp1"
         sample = Path(self.temporary.name) / "feed-sample.html"
         sample.write_text(SAMPLE, encoding="utf-8")
@@ -105,6 +136,7 @@ class FeedWebFixture(unittest.TestCase):
         self.contract.avatar_root = self.contract.candidate_root / "avatars"
         self.cover_misses: set[str] = set()
         self.cover_unreachable: set[str] = set()
+        self.cover_broken: set[str] = set()
         self.cover_urls: dict[str, str | None] = {}
         self._fetch_cover = feed_followup.fetch_cover
         feed_followup.fetch_cover = self._fake_cover
@@ -120,10 +152,13 @@ class FeedWebFixture(unittest.TestCase):
     def _fake_cover(self, contract, code, cover_url=None):
         self.cover_urls[code] = cover_url
         if code in self.cover_misses:
-            raise RuntimeError("官方渠道没有这个番号的封面")
+            from peach.jav_cover_fetch import NO_CANDIDATES_CODE, NotFound
+            raise NotFound(NO_CANDIDATES_CODE)
+        if code in self.cover_broken:
+            raise RuntimeError("cover pipeline crashed")
         if code in self.cover_unreachable:
-            from peach.jav_cover_fetch import HOSTS_UNREACHABLE, CoverConnectError
-            raise CoverConnectError(HOSTS_UNREACHABLE)
+            from peach.jav_cover_fetch import HOSTS_UNREACHABLE_CODE, CoverConnectError
+            raise CoverConnectError(HOSTS_UNREACHABLE_CODE)
         from PIL import Image
         image = Image.new("RGB", (800, 538), (40, 40, 40))
         image.paste((200, 120, 150), (420, 0, 800, 538))
@@ -140,6 +175,10 @@ class FeedWebFixture(unittest.TestCase):
             headers["If-Modified-Since"] = last_modified
         from peach.http import HttpRequest
         return transport(HttpRequest("GET", url, headers), 30.0, 1 << 21)
+
+    def _stock_window_passes(self):
+        """定时拉取派存量后继的窗口（`web_feeds.STOCK_INTERVAL`）已经过去。"""
+        self.contract.feed_stock_planned_at = None
 
     def _add(self, entity_id=None):
         with self.contract.database.write_transaction() as connection:
@@ -192,6 +231,27 @@ class FeedWebTest(FeedWebFixture):
         self.assertEqual(errors, [])
         self.assertFalse(self.contract.feed_job.thread.is_alive())
 
+    def test_a_round_that_stays_paused_does_not_hold_the_caller(self):
+        """这一轮在任务中心被暂停、一直不恢复：同步发起的一方（定时那一跳也是）到期就回来。"""
+        self._add()
+        entered, release = threading.Event(), threading.Event()
+        def paused(contract, body, job_id):
+            entered.set()
+            release.wait(10)
+            return {"ok": True, "checked": 0, "total": 0, "results": [], "added": 0, "stock": False}
+        with patch.object(web_feeds, "_execute_check", side_effect=paused), \
+                patch.object(web_feeds, "CHECK_WAIT_SECONDS", 0.3):
+            try:
+                begun = time.monotonic()
+                result = dispatch_api_post(self.contract, "/api/feeds/check", {"all": True})
+                self.assertLess(time.monotonic() - begun, 5, "同步发起的一方一直等到这一轮跑完")
+                self.assertTrue(entered.is_set())
+                self.assertEqual(result["status"], "running")
+            finally:
+                release.set()
+                self.contract.feed_job.thread.join(5)
+        self.assertEqual(dispatch_api_get(self.contract, "/api/feeds/check", {})["status"], "complete")
+
     def test_schedule_route_reports_feed_scheduler_failures(self):
         from peach.follow_scheduler import FEED_JOB_ID, FollowScheduleConfig, FollowUpdateScheduler
         idle = dispatch_api_get(self.contract, "/api/feeds/schedule", {})
@@ -210,6 +270,21 @@ class FeedWebTest(FeedWebFixture):
         self.assertEqual((status["available"], status["enabled"], status["interval_minutes"]),
                          (True, True, feeds.DEFAULT_INTERVAL_MINUTES))
         self.assertEqual((status["last_error"], status["consecutive_failures"]), ("1 个来源检查失败", 2))
+
+    def test_schedule_route_saves_switch_and_interval(self):
+        from peach.follow_scheduler import FEED_JOB_ID, FollowScheduleConfig, FollowUpdateScheduler
+        root = Path(self.temporary.name) / "schedule"
+        self.contract.feed_scheduler = FollowUpdateScheduler(
+            root, lambda: {"ok": True}, available=True, job_id=FEED_JOB_ID, filename="feed-schedule.json",
+            default=FollowScheduleConfig(enabled=True, interval_minutes=feeds.DEFAULT_INTERVAL_MINUTES))
+        saved = dispatch_api_post(self.contract, "/api/feeds/schedule", {"enabled": True, "interval_minutes": 720})
+        self.assertEqual((saved["enabled"], saved["interval_minutes"]), (True, 720))
+        off = dispatch_api_post(self.contract, "/api/feeds/schedule", {"enabled": False, "interval_minutes": 720})
+        self.assertFalse(off["enabled"])
+        self.assertEqual(json.loads((root / "feed-schedule.json").read_text(encoding="utf-8")),
+                         {"enabled": False, "interval_minutes": 720})
+        with self.assertRaises(ValueError):
+            dispatch_api_post(self.contract, "/api/feeds/schedule", {"enabled": True, "interval_minutes": 5})
 
     def test_recovery_keeps_source_selection_progress_and_discovered_codes(self):
         from peach import job_recovery
@@ -310,6 +385,14 @@ class FeedWebTest(FeedWebFixture):
                           {"action": "ignore", "ids": [item["id"] for item in items]})
         self.assertFalse(has_feed())
 
+    def test_new_discoveries_only_recompute_the_feed_part_of_the_shapes(self):
+        """采集每几秒写一次订阅表：形状名单只重算新作那一份，同台、资料表与版式那部分照旧命中缓存。"""
+        self.assertFalse(dispatch_api_get(self.contract, "/api/entity/shapes", {})["home"]["feed"])
+        with patch.object(web_entity, "_entity_shape_parts", side_effect=AssertionError("其余部分被重算了")):
+            self._add()
+            self._check()
+            self.assertTrue(dispatch_api_get(self.contract, "/api/entity/shapes", {})["home"]["feed"])
+
     def test_home_shape_applies_library_and_compilation_filters(self):
         self._compilation("波多野結衣、篠田ゆう")
         with self.contract.database.write_transaction() as connection:
@@ -406,13 +489,56 @@ class FeedWebTest(FeedWebFixture):
         while not self.contract.task_runs.query(status="active", task_key=feed_followup.TASK_KEY):
             self.assertLess(time.monotonic(), deadline, "取资料后继未入队")
             time.sleep(0.01)
-        items = dispatch_api_get(self.contract, "/api/feeds/discoveries", {})["items"]
-        self.assertTrue(all(item["cover_fetching"] for item in items))
-        self.assertTrue(all(not item["has_cover"] for item in items))
+        # 还排在通道里的那一批是「排队中」，说得出排在哪条队后面；领走开跑才算抓取中。
+        states = lambda: [(item["cover_state"], item["cover_reason"]) for item in
+                          dispatch_api_get(self.contract, "/api/feeds/discoveries", {})["items"]]
+        self.assertEqual(states(), [("queued", "排在新作资料采集后面，资料取完就取封面")] * 2)
+        [run] = self.contract.task_runs.query(status="active", task_key=feed_followup.TASK_KEY)
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE task_run SET status='running' WHERE id=?", (run.id,))
+        self.assertEqual({state for state, _ in states()}, {"fetching"})
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE task_run SET status='pending' WHERE id=?", (run.id,))
         self._drain(1)
         items = dispatch_api_get(self.contract, "/api/feeds/discoveries", {})["items"]
-        self.assertFalse(any(item["cover_fetching"] for item in items))
-        self.assertTrue(all(item["has_cover"] for item in items))
+        self.assertTrue(all(item["has_cover"] and item["cover_state"] is None for item in items))
+
+    def test_the_cover_cell_says_why_a_release_has_no_cover(self):
+        """取过没取到的写上次的原因；韩国 MIB 后台不替它取图，也不该说在排队；新作页与首页同一口径。"""
+        self.cover_misses.add("HMN-071")
+        self._add()
+        self._check()
+        self._drain(1)
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("INSERT INTO feed_discovery(code,source_id,title,link,release_date,discovered_at)"
+                               " VALUES('NOAH-101',1,'',NULL,'2026-09-22',?)", (feeds.stamp(),))
+            connection.execute("INSERT INTO feed_discovery(code,source_id,title,link,release_date,discovered_at)"
+                               " VALUES('ABP-123',1,'',NULL,'2026-09-22',?)", (feeds.stamp(),))
+        expected = {"HMN-071": ("missing", "上次没取到：所有渠道都没有候选"),
+                    "NOAH-101": ("missing", "韩国 MIB 不适用 JAV 封面来源"),
+                    "ABP-123": ("queued", "等下一轮订阅检查分批取图")}
+        with patch("peach.jav_discovery_metadata.DiscoveryMetadata.ensure", return_value=None):
+            for path in ("/api/feeds/discoveries", "/api/jav/releases"):
+                items = {item["code"]: (item["cover_state"], item["cover_reason"])
+                         for item in dispatch_api_get(self.contract, path, {})["items"]}
+                self.assertEqual({code: items[code] for code in expected}, expected, path)
+
+    def test_unreleased_works_wait_off_the_list_while_the_official_cover_is_a_placeholder(self):
+        """未发售、官方只回「准备中」占位图的先不列，后台照旧重取；已发售的旧作与没取过图的照常列出。"""
+        from peach.jav_cover_fetch import NotFound, OFFICIAL_PLACEHOLDER_ONLY_CODE
+        future = (datetime.now() + timedelta(days=30)).date().isoformat()
+        rows = {"VRKM-971": future, "HIGM-183": "2024-03-09", "VRKM-972": future}
+        with self.contract.database.write_transaction() as connection:
+            for code, released in rows.items():
+                connection.execute("INSERT INTO feed_discovery(code,source_id,title,link,release_date,discovered_at)"
+                                   " VALUES(?,NULL,'',NULL,?,?)", (code, released, feeds.stamp()))
+        for code in ("VRKM-971", "HIGM-183"):
+            feed_followup.record_cover_attempt(self.contract, code, ok=False, error=NotFound(OFFICIAL_PLACEHOLDER_ONLY_CODE))
+        with patch("peach.jav_discovery_metadata.DiscoveryMetadata.ensure", return_value=None):
+            for path in ("/api/feeds/discoveries", "/api/jav/releases"):
+                codes = {item["code"] for item in dispatch_api_get(self.contract, path, {})["items"]}
+                self.assertEqual(codes & set(rows), {"HIGM-183", "VRKM-972"}, path)
+        self.assertIn("VRKM-971", self._cover_backlog())
 
     def test_a_failing_source_reports_on_its_own_row_and_stays_scheduled(self):
         self._add()
@@ -422,6 +548,109 @@ class FeedWebTest(FeedWebFixture):
         row = dispatch_api_get(self.contract, "/api/feeds", {})["sources"][0]
         self.assertEqual(row["last_error"], "来源回了 HTTP 503")
         self.assertIsNotNone(row["next_fetch_at"])
+        # 原因连同 code 落在源那一行上，英文界面照 code 显示（迁移 0056）。
+        from peach import interface_text
+        self.assertEqual(interface_text.text(f"server:{row['last_error_code']}", row["last_error_params"], "en"),
+                         "The source returned HTTP 503.")
+
+    def _sources_named(self, *names):
+        """再加几个演员页源，各回一份同样的样本页。返回全部源 id，第一个是 `_add` 那个。"""
+        ids = [self._add()]
+        for name in names:
+            url = f"https://javdb.com/actors/{name}"
+            self.transport.responses[url] = self.transport.responses[self.url]
+            with self.contract.database.write_transaction() as connection:
+                ids.append(feeds.add_source(connection, url=url, name=name))
+        return ids
+
+    def _rows(self):
+        with self.contract.database.read_connection() as connection:
+            return {int(row["id"]): dict(row) for row in connection.execute("SELECT * FROM feed_source")}
+
+    def test_a_refused_round_records_one_failure_and_defers_the_rest_to_the_cooldown_end(self):
+        """一轮里撞上 403：只记撞上的那一条，其余源不再问、顺延到冷却结束（ADR-0134）。"""
+        from peach import scraping_access
+        first, *rest = self._sources_named("Smp2", "Smp3")
+        served = self.transport
+
+        def refused(request, timeout, max_bytes):
+            served.requests.append(request)
+            scraping_access.pause_source(self.contract.follow_secrets_root, "javdb", refused=True)
+            raise scraping_access.SourcePaused("errors.scrapingAccess.refused")
+
+        self.transport = refused
+        result = self._check()
+        self.assertEqual(len(served.requests), 1)
+        self.assertEqual(result["deferred"], 2)
+        [row] = result["results"]
+        self.assertFalse(row["ok"])
+        self.assertIn("其余 2 个源顺延到冷却结束后再拉", row["error"])
+        until = scraping_access.paused_until(self.contract.follow_secrets_root, "javdb")
+        expected = feeds.stamp(datetime.fromtimestamp(until, timezone.utc))
+        rows = self._rows()
+        self.assertEqual({rows[source]["next_fetch_at"] for source in (first, *rest)}, {expected})
+        self.assertTrue(all(rows[source]["last_fetched_at"] is None for source in rest))
+
+    def test_a_region_page_reads_as_the_exit_problem_not_an_empty_page(self):
+        """JavDB 对日本出口回 200 的版权说明页：整轮只记一条地区限制的原因，其余源顺延，不再各报
+        一条「这一页解不出任何条目」（2026-11-08，14 个演员页源一起这么报过）。"""
+        from peach.scraping_access import SourceTransport
+        first, *_ = self._sources_named("Smp2", "Smp3")
+        served = FakeTransport({})
+        transport = SourceTransport(self.contract.follow_secrets_root)
+
+        def blocked(request, timeout, max_bytes):
+            served.requests.append(request)
+            return HttpResponse(200, {}, "由於版權限制，本站禁止了你的網路所在國家的訪問。".encode("utf-8"),
+                                request.url)
+
+        transport.transports["javdb"] = blocked
+        self.transport = transport
+        result = self._check()
+        self.assertEqual(len(served.requests), 1)
+        self.assertEqual(result["deferred"], 2)
+        [row] = result["results"]
+        self.assertIn("JavDB 不对当前出口所在的地区开放", row["error"])
+        self.assertIn("其余 2 个源顺延到冷却结束后再拉", row["error"])
+        self.assertNotIn("解不出", self._rows()[first]["last_error"])
+
+    def test_a_round_that_starts_in_cooldown_asks_nothing(self):
+        """别的任务撞出来的冷却还没过：这一轮一个请求都不发，整轮只说一句。"""
+        from peach import scraping_access
+        self._sources_named("Smp2")
+        scraping_access.pause_source(self.contract.follow_secrets_root, "javdb", refused=True)
+        result = self._check()
+        self.assertEqual(self.transport.requests, [])
+        [row] = result["results"]
+        self.assertEqual(row["error"], "JavDB 正在冷却，这一轮没有拉；其余 1 个源顺延到冷却结束后再拉")
+        self.assertTrue(all(row["last_fetched_at"] is None and row["last_error"] is None
+                            for row in self._rows().values()))
+
+    def test_a_javdb_cooldown_does_not_defer_the_dmm_catalogue(self):
+        """冷却按来源记：JavDB 在冷却，DMM 片单照拉（ADR-0135）。"""
+        from peach import scraping_access
+        javdb = self._add()
+        with self.contract.database.write_transaction() as connection:
+            dmm = feeds.add_source(connection, url=feeds.dmm_actress_url("1051912"))
+        self.transport.responses[DMM_ENDPOINT] = dmm_catalogue(
+            [("mikr00133", "2026-11-13", True, 1)], {"mikr00133": "MIKR-133"})
+        scraping_access.pause_source(self.contract.follow_secrets_root, "javdb", refused=True)
+        result = self._check()
+        reports = {row["source"]: row for row in result["results"]}
+        self.assertEqual(result["deferred"], 1)
+        self.assertEqual(reports[javdb]["error"], "JavDB 正在冷却，这一轮没有拉")
+        self.assertEqual((reports[dmm]["ok"], reports[dmm]["codes"]), (True, ["MIKR-133"]))
+        self.assertTrue(all(request.url == DMM_ENDPOINT for request in self.transport.requests))
+
+    def test_a_scheduled_tick_without_due_sources_starts_nothing(self):
+        """定时每半小时一跳；没有到期的源时不起任务，任务中心里不留空跑的一行。"""
+        self._add()
+        self._check()
+        runs = len(self.contract.task_runs.query(task_key="feed-check", limit=50))
+        result = web_feeds.w_feed_check(self.contract, {"automatic": True})
+        self.assertTrue(result["idle"])
+        self.assertEqual(len(self.contract.task_runs.query(task_key="feed-check", limit=50)), runs)
+        self.assertEqual(len(self.transport.requests), 1)
 
     def test_an_empty_alias_page_settles_quietly_and_names_its_row(self):
         """同一个人的第二页挂在旧艺名下、一部作品都没有：不算失败，行上说出是哪个名字。"""
@@ -713,19 +942,68 @@ class FeedWebTest(FeedWebFixture):
         self.assertFalse(attempt['ok'])
         self.assertIn('error_type', attempt)
 
+    def test_detail_retry_installs_the_cover_or_reports_the_recorded_reason(self):
+        self.cover_misses.add("HMN-071")
+        missed = dispatch_api_post(self.contract, "/api/jav/cover", {"code": "hmn-071"})
+        self.assertEqual((missed["code"], missed["has_cover"], missed["message"]),
+                         ("HMN-071", False, "所有渠道都没有候选"))
+        # 取图链以外的故障不把原文给用户看，只说没处理完。
+        self.cover_broken.add("IPX-001")
+        broken = dispatch_api_post(self.contract, "/api/jav/cover", {"code": "IPX-001"})
+        self.assertEqual((broken["has_cover"], broken["message"]), (False, "封面处理未完成"))
+        got = dispatch_api_post(self.contract, "/api/jav/cover", {"code": "SSIS-950"})
+        self.assertEqual((got["has_cover"], got["message"]), (True, ""))
+        self.assertTrue(got["cover_version"])
+        self.assertTrue((self.contract.cover_root / "SSIS-950.poster.json").is_file())
+
     def test_official_miss_does_not_install_a_bound_javdb_image(self):
         from peach.jav_cover_fetch import Unavailable
         self._add()
         self._check()
         with self.contract.database.write_transaction() as connection:
             connection.execute("UPDATE feed_discovery SET link='https://javdb.com/v/Source01' WHERE code='SSIS-950'")
-        with patch('peach.jav_cover_fetch.best_cover', side_effect=Unavailable('官方封面未取得')), \
+        with patch('peach.jav_cover_fetch.best_cover', side_effect=Unavailable('errors.javCoverFetch.catalogUnfinished')), \
                 patch('peach.javdb_public.PUBLIC_API.image') as source_image, \
                 patch('peach.javdb_public.PUBLIC_API.remember_movie_identity') as identity:
-            with self.assertRaisesRegex(Unavailable, '官方封面未取得'):
+            with self.assertRaisesRegex(Unavailable, '官方目录查询未完成'):
                 self._fetch_cover(self.contract, 'SSIS-950')
         identity.assert_not_called()
         source_image.assert_not_called()
+
+    def test_fc2_cover_falls_back_to_issuer_and_community_pictures(self):
+        """FC2 的官方渠道一家都没有：带上发行方与存档站的图，再落空就用社区两个图源对得上的那张。"""
+        from peach.jav_cover_fetch import Candidate, NotFound
+        from peach.library_processing import LibraryMetadataProvider
+        issuer = Candidate('storage.fc2.com', 'https://storage.fc2.com/x.jpg', 'https://adult.contents.fc2.com/')
+        picked = Candidate('javbus', 'https://www.javbus.com/pics/cover/x.jpg', '')
+        works = [('javbus', {'cover_urls': [picked.url]})]
+        with patch('peach.jav_cover_fetch.best_cover', side_effect=NotFound('errors.javCoverFetch.noCandidates')) as best, \
+                patch.object(LibraryMetadataProvider, '_official_candidates', return_value=(issuer,)) as official, \
+                patch.object(LibraryMetadataProvider, 'community', return_value=works), \
+                patch('peach.community_catalog.verified_cover',
+                      return_value=(picked, (800, 450), b'jpeg', ('javbus', 'avbase'))) as verified:
+            data, size, evidence = self._fetch_cover(self.contract, 'FC2-PPV-4137487')
+        self.assertEqual((data, size, evidence['source_url']), (b'jpeg', (800, 450), picked.url))
+        self.assertIn(issuer, best.call_args.kwargs['prior_candidates'])
+        self.assertEqual(official.call_args.kwargs['absent'], feed_followup.FC2_BROWSER_SITES)
+        self.assertEqual(verified.call_args.args[2], works)
+
+    def test_recorded_source_url_returns_as_an_official_candidate(self):
+        from peach.jav_cover_fetch import Unavailable
+        recorded = 'https://awsimgsrc.dmm.co.jp/pics_dig/digital/amateur/deas082/deas082jp.jpg'
+        given = 'https://pics.dmm.co.jp/digital/amateur/deas082/deas082jp.jpg'
+        evidence = self.contract.cover_root / 'DEAS-082.scraping.json'
+        evidence.parent.mkdir(parents=True, exist_ok=True)
+        evidence.write_text(json.dumps({'code': 'DEAS-082', 'source_url': recorded}), encoding='utf-8')
+        with patch('peach.jav_cover_fetch.best_cover', side_effect=Unavailable('errors.javCoverFetch.catalogUnfinished')) as best:
+            for cover_url in (None, given):
+                with self.assertRaises(Unavailable):
+                    self._fetch_cover(self.contract, 'DEAS-082', cover_url)
+        without, with_given = ([c.url for c in call.kwargs['prior_candidates']] for call in best.call_args_list)
+        self.assertIn(recorded, without)
+        self.assertIn(recorded, with_given)
+        self.assertEqual(with_given[0], given)
+        self.assertEqual(len(with_given), len(set(with_given)))
 
     def test_vr_layout_survives_without_a_detected_face(self):
         target = self.contract.cover_root / 'MDVR-276.face.json'
@@ -782,6 +1060,99 @@ class FeedWebTest(FeedWebFixture):
         self.assertEqual(batch[-feed_followup.RETRY_SHARE:],
                          [f"OLD-{number:03d}" for number in range(feed_followup.RETRY_SHARE)])
 
+    BLURAY_TITLE = "Pretty Glamour ― 誰もが恋する私に ― /藤森里穂（ブルーレイディスク）"
+
+    def _bluray_shell(self, code="GRABD-039", title=BLURAY_TITLE):
+        with self.contract.database.write_transaction() as connection:
+            entity = connection.execute(
+                "INSERT INTO entity(kind,canonical_name,normalized_name,created_at,updated_at)"
+                " VALUES('performer','藤森里穂',peach_normalize('藤森里穂'),?,?)",
+                (feeds.stamp(), feeds.stamp())).lastrowid
+            shell = feeds.create_shell(connection, code, source_id=None, title=title,
+                                       performers="藤森里穂", entity_id=entity)
+            connection.execute("UPDATE feed_discovery SET scraped_at='2026-01-01T00:00:00Z',"
+                               "cover_url='https://c0.jdbstatic.com/covers/qn/QNZQX9.jpg' WHERE id=?", (shell,))
+        return shell
+
+    def _run_scrape(self, *codes):
+        handle = SimpleNamespace(saved={}, progress=lambda **_: None, checkpoint=lambda **_: None)
+        return feed_followup.run(self.contract, feed_followup.followup_key(codes), handle)
+
+    def test_a_bluray_product_number_resolves_to_its_dmm_streaming_edition_by_title(self):
+        """蓝光版品番 DMM 配信版里没有，序号也可能不同；标题去掉版本字样、出演者对得上的才算同一部。"""
+        def answer(request):
+            payload = json.loads(request.body)
+            if "legacySearchPPV" in payload["query"]:
+                self.assertEqual(payload["variables"]["queryWord"], "Pretty Glamour 誰もが恋する私に 藤森里穂")
+                contents = [{"id": "h_1714grace00039"}, {"id": "h_1714grace00038"}]
+                return HttpResponse(200, {"Content-Type": "application/json"},
+                                    json.dumps({"data": {"legacySearchPPV": {"result": {"contents": contents}}}}).encode(),
+                                    DMM_ENDPOINT)
+            cid = payload["variables"]["id"]
+            item = {"h_1714grace00039": ("GRACE-039", "Pretty Glamour ー 誰もが恋する私に ー 藤森里穂"),
+                    "h_1714grace00038": ("GRACE-038", "Pretty Glamour ー 別の作品 ー 藤森里穂")}[cid]
+            content = {"id": cid, "makerContentId": item[0], "title": item[1], "actresses": [{"name": "藤森里穂"}]}
+            return HttpResponse(200, {"Content-Type": "application/json"},
+                                json.dumps({"data": {"ppvContent": content}}).encode(), DMM_ENDPOINT)
+
+        from peach.jav_editions import digital_edition
+        root = self.contract.follow_secrets_root
+        transport = FakeTransport({DMM_ENDPOINT: answer})
+        self.assertEqual(digital_edition(self.BLURAY_TITLE, ["藤森里穂"], root, transport=transport), "GRACE-039")
+        self.assertEqual(digital_edition(self.BLURAY_TITLE, ["別の人"], root, transport=transport), "",
+                         "出演者对不上的不算同一部")
+        asked = len(transport.requests)
+        self.assertEqual(digital_edition("Pretty Glamour 藤森里穂", ["藤森里穂"], root, transport=transport), "")
+        self.assertEqual(len(transport.requests), asked, "标题没写蓝光的不问 DMM")
+
+    def test_a_bluray_shell_whose_streaming_edition_is_listed_leaves_the_list(self):
+        self._bluray_shell()
+        with self.contract.database.write_transaction() as connection:
+            feeds.create_shell(connection, "GRACE-039", source_id=None,
+                               title="Pretty Glamour ー 誰もが恋する私に ー 藤森里穂")
+        with patch("peach.jav_editions.digital_edition", return_value="GRACE-039") as lookup:
+            self._run_scrape("GRABD-039")
+        lookup.assert_called_once()
+        self.assertEqual(lookup.call_args.args[:2], (self.BLURAY_TITLE, ["藤森里穂"]))
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual([row[0] for row in connection.execute("SELECT code FROM feed_discovery")], ["GRACE-039"])
+            self.assertIsNone(connection.execute("SELECT 1 FROM feed_discovery_entity WHERE discovery_id NOT IN"
+                                                 " (SELECT id FROM feed_discovery)").fetchone())
+        self.assertNotIn("GRABD-039", self.cover_urls)
+
+    def test_a_listed_bluray_shell_without_a_cover_becomes_its_streaming_edition(self):
+        """存量里取过资料、封面一直取不到的蓝光版归取资料那一批：改成配信版番号，资料与封面按它重取。"""
+        shell = self._bluray_shell("REBDB-1006", "Hinako2 Eternal Wave・森日向子 ブルーレイエディション（ブルーレイディスク）")
+        with self.contract.database.read_connection() as connection:
+            batch = feed_followup.scrape_batch(connection, hidden=frozenset(), retry_after=timedelta(0),
+                                               cover_root=self.contract.cover_root)
+        self.assertEqual(batch, ["REBDB-1006"])
+        self.assertEqual(self._cover_backlog(), [], "补封面那条通道不写账本，蓝光版不排进去")
+        with patch("peach.jav_editions.digital_edition", return_value="REBD-1021"):
+            summary = self._run_scrape(*batch)
+        self.assertEqual(summary["covers"], 1)
+        with self.contract.database.read_connection() as connection:
+            row = connection.execute("SELECT id,code,title,cover_url FROM feed_discovery").fetchone()
+            linked = connection.execute("SELECT entity_id FROM feed_discovery_entity WHERE discovery_id=?",
+                                        (shell,)).fetchall()
+        self.assertEqual((row["id"], row["code"], row["title"]), (shell, "REBD-1021", "REBD-1021 的标题"))
+        self.assertEqual(self.cover_urls, {"REBD-1021": "https://images.example.test/cover.jpg"})
+        self.assertEqual(len(linked), 1, "出演者关联跟着壳走")
+        # 并完就不再是蓝光版，下一轮不再问 DMM。
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual(feed_followup.scrape_batch(connection, hidden=frozenset(), retry_after=timedelta(0),
+                                                        cover_root=self.contract.cover_root), [])
+
+    def test_a_bluray_shell_stays_when_dmm_has_no_matching_edition(self):
+        self._bluray_shell()
+        with patch("peach.jav_editions.digital_edition", side_effect=OSError("timeout")):
+            self._run_scrape("GRABD-039")
+        with patch("peach.jav_editions.digital_edition", return_value=""):
+            self._run_scrape("GRABD-039")
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual([row[0] for row in connection.execute("SELECT code FROM feed_discovery")], ["GRABD-039"])
+        self.assertIn("GRABD-039", self.cover_urls, "对不上时照旧按原番号取封面")
+
     def test_scraping_one_code_stops_at_the_metadata_budget(self):
         """来源连不上时一部最多问到资料预算为止，原因写成哪几家在多少秒内没答复。"""
         from peach.jav_cover_fetch import DeadlineExceeded
@@ -792,12 +1163,44 @@ class FeedWebTest(FeedWebFixture):
         class Silent:
             def community(self, code, *, deadline=None, route=None):
                 seen["remaining"] = float(deadline) - time.monotonic()
-                raise DeadlineExceeded("动作预算已用尽")
+                raise DeadlineExceeded("errors.javCoverFetch.deadline")
 
         with self.assertRaisesRegex(DeadlineExceeded, "秒内没有答复"):
             self._collect(Silent(), "SSIS-950")
         self.assertLessEqual(seen["remaining"], ACTION_BUDGETS["querying_metadata"])
         self.assertGreater(seen["remaining"], ACTION_BUDGETS["querying_metadata"] - 5)
+
+    def test_fc2_shell_asks_fc2_archives_before_the_community_stage(self):
+        """FC2 的综合索引那一档只剩 JavDB：FC2 自己与存档站给齐了就不问它，都没有才照常问。"""
+        asked = []
+        full = {"title": "标题", "performers": ["甲"], "studio": "卖家", "release_date": "2026-11-01",
+                "cover_url": "https://storage.fc2.com/x.jpg"}
+
+        class Archives:
+            def __init__(self, answer):
+                self.answer = answer
+
+            def fc2(self, code, *, deadline=None, route=None):
+                asked.append(("fc2", tuple(route)))
+                if self.answer is None:
+                    raise LookupError("没有")
+                return [("fc2cmadb", self.answer)]
+
+            def community(self, code, *, deadline=None, route=None):
+                asked.append(("community", tuple(route)))
+                return [("javdb", {"title": "JavDB 标题"})]
+
+        with patch("peach.feed_followup.extract_peach_fields",
+                   side_effect=lambda payload: {key: {"value": value} for key, value in payload.items()
+                                                if key != "cover_url"}), \
+                patch("peach.feed_followup._cover", side_effect=lambda payload: payload.get("cover_url")):
+            fields, cover = self._collect(Archives(full), "FC2-PPV-4137487")
+            self.assertEqual((fields["title"], cover), ("标题", "https://storage.fc2.com/x.jpg"))
+            self.assertEqual(asked, [("fc2", feed_followup.FC2_FEED_SITES)])
+            asked.clear()
+            fields, _ = self._collect(Archives(None), "FC2-PPV-4137487")
+        self.assertEqual(fields["title"], "JavDB 标题")
+        self.assertEqual([name for name, _ in asked], ["fc2", "community"])
 
     def test_codes_already_queued_are_not_planned_again(self):
         """在队里的那一批还没跑完，下一轮检查只带新的番号，不把同一批换个组合再派一条。"""
@@ -812,6 +1215,30 @@ class FeedWebTest(FeedWebFixture):
         if thread is not None:
             thread.join(5)
         self.assertEqual([item["key"] for item in self._check()["followups"]], ["feed-scrape:ABP-123"])
+
+    def test_shells_still_waiting_for_their_scrape_get_covers_in_their_own_lane(self):
+        """取资料一批装不下的壳不等写账本的那条通道，先只凭番号补封面；两批互不重复。"""
+        self._add()
+        self._check()
+        fresh = [f"NEW-{number:03d}" for number in range(feed_followup.MAX_BATCH + 2)]
+        with self.contract.database.write_transaction() as connection:
+            for code in fresh:
+                connection.execute("INSERT INTO feed_discovery(code,source_id,title,link,release_date,discovered_at)"
+                                   " VALUES(?,1,'',NULL,'2026-12-01',?)", (code, feeds.stamp()))
+        self.transport.responses[self.url] = HttpResponse(304, {}, b"", self.url)
+        thread = self.contract.feed_job.thread
+        if thread is not None:
+            thread.join(5)
+        planned = {item["task_key"]: item["key"] for item in self._check()["followups"]}
+        scrape = feed_followup.parse_key(planned[feed_followup.TASK_KEY])
+        covers = feed_followup.parse_key(planned[feed_followup.COVER_TASK_KEY], feed_followup.COVER_TASK_KEY)
+        self.assertEqual(len(scrape), feed_followup.MAX_BATCH)
+        self.assertEqual(sorted(covers), sorted(set(fresh) - set(scrape)))
+        # 上次没取到资料的仍归取资料重试，不进补封面。
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE feed_discovery SET scraped_at=?,scrape_error='来源连接未取得'"
+                               " WHERE code=?", (feeds.stamp(), covers[0]))
+        self.assertNotIn(covers[0], self._cover_backlog(exclude=scrape))
 
     def test_a_missing_cover_gets_its_own_batch_outside_the_ledger_lane(self):
         """资料齐了只缺封面的壳另派补封面：只取图，不再问资料来源，也不排在写账本的后继后面。"""
@@ -879,8 +1306,10 @@ class FeedWebTest(FeedWebFixture):
         self._drain(1)
         self.transport.responses[self.url] = HttpResponse(304, {}, b"", self.url)
         # 定时那一轮：刚试过的不再排；已经有封面、资料也齐的那部永远不再排。
+        self._stock_window_passes()
         self.assertEqual(self._check(automatic=True)["followups"], [])
         self._attempted("HMN-071", feed_followup.RETRY_AFTER.total_seconds() + 60)
+        self._stock_window_passes()
         self.assertEqual([item["key"] for item in self._check(automatic=True)["followups"]],
                          ["feed-cover:HMN-071"])
         # 人说了不想看的，不再替它花配额。
@@ -928,10 +1357,30 @@ class FeedWebTest(FeedWebFixture):
         self.assertIn(key, [item["key"] for item in self._check(automatic=True)["followups"]])
         with self.contract.database.read_connection() as connection:
             current = avatar_followup.fingerprint(connection, entity_id, providers_root)
-        Attempts(attempts_root(self.contract.candidate_root)).record(key, current, "图库 6 张认不准")
+        Attempts(attempts_root(self.contract.candidate_root)).record(key, current, [part("galleryUnsure", count=6)])
+        self._stock_window_passes()
         self.assertNotIn(key, [item["key"] for item in self._check(automatic=True)["followups"]])
         index_path.write_text(json.dumps({"Content": {"1-S1": {"二の宮すずか.jpg": "二の宮すずか.jpg"}}}), encoding="utf-8")
+        self._stock_window_passes()
         self.assertIn(key, [item["key"] for item in self._check(automatic=True)["followups"]])
+
+    def test_scheduled_rounds_carry_the_stock_only_once_per_window(self):
+        """定时每半小时一跳：新番号每跳都派，存量（旧壳、封面、头像、想要）一个窗口只派一次。"""
+        self.cover_misses.add("HMN-071")
+        self._add()
+        first = self._check(automatic=True)
+        self.assertTrue(first["stock"])
+        self.assertEqual([item["key"] for item in first["followups"]],
+                         ["feed-scrape:SSIS-950,HMN-071"])
+        self._drain(1)
+        self._attempted("HMN-071", feed_followup.RETRY_AFTER.total_seconds() + 60)
+        self.transport.responses[self.url] = HttpResponse(304, {}, b"", self.url)
+        quiet = self._check(automatic=True)
+        self.assertFalse(quiet["stock"])
+        self.assertEqual(quiet["followups"], [])
+        self._stock_window_passes()
+        self.assertEqual([item["key"] for item in self._check(automatic=True)["followups"]],
+                         ["feed-cover:HMN-071"])
 
     def test_an_unknown_action_is_refused(self):
         with self.assertRaises(ValueError):
@@ -968,8 +1417,8 @@ SOLO_PAGE = """
 """
 
 
-class PerformerFeedSwitchTest(FeedWebFixture):
-    """人物页「订阅新作」开关：地址由服务端按 JavDB 演员页拼，页面只送开和关。"""
+class PerformerFeedFixture(FeedWebFixture):
+    """一位有 JavDB 演员页的女优、按地址回样本页的传输，以及订阅相关的取数辅助。"""
 
     def setUp(self):
         super().setUp()
@@ -999,16 +1448,20 @@ class PerformerFeedSwitchTest(FeedWebFixture):
             "enabled": enabled})
 
     def _settled(self):
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            state = self.contract.feed_job.snapshot() or {}
-            if state.get("status") not in ("running", None):
-                return state
-            time.sleep(0.02)
-        self.fail("订阅拉取没有在 5 秒内跑完")
+        thread = self.contract.feed_job.thread
+        self.assertIsNotNone(thread, '订阅拉取未启动')
+        thread.join(15)
+        self.assertFalse(thread.is_alive(), '订阅拉取未结束')
+        state = self.contract.feed_job.snapshot() or {}
+        self.assertNotIn(state.get('status'), ('running', None))
+        return state
 
     def _sources(self):
         return dispatch_api_get(self.contract, "/api/feeds", {})["sources"]
+
+
+class PerformerFeedSwitchTest(PerformerFeedFixture):
+    """人物页「订阅新作」开关：地址由服务端按 JavDB 演员页拼，页面只送开和关。"""
 
     def test_switching_on_subscribes_her_javdb_page_and_fetches_it_now(self):
         result = self._switch(True)
@@ -1022,6 +1475,21 @@ class PerformerFeedSwitchTest(FeedWebFixture):
         mine = dispatch_api_get(self.contract, "/api/feeds/discoveries",
                                 {"entity": self.performer})
         self.assertEqual([item["code"] for item in mine["items"]], ["PBD-528", "BBSS-106"])
+
+    def test_a_name_matched_page_of_the_credited_record_is_not_subscribed(self):
+        """#271：按名字对上的同类演员页（旧艺名的空页）不进订阅，只订作品署名的那页。"""
+        with self.contract.database.write_transaction() as connection:
+            connection.execute(
+                "UPDATE entity_external_ref SET metadata_json=? WHERE entity_id=? AND external_id='pRMq'",
+                (json.dumps({"source": "javdb", "provider_id": "PBD-528", "uncensored": False}),
+                 self.performer))
+            connection.execute(
+                "INSERT INTO entity_external_ref(entity_id,provider,external_kind,external_id,metadata_json)"
+                " VALUES(?,'javdb','performer','MmbDR',?)",
+                (self.performer, json.dumps({"source": "backfill_performer_entry_ids", "uncensored": False})))
+        self._switch(True)
+        self.assertEqual([source["url"] for source in self._sources()], [self.page])
+        self._settled()
 
     def test_a_page_of_only_compilations_is_backfilled_from_her_solo_works(self):
         retired = self._performer("篠田ゆう", ["WE4e"])
@@ -1093,6 +1561,102 @@ class PerformerFeedSwitchTest(FeedWebFixture):
             self._switch(True, bare)
         self.assertEqual(self._sources(), [])
 
+    def _dmm_id(self, entity_id, value="1051912", provider="r18dev"):
+        with self.contract.database.write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO entity_external_ref(entity_id,provider,external_kind,external_id)"
+                " VALUES(?,?,'performer',?)", (entity_id, provider, value))
+
+    def test_her_dmm_catalogue_is_a_second_source_merged_with_javdb(self):
+        self._dmm_id(self.performer)
+        self.transport.responses[DMM_ENDPOINT] = dmm_catalogue(
+            [("mikr00133", "2026-11-13", True, 1), ("pbd00528", "2026-10-20", False, 2),
+             ("mizd00570", "2026-11-27", True, 37)],
+            {"mikr00133": "MIKR-133", "pbd00528": "PBD-528", "mizd00570": "MIZD-570"})
+        result = self._switch(True)
+        self.assertEqual(len(result["sources"]), 2)
+        reports = {report["source"]: report for report in self._settled()["results"]}
+        # 同一个人的几条源挨在一起，JavDB 演员页在前。
+        self.assertEqual([source["kind"] for source in self._sources()],
+                         [feeds.KIND_JAVDB_ACTOR, feeds.KIND_DMM_ACTRESS])
+        sources = {source["kind"]: source for source in self._sources()}
+        dmm = sources[feeds.KIND_DMM_ACTRESS]
+        self.assertEqual((dmm["url"], dmm["kind_label"], dmm["page_name"], dmm["name"]),
+                         ("https://video.dmm.co.jp/av/list/?actress=1051912", "JAV 订阅 · DMM",
+                          "涼森れむ", "凉森れむ"))
+        self.assertEqual({key: reports[dmm["id"]][key] for key in ("ok", "pre_order", "compilations")},
+                         {"ok": True, "pre_order": 2, "compilations": 1})
+        mine = dispatch_api_get(self.contract, "/api/feeds/discoveries", {"entity": self.performer})
+        # PBD-528 两个来源都报了，只有一个壳；三五十人的合集不建壳。
+        self.assertEqual(sorted(item["code"] for item in mine["items"]),
+                         ["BBSS-106", "MIKR-133", "PBD-528"])
+        # 两类源一起开、一起关。
+        self._switch(False)
+        self.assertEqual([source["enabled"] for source in self._sources()], [False, False])
+
+    def test_her_censored_javdb_page_is_skipped_while_her_dmm_catalogue_answers(self):
+        """DMM 片单拉成功后，定时轮次绕过她在 JavDB 上的有碼页；無碼页照拉，DMM 出错时 JavDB 接上。源都不停用。"""
+        self._dmm_id(self.performer)
+        self.transport.responses[DMM_ENDPOINT] = dmm_catalogue([], {})
+        self._switch(True)
+        self._settled()
+        sources = {source["kind"]: source for source in self._sources()}
+        javdb, dmm = sources[feeds.KIND_JAVDB_ACTOR], sources[feeds.KIND_DMM_ACTRESS]
+        future = "2999-01-01T00:00:00Z"
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual(feeds.covered_by_dmm(connection), {javdb["id"]})
+            self.assertEqual([row["id"] for row in feeds.due_sources(connection, future)], [dmm["id"]])
+        self.assertTrue(all(source["enabled"] for source in self._sources()), "绕过不等于停用")
+        # 她这一页是無碼记录时照拉。
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE entity_external_ref SET metadata_json=? WHERE entity_id=? AND provider='javdb'",
+                               (json.dumps({"uncensored": True}), self.performer))
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual(feeds.covered_by_dmm(connection), set())
+        # DMM 片单上次失败时 JavDB 接上。
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE entity_external_ref SET metadata_json='{}' WHERE entity_id=? AND provider='javdb'",
+                               (self.performer,))
+            connection.execute("UPDATE feed_source SET last_error='HTTP 503' WHERE id=?", (dmm["id"],))
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual(feeds.covered_by_dmm(connection), set())
+
+    def test_a_dmm_failure_lands_on_its_own_row(self):
+        self._dmm_id(self.performer)
+        self.transport.responses[DMM_ENDPOINT] = HttpResponse(503, {}, b"", DMM_ENDPOINT)
+        self._switch(True)
+        reports = {report["source"]: report for report in self._settled()["results"]}
+        sources = {source["kind"]: source for source in self._sources()}
+        dmm, javdb = sources[feeds.KIND_DMM_ACTRESS], sources[feeds.KIND_JAVDB_ACTOR]
+        self.assertEqual((dmm["last_error"], reports[dmm["id"]]["reason"]), ("HTTP 503", "server_error"))
+        self.assertIsNotNone(dmm["next_fetch_at"])
+        self.assertTrue(reports[javdb["id"]]["ok"])
+
+    def test_a_performer_with_only_a_dmm_id_can_subscribe(self):
+        dmm_only = self._performer("RION", [])
+        self._dmm_id(dmm_only, "1012345", provider="dmm")
+        self.transport.responses[DMM_ENDPOINT] = dmm_catalogue([], {})
+        profile = dispatch_api_get(self.contract, "/api/entity", {"kind": "performer", "name": "RION"})
+        self.assertEqual(profile["feed"], {"following": False})
+        self._switch(True, dmm_only)
+        [report] = self._settled()["results"]
+        self.assertEqual((report["ok"], report["seen"]), (True, 0))
+        [source] = self._sources()
+        self.assertEqual(source["kind"], feeds.KIND_DMM_ACTRESS)
+
+    def test_a_round_adds_her_dmm_source_once_her_id_is_scraped(self):
+        self._switch(True)
+        self._settled()
+        self.assertEqual(len(self._sources()), 1)
+        self._dmm_id(self.performer, "1051912", provider="dmm")
+        self.transport.responses[DMM_ENDPOINT] = dmm_catalogue(
+            [("mikr00133", "2026-11-13", True, 1)], {"mikr00133": "MIKR-133"})
+        self._check()
+        kinds = sorted(source["kind"] for source in self._sources())
+        self.assertEqual(kinds, [feeds.KIND_DMM_ACTRESS, feeds.KIND_JAVDB_ACTOR])
+        mine = dispatch_api_get(self.contract, "/api/feeds/discoveries", {"entity": self.performer})
+        self.assertIn("MIKR-133", [item["code"] for item in mine["items"]])
+
 
 #: JavDB 演员搜索页：同一位的有碼与無碼两张卡，加一位同名的别人。写法照
 #: `test_directory_link_harvest.JAVDB_SEARCH_PAGE`，多了無碼那枚 `info` 标记。
@@ -1116,8 +1680,8 @@ LOGIN_PAGE = """<html><head><title> 登入 | JavDB 成人影片數據庫 </title
 <body><form action="/user_sessions"></form></body></html>"""
 
 
-class FeedFollowByNameTest(PerformerFeedSwitchTest):
-    """订阅源页签「添加 JAV 订阅」：按名字搜演员卡，勾选后登记到她名下并订上（ADR-0083）。"""
+class FeedFollowByNameFixture(PerformerFeedFixture):
+    """JavDB 演员搜索页与几张演员卡的样本，按名字查找与登记的辅助。"""
 
     def setUp(self):
         super().setUp()
@@ -1146,6 +1710,10 @@ class FeedFollowByNameTest(PerformerFeedSwitchTest):
                 " AND provider='javdb' ORDER BY external_id", (entity_id,)).fetchall()
         return row, refs
 
+
+class FeedFollowByNameTest(FeedFollowByNameFixture):
+    """订阅源页签「添加 JAV 订阅」：按名字搜演员卡，勾选后登记到她名下并订上（ADR-0083）。"""
+
     def test_lookup_lists_every_card_and_only_pre_picks_the_one_person_matching_the_name(self):
         result = self._lookup()
         self.assertEqual(result["url"], self.search)
@@ -1170,7 +1738,7 @@ class FeedFollowByNameTest(PerformerFeedSwitchTest):
                 " VALUES(?,'濑户环奈',peach_normalize('濑户环奈'),'test')", (held,))
         result = self._lookup()
         first, second = result["candidates"][:2]
-        self.assertEqual(result["known"], {"id": held, "name": "瀬戸環奈"})
+        self.assertEqual(result["known"], {"id": held, "name": "瀬戸環奈", "subscribable": True, "following": False})
         self.assertEqual(first["held_by"], {"id": held, "name": "瀬戸環奈"})
         self.assertIsNone(second["held_by"])
         # 无码那张卡上只有正名，也对得上她；别名撞上的写法只报一次。
@@ -1189,6 +1757,20 @@ class FeedFollowByNameTest(PerformerFeedSwitchTest):
             self._lookup()
         with self.assertRaises(ValueError):
             self._lookup("  ")
+
+    def test_a_known_performer_with_an_id_can_be_followed_when_javdb_cannot_search(self):
+        """反馈「订阅女优搜不到」：JavDB 冷却或回登入页时，库里已有编号的她照样能订。"""
+        self._serve(self.search, LOGIN_PAGE)
+        held = self._performer("瀬戸環奈", ["Kn01"])
+        result = self._lookup()
+        self.assertEqual((result["candidates"], result["suggested"]), ([], []))
+        self.assertEqual(result["known"], {"id": held, "name": "瀬戸環奈", "subscribable": True, "following": False})
+        self.assertRegex(result["unavailable"], "登入页")
+        # 库里认得出、却没有任何编号的，仍然要靠搜索，搜不成就照旧报错。
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("DELETE FROM entity_external_ref WHERE entity_id=?", (held,))
+        with self.assertRaisesRegex(ValueError, "登入页"):
+            self._lookup()
 
     def test_following_an_unknown_name_creates_her_binds_the_cards_and_subscribes_now(self):
         result = self._follow(["Kn01", "Kn02"])
@@ -1244,6 +1826,87 @@ class FeedFollowByNameTest(PerformerFeedSwitchTest):
         self.assertEqual(self._sources(), [])
 
 
+class PerformerPageFollowTest(FeedFollowByNameFixture):
+    """用户脚本女优页上的「订阅新作」：先按页面地址里的站内编号认人，只有名字的页去 JavDB 确认。"""
+
+    JAVDB = "https://javdb.com/actors/Kn01"
+    DMM = "https://video.dmm.co.jp/av/list/?actress=1061586"
+    MISSAV = "https://missav.ws/dm127/cn/actresses/" + "%E7%80%AC%E6%88%B8%E7%92%B0%E5%A5%88"
+
+    def _status(self, url, names=()):
+        return performer.performer_status(self.contract, None, url, names)
+
+    def _page_follow(self, url, enabled=True, names=()):
+        return performer.follow_performer(self.contract, None,
+                                          {"source_url": url, "enabled": enabled, "names": list(names)})
+
+    def test_the_page_address_names_the_site_id_or_the_name(self):
+        self.assertEqual(performer.performer_page(self.JAVDB, ["瀬戸環奈, 瀨戶環奈"]),
+                         {"site": "javdb", "javdb": "Kn01", "dmm": "", "names": ["瀬戸環奈", "瀨戶環奈"]})
+        for url in (self.DMM, "https://www.dmm.co.jp/digital/videoa/-/list/=/article=actress/id=1061586/"):
+            with self.subTest(url=url):
+                self.assertEqual(performer.performer_page(url)["dmm"], "1061586")
+        self.assertEqual(performer.performer_page(
+            "https://missav.ws/cn/actresses/" + "%E6%A3%AE%E6%B2%A2%E3%81%8B%E3%81%AA%EF%BC%88%E9%A3%AF%E5%B2%A1%E3%81%8B%E3%81%AA%E3%81%93%EF%BC%89")["names"],
+                         ["森沢かな", "飯岡かなこ"])
+        for url in ("https://javdb.com/v/WM9m8", "https://video.dmm.co.jp/av/list/?actress=abc",
+                    "https://missav.ws/cn/ssis-057", "https://example.com/actors/Kn01", "http://javdb.com/actors/Kn01"):
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "不是支持的女优页"):
+                performer.performer_page(url)
+
+    def test_a_held_javdb_id_names_her_and_switches_her_subscription(self):
+        held = self._performer("瀬戸かんな", ["Kn01"])
+        status = self._status(self.JAVDB, ["瀬戸環奈"])
+        self.assertEqual((status["name"], status["entity_id"], status["following"]), ("瀬戸かんな", held, False))
+        self.assertTrue(self._page_follow(self.JAVDB)["following"])
+        self._settled()
+        self.assertFalse(self._page_follow(self.JAVDB, enabled=False)["following"])
+
+    def test_an_unknown_javdb_page_creates_her_from_the_page_name_and_binds_the_id(self):
+        status = self._page_follow(self.JAVDB, names=["瀬戸環奈, 瀨戶環奈"])
+        self.assertEqual((status["name"], status["following"]), ("瀬戸環奈", True))
+        _row, refs = self._entity(status["entity_id"])
+        self.assertEqual([ref["external_id"] for ref in refs], ["Kn01"])
+        self._settled()
+
+    def test_an_unknown_dmm_page_asks_dmm_for_her_name_and_subscribes_her_catalogue(self):
+        with patch.object(performer, "_dmm_name", return_value="森日向子") as asked, \
+                patch.object(web_feeds, "fetch_new_sources"):
+            status = self._page_follow(self.DMM)
+        asked.assert_called_once()
+        self.assertEqual((status["name"], status["following"]), ("森日向子", True))
+        [source] = [row for row in self._sources() if row["entity_id"] == status["entity_id"]]
+        self.assertEqual(source["url"], feeds.dmm_actress_url("1061586"))
+        # 再来一次就按编号认出她，不再问 DMM。
+        with patch.object(performer, "_dmm_name") as again:
+            self.assertEqual(self._status(self.DMM)["entity_id"], status["entity_id"])
+        again.assert_not_called()
+
+    def test_a_name_only_page_follows_her_once_javdb_confirms_one_person(self):
+        status = self._page_follow(self.MISSAV)
+        self.assertEqual((status["name"], status["following"]), ("瀬戸環奈", True))
+        _row, refs = self._entity(status["entity_id"])
+        self.assertEqual([ref["external_id"] for ref in refs], ["Kn01", "Kn02"])
+        self._settled()
+
+    def test_a_name_only_page_refuses_when_javdb_has_two_people_or_cannot_search(self):
+        for page, reason in ((TWINS_PAGE, "没能确认是同一位女优"), (LOGIN_PAGE, "登入页")):
+            with self.subTest(reason=reason):
+                self._serve(self.search, page)
+                with self.assertRaisesRegex(ValueError, reason):
+                    self._page_follow(self.MISSAV)
+        self.assertEqual(self._sources(), [])
+        self.assertEqual((self._status(self.MISSAV)["entity_id"], self._status(self.MISSAV)["name"]),
+                         (None, "瀬戸環奈"))
+
+    def test_a_known_name_with_an_id_is_followed_without_searching(self):
+        self._serve(self.search, LOGIN_PAGE)
+        held = self._performer("瀬戸環奈", ["Kn01"])
+        self.assertEqual(self._page_follow(self.MISSAV)["entity_id"], held)
+        self.assertTrue(all(request.url != self.search for request in self.transport.requests))
+        self._settled()
+
+
 class JavDiscoveryTest(FeedWebFixture):
     def test_discovery_cast_projects_canonical_names_and_preserves_unknown_names(self):
         self._add()
@@ -1295,8 +1958,8 @@ class JavDiscoveryTest(FeedWebFixture):
                 {"browser_tags": [{"name": "中出内射", "score": 4}]})), \
                 patch("peach.javdb_public.PUBLIC_API.movie") as movie:
             result = web_jav_discovery.q_jav_discoveries(self.contract, {"sort": "source_score"})
-            metadata.job.thread.join(5)
         movie.assert_not_called()
+        self.assertIsNone(metadata.job.thread, "GET 只读，不起外网任务")
         self.assertEqual([row["source_score"] for row in result["items"]], [4.23, None])
         self.assertTrue(all(row["tags"] == ["中出内射"] for row in result["items"]))
         self.assertTrue(all(row["duration"] == 10800 for row in result["items"]))
@@ -1304,8 +1967,123 @@ class JavDiscoveryTest(FeedWebFixture):
         self.assertEqual([row["rank"] for row in result["items"]], [1, 2])
         self.assertTrue(all(row["taste_score"] == row["score"] for row in result["items"]))
 
+    def test_discovery_scoring_is_cached_until_its_inputs_change(self):
+        """任务进行中页面会反复来取；打分只在账本、口味库或资料边车变了之后重算。"""
+        from peach import web_jav_discovery
+        from peach.jav_discovery_metadata import discovery_metadata
+        self._add()
+        self._check()
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE feed_discovery SET studio='示例厂牌'")
+        fixture = self._preference_fixture({"peach_studios": [{"name": "示例厂牌", "score": 4}]})
+        with patch.object(web_jav_discovery, "preference_profile", return_value=fixture) as profile:
+            first = web_jav_discovery.q_jav_discoveries(self.contract, {})
+            again = web_jav_discovery.q_jav_discoveries(self.contract, {})
+            self.assertEqual(profile.call_count, 1)
+            self.assertEqual([row["id"] for row in again["items"]], [row["id"] for row in first["items"]])
+            code = first["items"][0]["code"]
+            discovery_metadata(self.contract).remember(code, {"number": code, "tags": [{"name": "中出"}]})
+            web_jav_discovery.q_jav_discoveries(self.contract, {})
+            self.assertEqual(profile.call_count, 2, "资料边车变了要重算")
+
+    def test_metadata_reading_starts_from_post_and_progress_is_read_alone(self):
+        """GET 不起任务；页面用 POST 起、停，进度单独轮询，不再整页重取。"""
+        from peach import web_jav_discovery
+        self._add()
+        self._check()
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE feed_discovery SET studio='示例厂牌'")
+        fixture = self._preference_fixture({"peach_studios": [{"name": "示例厂牌", "score": 4}]})
+        started = {"job_id": "batch", "status": "running", "completed": 0, "total": 2, "failed": 0,
+                   "requests": 0, "bytes": 0, "codes": ["X"]}
+        with patch.object(web_jav_discovery, "preference_profile", return_value=fixture), \
+                patch("peach.jav_discovery_metadata.DiscoveryMetadata.ensure", return_value=started) as ensure:
+            listing = web_jav_discovery.q_jav_discoveries(self.contract, {})
+            ensure.assert_not_called()
+            response = web_jav_discovery.w_jav_discovery_metadata(self.contract, {"action": "refresh"})
+        self.assertEqual(sorted(ensure.call_args.args[0]), sorted(row["code"] for row in listing["items"]))
+        self.assertTrue(ensure.call_args.kwargs["refresh"])
+        self.assertEqual(response["metadata_job"]["status"], "running")
+        self.assertNotIn("codes", response["metadata_job"])
+        with patch("peach.jav_discovery_metadata.DiscoveryMetadata.current", return_value=started), \
+                patch.object(web_jav_discovery, "_ranked", side_effect=AssertionError("进度轮询不打分")):
+            progress = web_jav_discovery.q_jav_discovery_metadata(self.contract, {})
+        self.assertEqual(progress["metadata_job"]["job_id"], "batch")
+        self.assertEqual(progress["poll_after_ms"], 3000)
+        with self.assertRaises(ValueError):
+            web_jav_discovery.w_jav_discovery_metadata(self.contract, {"action": "delete"})
+
+    def test_releases_page_by_date_and_facets_come_only_from_unowned_releases(self):
+        from peach import web_jav_discovery
+        self._add()
+        self._check()
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("INSERT INTO feed_discovery(code,release_date,discovered_at) VALUES('OWN-001','2026-09-25','t')")
+            connection.execute("INSERT INTO asset(location,path,name,medium,code) VALUES('local','x.mp4','x.mp4','video','OWN-001')")
+        movies = {"SSIS-950": {"actors": [{"name": "女优甲"}], "tags": [{"name": "中出"}], "maker_name": "厂牌甲",
+                               "score": "3.5", "duration": 120},
+                  "HMN-071": {"actors": [{"name": "女优乙"}], "tags": [], "maker_name": "厂牌乙", "score": "4.5"},
+                  "OWN-001": {"actors": [{"name": "馆藏女优"}], "tags": [{"name": "巨乳"}], "maker_name": "馆藏厂牌"}}
+
+        reads = []
+
+        def releases(handler=web_jav_discovery.q_jav_releases, **args):
+            with patch.object(web_jav_discovery, "_cached_movie", side_effect=lambda code, contract: movies.get(code, {})), \
+                    patch("peach.jav_discovery_metadata.DiscoveryMetadata.ensure",
+                          side_effect=lambda codes, **options: reads.append((codes, options))):
+                return handler(self.contract, args)
+
+        every = releases()
+        self.assertEqual(reads, [], "列表只读，不起资料读取")
+        self.assertEqual(every["metadata_unread"], 2)
+        releases(web_jav_discovery.w_jav_release_metadata, action="start", performer="女优乙")
+        self.assertEqual(reads, [(["HMN-071"], {"refresh": True})],
+                         "「读取资料」只读当前筛选结果里从没读过来源资料的那几部")
+        self.assertEqual(([row["code"] for row in every["items"]], every["total"]), (["SSIS-950", "HMN-071"], 2))
+        self.assertEqual([(ref["name"], ref["count"]) for ref in every["facets"]["performers"]], [("女优乙", 1), ("女优甲", 1)])
+        self.assertEqual([ref["name"] for ref in every["facets"]["studios"]], ["厂牌乙", "厂牌甲"])
+        self.assertEqual(every["facets"]["tags"], [{"name": "中出内射", "count": 1}])
+        one = releases(performer="女优乙")
+        self.assertEqual([row["code"] for row in one["items"]], ["HMN-071"])
+        self.assertEqual(len(one["facets"]["performers"]), 2, "本维度不计，另一位女优照样能点")
+        self.assertEqual(one["facets"]["tags"], [])
+        union = releases(column_filters=json.dumps({'people': ['performer:女优甲', 'performer:女优乙']}))
+        self.assertEqual(union['total'], 2)
+        narrowed = releases(column_filters=json.dumps({'people': ['performer:女优甲', 'performer:女优乙'],
+                                                       'studio': ['厂牌甲']}))
+        self.assertEqual([row['code'] for row in narrowed['items']], ['SSIS-950'])
+        self.assertEqual(len(narrowed['facets']['studios']), 2)
+        self.assertTrue(all(ref['avatar_code'] for ref in union['facets']['performers']))
+        self.assertEqual(releases(column_filters='{"people":[]}')['total'], 0)
+        self.assertEqual(releases(column_filters='{}')['total'], 2)
+        excluded = releases(column_filters=json.dumps({'people': {'exclude': ['performer:女优甲']}}))
+        self.assertEqual([row['code'] for row in excluded['items']], ['HMN-071'])
+        with patch.object(web_jav_discovery, 'preference_profile', side_effect=AssertionError('列选项无需口味打分')):
+            first_options = releases(column='people', column_limit='1', sort='taste')
+            next_options = releases(column='people', column_limit='1', column_offset='1')
+        self.assertEqual([row['name'] for row in first_options['items']], ['女优乙'])
+        self.assertEqual(first_options['next_offset'], 1)
+        self.assertEqual([row['name'] for row in next_options['items']], ['女优甲'])
+        self.assertFalse(next_options['has_more'])
+        self.assertIsNone(next_options['next_offset'])
+        second = releases(page=2, size=1)
+        self.assertEqual(([row["code"] for row in second["items"]], second["total"], second["page"]), (["HMN-071"], 2, 2))
+        self.assertEqual([row["code"] for row in releases(q="中出")["items"]], ["SSIS-950"])
+
+        def order(**args):
+            return [row["code"] for row in releases(**args)["items"]]
+
+        self.assertEqual(order(sort="release_date", direction="asc"), ["HMN-071", "SSIS-950"])
+        self.assertEqual(order(sort="source_score"), ["HMN-071", "SSIS-950"])
+        self.assertEqual(order(sort="source_score", direction="asc"), ["SSIS-950", "HMN-071"])
+        self.assertEqual(order(sort="duration", direction="asc"), ["SSIS-950", "HMN-071"], "没有时长的排在末尾，不随方向翻转")
+        self.assertEqual(order(sort="duration"), ["SSIS-950", "HMN-071"])
+        self.assertEqual(order(sort="random", seed="a"), order(sort="random", seed="a"), "同一个种子翻页时顺序不变")
+
     def _discover(self, scope="external", rankings=None, metadata=None, args=None):
         from peach import web_jav_discovery
+        # 口味与来源资料在这里是换掉的函数，不经它们的版本；每次从头算，不读上一次的打分缓存。
+        self.contract.cache.clear()
         with patch.object(web_jav_discovery, "preference_profile", return_value=self._preference_fixture(rankings or {})), \
                 patch.object(web_jav_discovery, "_cached_movie", return_value=metadata or {}), \
                 patch("peach.jav_discovery_metadata.DiscoveryMetadata.ensure", return_value=None):

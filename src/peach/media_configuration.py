@@ -1,14 +1,17 @@
 """媒体来源表单与配置映射；来源 ID 直接沿用扫描及流量策略。"""
 from __future__ import annotations
 
+from concurrent.futures import Future, TimeoutError as FuturesTimeout
 from pathlib import Path, PurePath, PureWindowsPath, PurePosixPath
 import hashlib
 import shutil
 import sys
+import threading
 from typing import Any
 
 from . import platform, media_identity
 from .media_sources import SOURCE_OPTIONS, cost_for
+from .user_messages import UserValueError
 
 
 def _windows_installed_names() -> list[str]:
@@ -51,7 +54,12 @@ def mount_dependencies(*, system: str | None = None) -> list[dict[str, Any]]:
             {"name": driver, "available": installed, "download_url": url}]
 
 
-def rows(config, *, windows: bool, probe: bool = False) -> list[dict[str, Any]]:
+def rows(config, *, windows: bool, probe: bool = False, known: dict | None = None) -> list[dict[str, Any]]:
+    """设置页的媒体目录行。`known` 是挂载可达性快照（`reachability_states`）：
+
+    快照里有的根直接用快照，网盘卡住时页面不再跟着等；快照里没有的（刚保存、服务还没
+    重载）才现场探测，最多等 `PROBE_TIMEOUT` 秒，到时报未检测。
+    """
     result = []
     libraries, stored = media_identity.catalog(config)
     for location, roots in config.locations.items():
@@ -78,16 +86,63 @@ def rows(config, *, windows: bool, probe: bool = False) -> list[dict[str, Any]]:
                            "library_stages": library.get("stages", ""),
                            "cost": cost_for(location, root, config),
                            "transport": value.get('transport', 'filesystem'),
-                           "online": _online(root, mount, probe, config), **smb_fields})
+                           "online": _online(root, root_id, mount, probe, config, known), **smb_fields})
     return result
 
 
-def _online(root, mount, probe, config):
+def reachability_states(reachability) -> dict[str, bool | None]:
+    """可达性快照按根 ID 与路径键各记一份：True 在线、False 离线、None 探测未返回。
+
+    服务刚启动、快照还在检测的根不记，交给 `_online` 现场探测（有时限）；探测已经超时的
+    记 None，不再陪它等。
+    """
+    states: dict[str, bool | None] = {}
+    if reachability is None:
+        return states
+    for source in reachability.sources():
+        for root in source["roots"]:
+            if root["online"] is None and root.get("state") != "timeout":
+                continue
+            if root.get("root_id"):
+                states["id:" + root["root_id"]] = root["online"]
+            states["path:" + media_identity.path_key(root["declared"])] = root["online"]
+    return states
+
+
+def _online(root, root_id, mount, probe, config, known):
     if not probe or not mount:
         return False
+    for key in ("id:" + root_id if root_id else "", "path:" + media_identity.path_key(root)):
+        if known and key in known:
+            return known[key]
     from .smb_media import resolve
     resource = resolve(root, config)
-    return platform.root_online(resource if resource is not None else Path(mount))
+    return _bounded_online(resource if resource is not None else Path(mount))
+
+
+_PROBES: dict[str, Future] = {}
+_PROBES_LOCK = threading.Lock()
+
+
+def _bounded_online(target) -> bool | None:
+    """现场探测一个根，最多等 `PROBE_TIMEOUT` 秒；同一个根上一次还没返回时不另起线程。"""
+    from .mount_reachability import PROBE_TIMEOUT
+    key = str(target)
+    with _PROBES_LOCK:
+        future = _PROBES.get(key)
+        if future is None or future.done():
+            future = _PROBES[key] = Future()
+
+            def read(pending=future):
+                try:
+                    pending.set_result(platform.root_status(target) == "ok")
+                except Exception:  # noqa: BLE001 - 未知异常不当作离线证据，报未检测
+                    pending.set_result(None)
+            threading.Thread(target=read, name="PeachMountProbe", daemon=True).start()
+    try:
+        return future.result(timeout=PROBE_TIMEOUT)
+    except FuturesTimeout:
+        return None
 
 
 def _automatic_root(location: str, path: str, used: list[PureWindowsPath]) -> str:
@@ -141,68 +196,71 @@ def _validated_paths(row: dict, *, windows: bool) -> tuple[PureWindowsPath, Pure
     text = str(row.get("path", "")).strip()
     from .smb_media import is_address, canonical
     if row.get('transport') == 'smb' and not is_address(text):
-        raise ValueError('请填写 smb://服务器/共享/目录')
+        raise UserValueError('errors.mediaConfiguration.smbAddressRequired')
     if is_address(text):
         text = canonical(text)
         row['path'] = text
         if any(not isinstance(row.get(key, ''), str) for key in ('smb_username', 'smb_password')):
-            raise ValueError('SMB 账号和密码必须是文字')
+            raise UserValueError('errors.mediaConfiguration.smbCredentialsNotText')
         if any(key in row and not isinstance(row[key], bool) for key in ('smb_encrypt', 'smb_clear')):
-            raise ValueError('SMB 连接选项无效')
+            raise UserValueError('errors.mediaConfiguration.smbOptionsInvalid')
         root = str(row.get('root', ''))
         if not platform.is_windows_path(root) or '..' in PureWindowsPath(root).parts:
-            raise ValueError('SMB 目录的内部路径无效')
+            raise UserValueError('errors.mediaConfiguration.smbRootInvalid')
         return PureWindowsPath(root), PurePosixPath(text)
     root = str(row.get("root") or text).strip() if windows else str(row.get("root", "")).strip()
     if any(ord(char) < 32 for char in text + root):
-        raise ValueError("路径不能包含控制字符")
+        raise UserValueError("errors.mediaConfiguration.controlCharacters")
     if not windows and not root:
-        raise ValueError("无法自动配置媒体目录，请检查配置文件中的目录对应关系")
+        raise UserValueError("errors.mediaConfiguration.rootMappingMissing")
     if not platform.is_windows_path(root) or ".." in PureWindowsPath(root).parts:
-        raise ValueError("媒体路径必须包含盘符，例如 B:\\；网络共享请先映射为 Windows 盘符" if windows
-                         else "配置文件中 [media.locations] 的路径格式无效；请使用 Windows 格式，例如 R:\\media")
+        raise UserValueError("errors.mediaConfiguration.driveLetterRequired" if windows
+                             else "errors.mediaConfiguration.mappingFormatInvalid")
     path = PureWindowsPath(text) if windows else PurePosixPath(text)
     if not text or not (platform.is_windows_path(text) if windows else text.startswith("/")):
-        raise ValueError("请填写媒体目录的完整路径，例如 D:\\Movies" if windows
-                         else "请填写媒体目录的完整路径，例如 /media")
+        raise UserValueError("errors.mediaConfiguration.fullPathRequiredWindows" if windows
+                             else "errors.mediaConfiguration.fullPathRequiredPosix")
     if ".." in path.parts:
-        raise ValueError("媒体目录路径不能包含上级目录 ..")
+        raise UserValueError("errors.mediaConfiguration.parentSegment")
     return PureWindowsPath(root), path
 
 
-def validate(raws: object, *, windows: bool, config=None) -> tuple[dict, dict, list[str]]:
-    """离线来源允许保存；绝对路径、盘符根与来源间重叠在保存前校验。"""
+def validate(raws: object, *, windows: bool, config=None) -> tuple[dict, dict, list]:
+    """离线来源允许保存；绝对路径、盘符根与来源间重叠在保存前校验。
+
+    错误与行对齐：没问题的行是空串，有问题的是带 code 的异常，由 `web_entry.field_errors` 写成原句与 code。
+    整表不成立（一行都没填、超过 100 行）时只有一项。"""
     if not isinstance(raws, list) or not raws or len(raws) > 100:
-        return {}, {}, ["请添加 1 到 100 个媒体目录"]
+        return {}, {}, [UserValueError("errors.mediaConfiguration.rowCount")]
     raws = prepare_sources(raws, windows=windows, config=config)
     locations: dict[str, list[str]] = {}
     mounts: dict[str, list[str]] = {}
-    errors = [""] * len(raws)
+    errors: list = [""] * len(raws)
     seen: list[tuple[PureWindowsPath, PurePath]] = []
     for index, row in enumerate(raws):
         try:
             if not isinstance(row, dict):
-                raise ValueError("媒体来源格式不正确")
+                raise UserValueError("errors.mediaConfiguration.rowInvalid")
             location = row.get("location")
             if not isinstance(location, str) or location not in dict(SOURCE_OPTIONS):
-                raise ValueError("请选择列表中的媒体来源")
+                raise UserValueError("errors.mediaConfiguration.locationRequired")
             if "cost" in row and row["cost"] not in ("free", "metered"):
-                raise ValueError("请选择代理流量保护设置")
+                raise UserValueError("errors.mediaConfiguration.costRequired")
             declared, path = _validated_paths(row, windows=windows)
             for other_root, other_path in seen:
                 if (declared == other_root or declared.is_relative_to(other_root)
                         or other_root.is_relative_to(declared)):
-                    raise ValueError("媒体路径与另一文件夹重复或互相包含" if windows
-                                     else "配置文件中的目录对应关系重复或互相包含")
+                    raise UserValueError("errors.mediaConfiguration.pathOverlaps" if windows
+                                         else "errors.mediaConfiguration.mappingOverlaps")
                 if path == other_path or path.is_relative_to(other_path) or other_path.is_relative_to(path):
-                    raise ValueError("媒体目录与另一行重复或互相包含")
+                    raise UserValueError("errors.mediaConfiguration.directoryOverlaps")
             seen.append((declared, path))
             locations.setdefault(location, []).append(str(declared))
             from .smb_media import is_address
             mounts.setdefault(location, []).append(row['path'] if is_address(row['path'])
                                                     else str(path) if not windows or declared != path else "")
         except ValueError as exc:
-            errors[index] = str(exc)
+            errors[index] = exc
     return ({key: tuple(value) for key, value in locations.items()},
             {key: tuple(value) for key, value in mounts.items() if any(value)},
             errors if any(errors) else [])

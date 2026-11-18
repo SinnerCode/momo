@@ -27,12 +27,13 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from peach.catalog_rules import (
     CODE_BODY_STOPWORDS,
     REPOST_SITE_LABELS,
+    CodePatternError,
     code_query_variants,
     compact_label,
     compile_code_patterns,
@@ -51,10 +52,12 @@ from peach.catalog_rules import (
     scrapes_as_jav,
     tokyo_hot_code,
     western_release_identity,
+    without_store_prefix,
 )
 from peach import scripting
 from peach.migrations import upgrade
 from peach.review_csv import write_rows
+from support.ledger import fresh_ledger
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "audit_domain_codes.py"
@@ -121,6 +124,13 @@ class NormalisationTests(unittest.TestCase):
         self.assertFalse(is_jav_asset("HHD800", None, "2022-04-01"))
         self.assertFalse(is_jav_asset("HHD800", None, None, ("performer",)))
         self.assertTrue(is_jav_asset("PBD390", "MOODYZ"))
+
+    def test_store_prefix_is_dropped_only_for_verified_labels(self):
+        self.assertEqual(without_store_prefix("107stzy019"), "STZY-019")
+        self.assertTrue(same_release_code("107STARS-325", "STARS-325"))
+        # 素人系前缀是作品身份的一部分，未核验的前缀仍是另一部作品。
+        self.assertEqual(without_store_prefix("259LUXU-1475"), "259LUXU-1475")
+        self.assertFalse(same_release_code("348NTR-001", "NTR-001"))
 
 
 class ScrapeGateTests(unittest.TestCase):
@@ -319,6 +329,44 @@ class DatedCodeSeparatorTests(unittest.TestCase):
             self.assertFalse(is_uncensored_code(value), value)
 
 
+class ShortSerialWidthTests(unittest.TestCase):
+    """登记过的字母段，短号按原写保留：#296 的 `MCDV-24` 与 `MCDV-024` 是两部片。
+
+    JavDB 实测：`MCDV-24` 是メルシーボークー的无码片（2015-06-25，110 分钟），
+    `MCDV-024` 是クリスタル映像的有码片（2004-12-10，130 分钟）。其余字母段的短号仍是
+    补零号的省略写法，两头都钉住，免得有人把例外推广成通用规则（ADR-0133）。
+    """
+
+    def test_other_prefixes_still_pad_short_serials(self):
+        self.assertEqual(normalise_code_key("LAF-41"), "LAF-041")
+        self.assertEqual(release_code_from_filename("laf41.mp4"), "LAF-041")
+        self.assertTrue(same_release_code("MESU-088", "MESU-88"))
+        self.assertEqual(jav_fallback_title("laf41 some title.mp4", "LAF-041"), "some title")
+
+    def test_the_key_keeps_the_written_width(self):
+        self.assertEqual(normalise_code_key("mcdv-24"), "MCDV-24")
+        self.assertEqual(normalise_code_key("MCDV24"), "MCDV-24")
+        self.assertEqual(normalise_code_key("MCDV-024"), "MCDV-024")
+        self.assertEqual(release_code_from_filename("MCDV-24.mp4"), "MCDV-24")
+        self.assertEqual(release_code_from_filename("mcdv-024.mp4"), "MCDV-024")
+
+    def test_the_two_widths_are_two_releases(self):
+        self.assertFalse(same_release_code("MCDV-24", "MCDV-024"))
+        self.assertTrue(same_release_code("MCDV-24", "mcdv24"))
+
+    def test_padding_beyond_three_digits_is_still_one_release(self):
+        # DMM content_id 补到五位：`mcdv00024` 是有码那部，`ssis00001` 是 `SSIS-001`。
+        self.assertTrue(same_release_code("mcdv00024", "MCDV-024"))
+        self.assertFalse(same_release_code("mcdv00024", "MCDV-24"))
+        self.assertTrue(same_release_code("ssis00001", "SSIS-001"))
+        self.assertEqual(normalise_code_key("SSIS-0001"), "SSIS-001")
+
+    def test_filename_matching_follows_the_same_width(self):
+        self.assertEqual(jav_fallback_title("MCDV-24 first title.mp4", "MCDV-24"), "first title")
+        self.assertEqual(jav_fallback_title("mcdv-024 other title.mp4", "MCDV-24"), "mcdv-024 other title")
+        self.assertEqual(jav_fallback_title("MCDV0024 other title.mp4", "MCDV-024"), "other title")
+
+
 class TokyoHotShapeTests(unittest.TestCase):
     """Tokyo-Hot 的编号没有厂牌字母段，规范写法是小写。`k` 与 `red` 两支账本里一条
     没有，按同一发行体系一并认。
@@ -370,8 +418,81 @@ class TokyoHotShapeTests(unittest.TestCase):
             name = f'MKBD{separator}S94-C 作品标题.mkv'
             self.assertEqual(jav_display_metadata(name, 'MKBD-S94'), {
                 'display_code': 'MKBD-S94', 'display_title': '作品标题',
-                'edition_badges': ['中字', '无码']})
+                'edition_badges': ['chinese-subtitles', 'uncensored']})
         self.assertEqual(jav_fallback_title('MKD-S118.mp4', 'MKD-S118'), '')
+
+    def test_registered_digit_labels_reach_every_code_entrypoint(self):
+        """TMA 的 `T28`、`T38` 厂牌段带数字；只认登记过的这两段。"""
+        from peach.feeds import scan_code
+        for value in ('T38-076', 't38-076', 'T38_076', 't38076', 'T38-76', 'T38-076-C', '[98t.tv]T38-076'):
+            self.assertEqual(release_code_from_text(value), 'T38-076', value)
+            self.assertEqual(release_code_from_filename(f'{value}.mp4'), 'T38-076', value)
+        self.assertEqual(release_code_from_filename('T28-612 週に3回ハメてます.mp4'), 'T28-612')
+        self.assertEqual(scan_code('T38-076 今日、家族に売られました。'), 'T38-076')
+        self.assertEqual(scan_code('T28-612 週に3回ハメてます', product=True), 'T28-612')
+        self.assertTrue(is_jav_code('T28-612'))
+        self.assertEqual(normalise_code_key('t28_612'), 'T28-612')
+        self.assertEqual(code_query_variants('T28-612'), ('T28-612',))
+        self.assertEqual(jav_display_metadata('T38-076-C 片名.mp4', 'T38-076'), {
+            'display_code': 'T38-076', 'display_title': '片名', 'edition_badges': ['chinese-subtitles']})
+        # DMM 的 content_id 带片商数字头，和别家番号一样不与裸番号算成同一身份。
+        self.assertEqual(release_identity('t2800612'), 'T28-612')
+        self.assertEqual(release_identity('55t2800612'), '55T28-612')
+        self.assertFalse(same_release_code('T28-612', 'T38-612'))
+
+    def test_unregistered_letter_digit_labels_stay_unrecognised(self):
+        """厂牌名、画质词与素材编号同样是「字母+数字」，白名单之外一律不是番号。"""
+        for value in ('S1-123', 'G1-123', 'VR180-123', 'X1080', 'G2115', 'p1000', 'T29-123',
+                      'T-28612', 'AT28-612', 'T280-612', 'T28'):
+            self.assertIsNone(release_code_from_text(value), value)
+            self.assertIsNone(release_code_from_filename(f'{value}.mp4'), value)
+        self.assertEqual(release_code_from_filename('MIAA-636-C_X1080X.mp4'), 'MIAA-636')
+        self.assertFalse(is_jav_code('T28612'))
+
+    def test_s_model_and_catwalk_digit_labels_keep_their_registered_serial_width(self):
+        """#124：S Model 的 `S2M`、`S2MCR` 与キャットウォーク的 `CW3D2DBD` 厂牌段带数字。"""
+        for value, code in (('S2M-009', 'S2M-009'), ('s2m009', 'S2M-009'), ('S2M-027-C', 'S2M-027'),
+                            ('S2MCR-08', 'S2MCR-08'), ('S2MCR-008', 'S2MCR-08'),
+                            ('CW3D2DBD-14', 'CW3D2DBD-14'), ('cw3d2dbd_14', 'CW3D2DBD-14')):
+            self.assertEqual(release_code_from_text(value), code, value)
+            self.assertEqual(release_code_from_filename(f'{value}.mp4'), code, value)
+        self.assertTrue(same_release_code('S2MCR-08', 'S2MCR-008'))
+        self.assertFalse(same_release_code('S2M-008', 'S2MCR-08'))
+        self.assertTrue(is_jav_code('CW3D2DBD-14'))
+
+    def test_registered_label_suffix_stays_in_the_code_while_edition_markers_are_stripped(self):
+        """#124：`IBW-483z` 的 `z` 是番号的一部分；`C`、`U`、`UC` 这些版次标记照旧剥掉。"""
+        for name in ('IBW-483z.mp4', 'IBW-483Z.mp4', 'ibw483z.mp4', 'IBW-483z-C.mp4',
+                     'IBW-483z 少女の道草.mp4', '[98t.tv]IBW-483z.mp4'):
+            self.assertEqual(release_code_from_filename(name), 'IBW-483Z', name)
+        self.assertEqual(release_code_from_text('IBW-483z'), 'IBW-483Z')
+        self.assertTrue(same_release_code('IBW-483Z', 'IBW-483z'))
+        self.assertFalse(same_release_code('IBW-483', 'IBW-483z'))
+        # 别的段尾字母不算番号；登记段的其他字母也不算。
+        for name, code in (('ADN-516C.mp4', 'ADN-516'), ('ABW-483z.mp4', 'ABW-483'), ('IBW-483C.mp4', 'IBW-483'),
+                           ('SNOS-205-UC.mp4', 'SNOS-205'), ('ADN-516-U.mp4', 'ADN-516')):
+            self.assertEqual(release_code_from_filename(name), code, name)
+
+    def test_codes_followed_by_encoding_and_enhancement_tails_are_recognised(self):
+        """#124、#200：番号后面接转码、修复或增强说明时取番号本身。"""
+        for name, code in (('SNOS-205-C.H265.mp4', 'SNOS-205'), ('SNOS-124.restored.H265.mp4', 'SNOS-124'),
+                           ('SNOS-289.H265.mp4', 'SNOS-289'), ('ABC-199_AI.mp4', 'ABC-199'),
+                           ('ABC-199-AI.mp4', 'ABC-199'), ('MKD-S62.mp4', 'MKD-S62')):
+            self.assertEqual(release_code_from_filename(name), code, name)
+
+    def test_uncensored_only_labels_get_the_uncensored_badge(self):
+        for name, code in (('SMBD-120.mp4', 'SMBD-120'), ('SKYHD-050-C.mp4', 'SKYHD-050')):
+            with self.subTest(code=code):
+                self.assertIn('uncensored', jav_display_metadata(name, code)['edition_badges'])
+        self.assertEqual(jav_display_metadata('MCDV-024.mp4', 'MCDV-024')['edition_badges'], [])
+
+    def test_ltx_after_the_code_marks_a_cracked_edition(self):
+        self.assertEqual(jav_display_metadata('ABP-123-LTX.mp4', 'ABP-123'), {
+            'display_code': 'ABP-123', 'display_title': '', 'edition_badges': ['uncensored-crack']})
+        self.assertEqual(jav_display_metadata('ABP-123-C-LTX.mp4', 'ABP-123')['edition_badges'],
+                         ['chinese-subtitles', 'uncensored-crack'])
+        # 字母段本身是 LTX 的番号不是破解标记。
+        self.assertEqual(jav_display_metadata('LTX-123.mp4', 'LTX-123')['edition_badges'], [])
 
     def test_a_bare_number_is_read_only_at_the_head_of_the_name(self):
         self.assertEqual(release_code_from_filename("n1032.mkv"), "n1032")
@@ -423,6 +544,14 @@ class DeliveryFilenameTests(unittest.TestCase):
         self.assertEqual(release_code_from_filename("heyzo_hd_1031_full.mp4"), "HEYZO-1031")
         self.assertEqual(release_code_from_filename("heyzo_lt_1380_full-1.mp4"), "HEYZO-1380")
         self.assertEqual(release_code_from_filename("HEYZO-1380.mp4"), "HEYZO-1380")
+
+    def test_heyzo_keeps_four_digits_below_one_thousand(self):
+        """#354：HEYZO 官方编号定宽四位，前导零是编号的一部分，收成三位就查不到资料。"""
+        for name in ("HEYZO-0707.mp4", "heyzo_hd_0707_full.mp4", "HEYZO-707.mp4", "heyzo-00707.mp4"):
+            with self.subTest(name=name):
+                self.assertEqual(release_code_from_filename(name), "HEYZO-0707")
+        self.assertEqual(normalise_code_key("HEYZO-707"), "HEYZO-0707")
+        self.assertEqual(normalise_code_key("ABC-0123"), "ABC-123")
 
     def test_the_number_alone_is_not_a_heyzo_release(self):
         # 站名是这条规则的全部证据：少了它，创作者目录里按下划线分段、末尾带画质
@@ -483,8 +612,10 @@ class TitledFilenameTests(unittest.TestCase):
         self.assertEqual(release_code_from_filename("片名 CAWD-987.mp4", patterns=loose), "CAWD-987")
 
     def test_a_broken_user_rule_says_which_one(self):
-        with self.assertRaisesRegex(ValueError, "第 2 条"):
+        with self.assertRaises(CodePatternError) as caught:
             compile_code_patterns([r"(\w+-\d+)", "(unclosed"])
+        self.assertEqual((caught.exception.code, caught.exception.params["index"]),
+                         ("errors.catalogRules.codePatternInvalid", 2))
         self.assertEqual(compile_code_patterns(None), ())
         self.assertEqual(compile_code_patterns(["", "  "]), ())
 
@@ -703,9 +834,9 @@ class AuditScriptTests(unittest.TestCase):
         self._asset(12, folder + r"\最新成人AV.gif", "HJD2048")
         rows = self._rows()
         self.assertEqual((rows[10]["proposed_code"], rows[10]["proposal_from"]),
-                         ("MIDE-612", "文件名"))
+                         ("MIDE-612", "filename"))
         self.assertEqual((rows[12]["proposed_code"], rows[12]["proposal_from"]),
-                         ("MIDE-612", "同目录兄弟"))
+                         ("MIDE-612", "siblings"))
 
     def test_two_codes_in_one_directory_leave_the_rest_unproposed(self):
         # 目录里有两部片时，兄弟证据指不出这条属于哪一部，宁可报「无番号」。
@@ -723,7 +854,7 @@ class AuditScriptTests(unittest.TestCase):
         self._asset(6, r"B:\番号\_未知厂牌\NEWSITE77\newsite77.com@SSIS-070\SSIS-070.mp4",
                     "NEWSITE77")
         row = self._rows()[6]
-        self.assertEqual((row["tier"], row["confidence"]), ("E2", "高"))
+        self.assertEqual((row["tier"], row["confidence"]), ("E2", "high"))
         self.assertEqual(row["proposed_code"], "SSIS-070")
 
     def test_a_sibling_carries_the_evidence_for_a_renamed_file(self):
@@ -732,7 +863,7 @@ class AuditScriptTests(unittest.TestCase):
                     "NEWSITE77")
         self._asset(8, r"B:\番号\_未知厂牌\NEWSITE77\SSIS-071\SSIS-071.mp4", "NEWSITE77")
         row = self._rows()[8]
-        self.assertEqual((row["tier"], row["confidence"]), ("E3", "中"))
+        self.assertEqual((row["tier"], row["confidence"]), ("E3", "medium"))
         self.assertEqual(row["proposed_code"], "SSIS-071")
         self.assertEqual(row["evidence"], "newsite77.com")
 
@@ -749,9 +880,7 @@ class ApplyTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.db = self.root / "ledger.db"
-        sqlite3.connect(self.db).close()
-        upgrade(self.db, MIGRATIONS)
+        self.db = fresh_ledger(self.root)
         self.review = self.root / "review.csv"
 
     def _asset(self, asset_id, path, code):
@@ -803,13 +932,14 @@ class ApplyTests(unittest.TestCase):
         self.assertTrue((self.root / "b.db").exists())
 
     def test_a_pack_row_is_never_written(self):
-        # `存疑` 的 269 条论坛整合包要人工看过再定，不能跟着这一批一起改。
+        # `suspect` 的 269 条论坛整合包要人工看过再定，不能跟着这一批一起改；旧版表里写「存疑」。
         self._asset(3, r"B:\x\WX17\[mtfdz.club]WX17.3\a.rar", "WX17")
-        self._plan({"asset_id": "3", "current_code": "WX17",
-                    "proposed_code": "", "tier": "存疑"})
-        with self.assertRaises(SystemExit):
-            self._run("--apply", "--backup", str(self.root / "b.db"))
-        self.assertEqual(self._codes()[3][0], "WX17")
+        for tier in ("suspect", "存疑"):
+            self._plan({"asset_id": "3", "current_code": "WX17",
+                        "proposed_code": "", "tier": tier})
+            with self.assertRaises(SystemExit):
+                self._run("--apply", "--backup", str(self.root / "b.db"))
+            self.assertEqual(self._codes()[3][0], "WX17")
 
     def test_a_row_edited_since_the_review_is_skipped_not_overwritten(self):
         # 出表和写库之间隔着一次人工阅读，期间别的脚本可能已经改过同一行。
@@ -853,10 +983,8 @@ class RevertMisreadCodeTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
-        self.db = self.root / "ledger.db"
-        sqlite3.connect(self.db).close()
-        upgrade(self.db, MIGRATIONS)
+        self.root = Path(tmp.name).resolve()
+        self.db = fresh_ledger(self.root)
         connection = sqlite3.connect(self.db)
         connection.executemany(
             "INSERT INTO asset(id,location,path,name,medium,code,catalog_title,field_owners) "
@@ -1057,6 +1185,27 @@ _identity_spec.loader.exec_module(identity)
 
 class ScrapedIdentityAuditTests(unittest.TestCase):
     """已落库的刮削归属按来源交回的编号重判身份，分错配、前缀未证实、来源无编号三档。"""
+
+    def test_date_code_review_keys_compare_the_release_not_the_key_namespace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / 'ledger.db'
+            upgrade(database, MIGRATIONS)
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("INSERT INTO asset(id,location,path,name,medium,code) "
+                                   "VALUES(1,'local','sample.mp4','sample.mp4','video','010101_001')")
+                connection.execute("INSERT INTO entity(id,kind,canonical_name,normalized_name,created_at,updated_at) "
+                                   "VALUES(1,'tag','sample','sample','now','now')")
+                metadata = {'review_item': 'date-code:1:tags', 'provider_id': '010101_001'}
+                connection.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source,metadata_json) "
+                                   "VALUES(1,1,'tag','javinizer:test:tag',?)", (json.dumps(metadata),))
+                rows, tiers = identity.collect(connection)
+                self.assertEqual(rows, [])
+                self.assertEqual(dict(tiers), {})
+                metadata['provider_id'] = '010101_002'
+                connection.execute('UPDATE asset_entity SET metadata_json=?', (json.dumps(metadata),))
+                rows, tiers = identity.collect(connection)
+                self.assertEqual(tiers[identity.MISMATCH], 1)
+                self.assertEqual(rows[0]['review_code'], '010101_001')
 
     def test_each_tier_is_told_apart(self):
         self.assertIsNone(identity.classify("ABW-123", {"id": "ABW-123"}))

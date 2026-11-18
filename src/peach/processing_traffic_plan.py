@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from itertools import islice
+import json
 import os
 import sqlite3
 from statistics import median
 from contextlib import closing
 
 from .catalog_rules import is_local_extra
+from .catalog_vocabulary import PERFORMER_TAG_PREFIX
 
 MIB = 1024 ** 2
 
@@ -24,12 +26,12 @@ def ledger_rows(db_path, asset_ids=None, *, library_roots=()):
     query = """SELECT asset.*,
         EXISTS(SELECT 1 FROM asset_entity ae JOIN entity e ON ae.entity_id=e.id
                WHERE ae.asset_id=asset.id AND e.kind='performer') AS performers,
-        EXISTS(SELECT 1 FROM asset_tag t WHERE t.asset_id=asset.id AND t.tag NOT LIKE '演员:%') AS tags
+        EXISTS(SELECT 1 FROM asset_tag t WHERE t.asset_id=asset.id AND t.tag NOT LIKE ?) AS tags
         FROM asset WHERE medium='video' AND disposal IS NULL"""
-    parameters = []
+    parameters = [PERFORMER_TAG_PREFIX + '%']
     if asset_ids is not None:
-        query += ' AND id IN (' + ','.join('?' for _ in asset_ids) + ')'
-        parameters = asset_ids
+        query += ' AND id IN (SELECT value FROM json_each(?))'
+        parameters.append(json.dumps(asset_ids))
     with closing(sqlite3.connect(db_path, timeout=30)) as connection:
         connection.row_factory = sqlite3.Row
         return [dict(row) for row in connection.execute(query, parameters)
@@ -50,9 +52,13 @@ def typical_size(directory, pattern, fallback):
 
 
 class TrafficPlan:
-    def __init__(self, config, stage, media_key):
+    def __init__(self, config, stage, media_key, *, allow_metered=False):
         from .library_processing import _MissCache, _RemoteSession, misses_path
+        from .library_processing import MAX_SOURCE_BYTES
         self.config, self.stage, self.media_key = config, stage, media_key
+        #: 本趟采集预算里的下载字节上限；`ProcessingTraffic` 按账本设置换掉默认档。
+        self.budget_bytes = MAX_SOURCE_BYTES
+        self.allow_metered = allow_metered
         self.remote = _RemoteSession(config, None, _MissCache(misses_path(config)), retrying=False)
         self.cover_root = config.directory('generated') / 'covers'
         self.cover_bytes = typical_size(self.cover_root, '*.jpg', MIB // 2)
@@ -88,10 +94,11 @@ class TrafficPlan:
 
     def _network(self, source):
         from . import peach_proxy
-        from .scraping_access import values_for
+        from .scraping_access import SOURCES, values_for
         if source not in self.proxy:
             root = self.config.directory('secrets')
-            if values_for(root, source).get('network') == 'direct':
+            # 不在采集设置里的站（素人链上的认人 Wiki）没有单独的连接方式，同 `SourceTransport` 照 Peach 代理出网。
+            if source in SOURCES and values_for(root, source).get('network') == 'direct':
                 self.proxy[source] = False
             else:
                 try:
@@ -112,12 +119,12 @@ class TrafficPlan:
         self.extend(rows)
 
     def extend(self, rows):
-        from .library_processing import _provider_code, _scrapes_as_jav, _missing_fields
+        from .library_processing import _provider_code, _scrapes_as_jav, _missing_fields, preview_readable
         from .catalog_rules import release_code_from_filename
         changed = set()
         for row in rows:
             self.assets.append(row)
-            if self.stage == 'previews' and row['location'] != 'local':
+            if self.stage == 'previews' and not preview_readable(row, self.config, allow_metered=self.allow_metered):
                 continue
             key = self.media_key(row['path'], row['location'])
             if key is None:
@@ -137,7 +144,8 @@ class TrafficPlan:
                     if not self._ready(code):
                         self._add('local:' + path, key, self.cover_bytes)
                     title = self.titles.setdefault(code, dict(row=row, missing=set()))
-                    title['missing'].update(_missing_fields(row))
+                    if self.stage != 'covers':
+                        title['missing'].update(_missing_fields(row))
                     changed.add(code)
             self._media(row, key)
         for code in changed:
@@ -149,6 +157,7 @@ class TrafficPlan:
             self._downloads(code, self.titles[code])
 
     def _media(self, row, key):
+        from .library_processing import preview_readable
         from .media_processing_policy import metadata_only
         from .media_sources import cost_for
         from .strm import skip_background_read
@@ -156,10 +165,11 @@ class TrafficPlan:
         if skip_background_read(path):
             return
         size = max(0, row.get('size') if row.get('size') is not None else 9 * 8 * MIB)
-        if (self.stage != 'metadata' and row.get('duration') is None
+        if (self.stage not in ('metadata', 'covers') and row.get('duration') is None
                 and cost_for(row['location'], path, self.config) == 'free'):
             self._add('media:' + path, key, min(size, self.history.average(key + ':probe', 8 * MIB)))
-        if (self.stage in ('all', 'collect', 'previews') and row['location'] == 'local'
+        if (self.stage in ('all', 'collect', 'previews')
+                and preview_readable(row, self.config, allow_metered=self.allow_metered)
                 and not row.get('snapshot_path') and not metadata_only(self.config.directory('state'))):
             self._add('media:' + path, key, min(size, 9 * self.history.average(key + ':frame', 8 * MIB)))
 
@@ -208,7 +218,8 @@ class TrafficPlan:
         for row, code, verify, local_fields, *_ in prepared:
             if code and _scrapes_as_jav(row, code):
                 title = titles.setdefault(code, dict(row=row, missing=set()))
-                title['missing'].update(COLLECTED_FIELDS if verify else _missing_fields(row, local_fields))
+                if self.stage != 'covers':
+                    title['missing'].update(COLLECTED_FIELDS if verify else _missing_fields(row, local_fields))
         for code, title in titles.items():
             self._downloads(code, title)
 
@@ -234,7 +245,6 @@ class TrafficPlan:
             self.refresh(list(self.assets))
 
     def remaining(self, rows):
-        from .library_processing import MAX_SOURCE_BYTES
         planned = dict.fromkeys(rows, 0)
         for unit in self.units.values():
             for key, amount in unit.items():
@@ -243,7 +253,7 @@ class TrafficPlan:
         download_keys = [key for key, row in rows.items() if not row['root']]
         outside = {key: sum(unit.get(key, 0) for unit in self.outside_budget.values()) for key in download_keys}
         wanted = sum(planned[key] - outside[key] for key in download_keys)
-        budget = max(0, MAX_SOURCE_BYTES - sum(rows[key]['used_bytes'] for key in download_keys))
+        budget = max(0, self.budget_bytes - sum(rows[key]['used_bytes'] for key in download_keys))
         if wanted > budget:
             remaining = budget
             for key in download_keys:

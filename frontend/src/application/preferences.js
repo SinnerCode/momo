@@ -1,8 +1,10 @@
 /* preferences 域控制器：本域状态与动作，启动由 Application 的生命周期统一安装。 */
 import { loadMediaSources } from './../query/media-sources';
-import { buildBars, catalogState, dropOfflineFromDefaultLoc, homePath, loadCatalog, paintCatalogFilter, repaintCatalogGrid } from './catalog.js';
-import { appSettingsStore } from './../appearance/settings';
-import { entityDisplayName, setNameLanguage } from '../core/entity-names';
+import { buildBars, catalogState, dropOfflineFromDefaultLoc, homePath, loadCatalog, paintCatalogFilter, repaintCatalogGrid, syncCatalogFilterScreen } from './catalog.js';
+import { appSettingsStore, wireGestureSettings } from './../appearance/settings';
+import { interfaceLanguage, storedInterfaceLanguage, t } from '../i18n';
+import { entityDisplayName, setNameLanguage, setNameLocale } from '../core/entity-names';
+import { orientLabel } from '../core/stored-values';
 import { playUiSound, setUiSoundsEnabled, wireUiSounds } from '../ui-kit/sounds';
 import { applyTheme, watchSystemTheme } from './../appearance/theme';
 import { applyAccent, applyGlassFaces, applyHomeGlow, paintHomeGlowNow } from './../appearance/glow';
@@ -13,15 +15,18 @@ import { notifyShell, selectMode, selected, state } from './../shell/index';
 import { preferredDirection } from './../sort-preferences';
 import { releaseHoverPreviews, setHoverState } from './../card-art/hover';
 import { reloadCurrentSurface } from './layout.js';
-import { refreshFeedRows, syncFeedAutoScroll } from './feed.js';
+import { refreshPageNavigation } from '../history/page-navigation';
+import { refreshFeedRows, syncFeedAutoScroll, syncHomeFeedSetting } from './feed.js';
 import { stageApi } from '../react/application-residents';
 import { syncJavImages } from './../jav-artwork';
 import { coverAnchor } from './../card-art/framing';
+import { DEFAULT_SFW_SHORTCUT, SFW_SHORTCUT_KEY, parseShortcut, serializeShortcut } from './../keyboard-shortcut';
 import { mediaState, repaintDetailPoster } from './media.js';
 import { loadingState } from './loading.js';
 import { updateManagedRoute } from './../history/managed';
 import { MEDIA_SOURCE_ICONS, emptyStateHtml, wireHorizontalScroller } from '../ui-kit';
 import { tagLabel } from '../core/tags';
+import { codedText } from '../core/server-text';
 import { rereadPlaylists } from './playlists.js';
 import { receiptsState } from './receipts.js';
 import { dropBars } from './../catalog-bars';
@@ -60,13 +65,13 @@ export function sidebarDot(loc){
 }
 
 export function sidebarFacets(facetData,context){
-  const rows=(items,named=row=>row.label||tagLabel(row.k))=>(items||[]).map(row=>({value:String(row.k),label:named(row),n:row.n??null}));
+  const rows=(items,named=row=>codedText(row,'label')||tagLabel(row.k))=>(items||[]).map(row=>({value:String(row.k),label:named(row),n:row.n??null}));
   const creators=context.type==='entity'&&context.kind==='creator'
     ?(facetData.creators||[]).filter(row=>row.k!==context.name):facetData.creators;
   return {
     locations:(facetData.locations||[]).map(row=>({value:row.k,label:LOC[row.k]||row.k,n:row.n??null,dot:sidebarDot(row.k),
       ...(preferencesState.sourceOffline(row.k)?{offline:preferencesState.OFFLINE_HINT}:{})})),
-    regions:rows(facetData.regions),orientations:rows(facetData.orientations),years:rows(facetData.years),
+    regions:rows(facetData.regions),orientations:rows(facetData.orientations,row=>orientLabel(row.k)),years:rows(facetData.years),
     creators:rows(creators,row=>entityDisplayName('creator',row.k)),tags:rows(facetData.tags),tech:rows(facetData.tech),
     followTags:rows(facetData.follow_tags,row=>tagLabel(row.k)),
     duration:!!facetData.stats?.duration,
@@ -85,6 +90,7 @@ export async function refreshAll(automatic=false){
     if(refresh==='skip')return;
     if(path==='/playlists'){rereadPlaylists();return}
     const target=refresh==='reopen'?path:'/stats';
+    refreshPageNavigation();
     if(target===path)navigationState.navigatePath(location.pathname+location.search+location.hash,true,peachHistory.navigation.location.state);
     else navigationState.navigatePath(target);
     return;
@@ -99,7 +105,7 @@ export async function refreshAll(automatic=false){
      有内容在屏幕上，撕成灰条再填回去比直接换掉更晃眼；只铺一层微光，骨架留给从无到有的首屏。 */
   paintCatalogFilter({refreshing:true});
   /* 目录元素在改写地址排下的那个微任务里发起取数；让过这一拍，网格先认领表面、铺好等待态，顶部三层再取。 */
-  try{const loading=replaceCatalogAddress();await null;await Promise.all([loading,buildBars()])}
+  try{refreshPageNavigation();const loading=replaceCatalogAddress();await null;await Promise.all([loading,buildBars()])}
   finally{paintCatalogFilter({refreshing:false})}
   if(!automatic)window.scrollTo({top:0,behavior:'smooth'});
   return true;
@@ -116,6 +122,18 @@ export function setCensored(on){
   localStorage.setItem(preferencesState.CENSOR_KEY,on?'1':'0');
   applyCensor(on);
   if(on)releaseHoverPreviews();
+}
+
+/** SFW 开关键：本机存的那份读不出来时回到默认 Shift+S。 */
+export function sfwShortcut(){
+  return parseShortcut(localStorage.getItem(SFW_SHORTCUT_KEY))||parseShortcut(DEFAULT_SFW_SHORTCUT);
+}
+
+/** 传空恢复默认。存本机、不进同步设置，见 `keyboard-shortcut.ts`。 */
+export function setSfwShortcut(shortcut){
+  if(shortcut)localStorage.setItem(SFW_SHORTCUT_KEY,serializeShortcut(shortcut));
+  else localStorage.removeItem(SFW_SHORTCUT_KEY);
+  preferencesState.settingsStore.notify();
 }
 
 export function setHighContrast(on){
@@ -138,13 +156,15 @@ export function installPreferences5() {
 preferencesState.sourceOnline = {};
 preferencesState.sourceProblems = {};
 preferencesState.sourceOffline = key=>preferencesState.sourceOnline[key]===false;
-preferencesState.OFFLINE_HINT = '媒体目录无法访问，请检查目录、读取权限和网盘挂载状态';
-preferencesState.OFFLINE_REASON = {local:'无法读取媒体目录，请检查目录是否存在及读取权限。',
-  '115':'无法读取 115 媒体目录，请检查目录权限及网盘挂载工具是否正常运行。',
-  pikpak:'无法读取 PikPak 媒体目录，请检查目录权限及网盘挂载工具是否正常运行。'};
-preferencesState.offlineReason = key=>preferencesState.sourceProblems[key]||preferencesState.OFFLINE_REASON[key]||'无法读取这个来源的媒体目录，请检查目录权限及挂载状态。';
+preferencesState.OFFLINE_HINT = t('shell:storageOffline.hint');
+preferencesState.OFFLINE_REASON = {local:t('shell:storageOffline.localLabel'),
+  '115':t('shell:storageOffline.drive115'),
+  pikpak:t('shell:storageOffline.pikpak')};
+preferencesState.offlineReason = key=>preferencesState.sourceProblems[key]||preferencesState.OFFLINE_REASON[key]||t('shell:storageOffline.other');
 preferencesState.settingsStore = appSettingsStore();
 preferencesState.appSettings = preferencesState.settingsStore.value;
+wireGestureSettings(preferencesState.settingsStore);
+setNameLocale(interfaceLanguage);
 setNameLanguage(preferencesState.appSettings.performerNameLanguage);
 preferencesState.saveSettings = ()=>preferencesState.settingsStore.save();
 document.documentElement.style.setProperty('--hover-delay',`${preferencesState.appSettings.hoverDelaySeconds}s`);
@@ -164,6 +184,10 @@ preferencesState.settingsEffects = {
     loadingState.syncPageTitle(location.href);
     catalogState.barsRendered='';buildBars();
   },
+  /* 按本地存下的那份重新算一遍：算出来和页面正在用的不同才重载。存储不可写时算出来还是旧语言，不会一直重载。 */
+  interfaceLanguage:()=>{
+    if(storedInterfaceLanguage()!==interfaceLanguage)location.reload();
+  },
   theme:()=>applyTheme(),
   /* 开这一格时立刻响一声开关音，人才知道它开了。关的那一声由 document 上的 change 监听
      发出：捕获阶段排在这里前面，那时开关还没关掉，最后一声还能响出来。 */
@@ -182,6 +206,7 @@ preferencesState.settingsEffects = {
     notifyShell();
     if(location.pathname==='/')replaceCatalogAddress();
   },
+  hoverPreview:()=>{if(!preferencesState.appSettings.hoverPreview)releaseHoverPreviews()},
   hoverDelay:()=>{
     if(!preferencesState.appSettings.hoverDelaySeconds)document.querySelectorAll('[data-previewing],[data-longhover]')
       .forEach(el=>{setHoverState(el,'previewing',false);setHoverState(el,'longhover',false)});
@@ -201,6 +226,17 @@ preferencesState.settingsEffects = {
     repaintDetailPoster();
   },
   searchHistoryLimit:()=>updateManagedRoute($('#searchMenu'),{historyLimit:preferencesState.appSettings.searchHistoryLimit}),
+  searchRecommendations:()=>updateManagedRoute($('#searchMenu'),{recommend:preferencesState.appSettings.searchRecommendations}),
+  feedNewRows:()=>syncHomeFeedSetting(state.browse==='folders'),
+  /* 竖屏带的开关与张数都改了目录的请求口径（排不排除竖屏、一条取几张），按新口径重取一遍。 */
+  homeShorts:()=>{if(isCatalogPath(location.pathname))loadCatalog()},
+  homeTiers:()=>syncCatalogFilterScreen(),
+  /* 首页当场换到新的默认档；地址上带着 `thumb` 的、不在首页的，下次回首页时生效。 */
+  homePreviewOnly:()=>{
+    if(navigationState.surfacePath()!=='/'||new URLSearchParams(location.search).has('thumb'))return;
+    state.thumb=preferencesState.appSettings.homePreviewOnly?'1':'0';notifyShell();
+    paintCatalogFilter({previewOnly:state.thumb==='1'});replaceCatalogAddress();
+  },
 };
 preferencesState.syncGlassOptics = ()=>{};
 preferencesState.placeSidebarHead = ()=>{};
@@ -209,7 +245,7 @@ preferencesState.SRCICON = {
     [location,mark.startsWith('data:')?`<img class="source-icon" src="${mark}" alt="">`:icon(mark)])),
   online:icon('rss'),
 };
-preferencesState.srcBadge = (loc,cost,cls)=>{const label=`${LOC[loc]||loc}${cost==='metered'?' · 计费':''}`;
+preferencesState.srcBadge = (loc,cost,cls)=>{const label=cost==='metered'?t('shell:storageLabel.metered', { label: LOC[loc]||loc }):LOC[loc]||loc;
   return `<span class="${cls||'src'} ${cost==='metered'?'metered':'free'}" title="${esc(label)}" aria-label="${esc(label)}">`
     +(preferencesState.SRCICON[loc]||'')+'</span>'};
 preferencesState.emptyState = emptyStateHtml;

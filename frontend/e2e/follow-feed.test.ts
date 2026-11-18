@@ -42,15 +42,15 @@ describe('关注页岛', () => {
         const page = opened.page;
         const payload = await page.evaluate(async () => (await fetch('/api/follow')).json());
         let revision = 1;
-        await page.route((url) => url.pathname === '/api/tasks', route => route.fulfill({ json: {
-          available: true, running: [{ id: 1, status: 'running', task_key: 'follow-check' }],
-          finished: [], skipped: [], result_versions: { follow: String(revision) },
+        await page.route((url) => url.pathname === '/api/result-updates', route => route.fulfill({ json: {
+          busy: true,
+          result_versions: { follow: String(revision) },
         } }));
         await page.route((url) => url.pathname === '/api/follow' && !url.searchParams.has('item'), route =>
           route.fulfill({ json: { ...payload, groups: payload.groups.map((group: typeof FIRST[number]) =>
             group.primary.id === 1000 && revision > 1 ? { ...group, primary: { ...group.primary,
               title: '任务运行中已确认的标题' } } : group) } }));
-        const baseline = page.waitForResponse(url => new URL(url.url()).pathname === '/api/tasks');
+        const baseline = page.waitForResponse(url => new URL(url.url()).pathname === '/api/result-updates');
         await page.reload({ waitUntil: 'load' });
         await baseline;
         await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -371,7 +371,7 @@ describe('关注页岛', () => {
       await searchIs(page, '?author=name%3Amira&tag=loop&work=zelda');
       const drops = await page.locator('[data-follow-drop]').evaluateAll((buttons) =>
         buttons.map((button) => (button as HTMLElement).dataset.followDropKind));
-      assert.deepEqual(drops, ['创作者', '题材', '标签'], `组合条的条件不对：${JSON.stringify(drops)}`);
+      assert.deepEqual(drops, ['creator', 'franchise', 'tag'], `组合条的条件不对：${JSON.stringify(drops)}`);
       const [readout, combo, list] = await page.evaluate(() => ['[data-follow-readout]', '[data-follow-combo]',
         '[data-follow-list-body]'].map((selector) => document.querySelector(selector)!.getBoundingClientRect()));
       assert.ok(readout!.bottom <= combo!.top + 1 && combo!.bottom <= list!.top + 1,
@@ -400,11 +400,12 @@ describe('关注页岛', () => {
         authors: document.querySelectorAll('button[data-follow-author]').length,
         glass: !!document.querySelector('[data-follow-filter-glass]'),
         wholePage: !!document.querySelector('#stats .followauthors'),
-        skeletons: document.querySelectorAll('[data-skeleton]').length,
+        skeletons: [...document.querySelectorAll('[data-skeleton]')]
+          .filter(node => !node.closest('[data-content-skeleton][aria-hidden="true"]')).length,
       }));
       assert.deepEqual(during, { head: true, authors: 6, glass: true, wholePage: false, skeletons: 1 });
       await opened.stub.release();
-      await page.locator('[data-follow-list-body] [data-skeleton]').waitFor({ state: 'detached', timeout: 10_000 });
+      await page.locator('[data-follow-list-body] [data-skeleton]').waitFor({ state: 'hidden', timeout: 10_000 });
       await page.locator(CARDS).first().waitFor();
       assert.deepEqual(opened.problems, []);
     } finally {

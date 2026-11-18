@@ -6,6 +6,7 @@
  *
  * 分页照 `/api/index` 的形状：`limit`／`offset` 翻页，响应带 `has_more`。 */
 import { apiGet } from '../../api';
+import type { FaceRef } from '../../card-art/markup';
 
 export const FOLLOW_AUTHORS_URL = '/api/follow/authors';
 export const FOLLOW_TAGS_URL = '/api/follow/tags';
@@ -17,12 +18,15 @@ export interface OnlineAuthor {
   key: string;
   n: number;
   entity_id: number | null;
+  author_entity?: (FaceRef & { name: string }) | null;
   held_by: string;
   /** 官方主页上的头像；取不到时是空串。 */
   avatar: string;
   /** 归档站的头像，主页那张失败时换它。 */
   avatar_fallback: string;
   providers: string[];
+  /** 最近一条的发布时间，来源没给就是入库时间。 */
+  latest?: string;
 }
 
 export interface OnlineAuthorsPage {

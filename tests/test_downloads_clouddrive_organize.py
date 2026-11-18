@@ -1,4 +1,5 @@
 """已声明来源的官方移动：冲突、成员核验、确定性拒绝与状态未知、路径边界。"""
+import ssl
 import unittest
 from pathlib import PureWindowsPath
 from types import SimpleNamespace
@@ -11,6 +12,8 @@ import grpc
 from peach.organize_clouddrive import (ACCEPTED, DAV_ORIGIN, REJECTED, MoveNotExecuted, PikPakDav,
                                        UnconfirmedMove)
 from peach import organize_clouddrive
+from peach.task_retry import transient_delay
+from peach.os_errors import UserFileNotFoundError
 
 MAPPING = organize_clouddrive.PikPakPaths('A:\\', '/Pikpak')
 
@@ -26,6 +29,37 @@ class Status(grpc.RpcError):
 class ConfiguredPaths(unittest.TestCase):
     def setUp(self):
         self.mapping = organize_clouddrive.PikPakPaths('P:\\Library', '/My cloud/Movies', '/Movies')
+
+    def test_parent_creation_keeps_server_retry_after_but_stops_for_authentication(self):
+        for status, delay in ((429, 1200), (503, 1200), (401, None), (403, None)):
+            with self.subTest(status=status), httpx.Client(transport=httpx.MockTransport(
+                    lambda request, status=status: httpx.Response(status, headers={'Retry-After': '1200'}))) as http:
+                dav = PikPakDav(http, self.mapping, Mock(), listing=lambda path: [], rename=Mock(), move_remote=Mock())
+                with self.assertRaises(OSError) as failure:
+                    dav.ensure_parent('P:\\Library\\new\\film.mp4')
+                self.assertEqual(transient_delay(failure.exception), delay)
+
+    def test_certificate_failure_does_not_become_a_retryable_file_error(self):
+        error = httpx.ConnectError('证书校验失败')
+        error.__cause__ = ssl.SSLCertVerificationError('证书不可信')
+        with httpx.Client(transport=httpx.MockTransport(Mock(side_effect=error))) as http:
+            dav = PikPakDav(http, self.mapping, Mock(), listing=lambda path: [], rename=Mock(), move_remote=Mock())
+            with self.assertRaises(OSError) as failure:
+                dav.ensure_parent('P:\\Library\\new\\film.mp4')
+            self.assertIsNone(transient_delay(failure.exception))
+
+    def test_directory_network_failure_retries_but_permission_failure_stops(self):
+        for code, delay in ((grpc.StatusCode.UNAVAILABLE, 0), (grpc.StatusCode.DEADLINE_EXCEEDED, 0),
+                            (grpc.StatusCode.PERMISSION_DENIED, None)):
+            with self.subTest(code=code):
+                stream = Mock()
+                stream.__iter__ = Mock(side_effect=Status(code))
+                cloud = Mock(token='test-token')
+                cloud.channel.unary_stream.return_value.return_value = stream
+                with self.assertRaises(OSError) as failure:
+                    organize_clouddrive._cloud_listing(cloud, 'P:\\Library', self.mapping)
+                self.assertEqual(transient_delay(failure.exception), delay)
+                stream.cancel.assert_called_once()
 
     def test_custom_drive_subdirectory_and_remote_name(self):
         self.assertEqual(self.mapping.cloud_path('p:\\library\\人名\\a.mp4'), '/My cloud/Movies/人名/a.mp4')
@@ -107,12 +141,21 @@ class ConfiguredPaths(unittest.TestCase):
             credentials.return_value.load.return_value = SimpleNamespace(values={'token': 'test-token'})
             downloads.return_value.load.return_value = SimpleNamespace(clouddrive_address='http://example.test')
             cloud = client.return_value.__enter__.return_value
+            cloud.root = '/'
             cloud.find.return_value = pb.CloudDriveFile(isDirectory=True,
                 CloudAPI=pb.CloudAPI(name='WebDAV', path='/Renamed account'))
             with organize_clouddrive.pikpak_renames('P:\\Library\\a.mp4', roots) as dav:
                 self.assertEqual(dav.url('P:\\Library\\a.mp4'), DAV_ORIGIN + '/Movies/a.mp4')
             cloud.find.assert_called_once_with('/Renamed account/Movies')
             self.assertEqual(headers.call_args.args[2].dav_root, '/Movies')
+
+            cloud.root = '/Renamed account'
+            cloud.find.reset_mock()
+            with self.assertRaises(organize_clouddrive.UserValueError) as raised:
+                with organize_clouddrive.pikpak_renames('P:\\Library\\a.mp4', roots):
+                    pass
+            self.assertEqual(raised.exception.code, 'errors.organizeClouddrive.tokenRootRestricted')
+            cloud.find.assert_not_called()
 
 
 class OfficialMoves(unittest.TestCase):
@@ -136,7 +179,7 @@ class OfficialMoves(unittest.TestCase):
 
     def listing(self, path):
         if path != 'A:\\' and self.entries.get(path) is not True:
-            raise FileNotFoundError('官方父目录未列出所需目录')
+            raise UserFileNotFoundError('errors.organizeClouddrive.cloudParentMissing')
         return [dict(path=name, size=0 if value is True else value, directory=value is True)
                 for name, value in self.entries.items()
                 if name != path and str(PureWindowsPath(name).parent) == path]
@@ -273,7 +316,7 @@ class OfficialMoves(unittest.TestCase):
 
     def test_cache_failure_after_submission_preserves_intent(self):
         self.dav.move_remote = Mock(return_value=ACCEPTED)
-        self.dav.refresh = Mock(side_effect=OSError('未取得'))
+        self.dav.refresh = Mock(side_effect=OSError('connection refused'))
         with self.assertRaises(UnconfirmedMove):
             self.dav.move('A:\\old\\film.mp4', 'A:\\new\\film.mp4')
         self.dav.move_remote.assert_called_once()

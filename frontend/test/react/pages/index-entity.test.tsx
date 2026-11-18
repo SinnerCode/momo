@@ -195,33 +195,33 @@ it('索引元素：后退落到压在索引上的详情才挂上（中间去过�
   expect(opens(actions), '关掉回来整页打开').toBe(2);
 });
 
-it('资料元素：同一位领了新代次只就地推，推不进才整页开；换一位与壳要求重开都整页开', async () => {
+it('资料尚未提交时先显示目标骨架，同一位可由壳接手刷新，换一位或要求重开才重新构造属性', async () => {
   const refreshed = { ok: true };
   const r = await load('/performers/1');
   indexSurface();
   const { actions, log } = shellActions(refreshed);
   await boot(r, actions);
-  expect(log).toEqual(['surface entity /performers/1', 'loading performer A', 'props performer A ']);
+  expect(log).toEqual(['surface entity /performers/1', 'loading performer 1', 'props performer A ']);
   log.length = 0;
   await act(async () => { r.peachHistory.push('/performers/1?tag=x') });
   await settle();
-  expect(log, '推进画着的那一页就够了').toEqual(['refresh performer A ?tag=x']);
+  expect(log, '目标骨架就位后由壳接手刷新').toEqual(['surface entity /performers/1', 'loading performer 1', 'refresh performer A ?tag=x']);
   log.length = 0;
   refreshed.ok = false;
   await act(async () => { r.peachHistory.push('/performers/1?tag=y') });
   await settle();
-  expect(log, '那一页没画着就整页开').toEqual(['refresh performer A ?tag=y', 'surface entity /performers/1',
-    'loading performer A', 'props performer A ?tag=y']);
+  expect(log, '壳无法接手时构造整页属性').toEqual(['surface entity /performers/1', 'loading performer 1',
+    'refresh performer A ?tag=y', 'props performer A ?tag=y']);
   log.length = 0;
   refreshed.ok = true;
   await act(async () => { r.shellNavigate('/performers/2', { replace: true }) });
   await settle();
-  expect(log, '换一位按新名字重挂').toEqual(['surface entity /performers/2', 'loading performer B',
+  expect(log, '换一位先按地址显示骨架，资料取回后使用规范名字').toEqual(['surface entity /performers/2', 'loading performer 2',
     'props performer B ']);
   log.length = 0;
   await act(async () => { reopen(r) });
   await settle();
-  expect(log, '壳要求重开时不就地推').toEqual(['surface entity /performers/2', 'loading performer B',
+  expect(log, '壳要求重开时不就地推').toEqual(['surface entity /performers/2', 'loading performer 2',
     'props performer B ']);
   expect(r.shell.entityJavLayout, '每次整页打开都从非 JAV 语境起').toBe(false);
 });

@@ -174,12 +174,16 @@ describe('实体页筛选浮层', () => {
       const pressed = await page.evaluate(() => ({
         state: document.querySelector('[data-entity-state="fresh"]')?.getAttribute('aria-pressed'),
         busy: document.querySelector('[data-entity-filter-glass] [data-filter-row="bottom"]')?.getAttribute('aria-busy'),
-        shimmer: !!document.querySelector('[data-entity-readout] [data-skeleton="count"]'),
+        shimmer: !!document.querySelector('[data-entity-readout] [data-async-text][aria-busy="true"] > [data-async-text-skeleton]'),
+        retained: document.querySelector('[data-entity-readout] [data-async-text-value]')?.getAttribute('aria-hidden'),
       }));
-      assert.deepEqual(pressed, { state: 'true', busy: 'true', shimmer: true }, '按下态要等请求回来才到位');
-      assertCovers(await glideOver(page, '[data-view-glide=""]', '[data-entity-state="fresh"]'), '换过去的观看状态');
+      assert.deepEqual(pressed, { state: 'true', busy: 'true', shimmer: true, retained: 'true' }, '按下态和读数等待态当场到位');
+      await page.waitForFunction(() => getComputedStyle(document.querySelector('[data-entity-readout] [data-async-text-skeleton]')!).opacity === '1');
+      assertCovers(await glideOver(page, '[data-entity-filter-glass] > [data-view-glide=""]', '[data-entity-state="fresh"]'), '换过去的观看状态');
       stubs.release();
       await page.locator('[data-entity-readout]', { hasText: '视频 · 24' }).waitFor({ timeout: 15_000 });
+      await page.waitForFunction(() => !document.querySelector('[data-entity-readout] [data-async-text][aria-busy="true"]')
+        && getComputedStyle(document.querySelector('[data-entity-readout] [data-async-text-skeleton]')!).opacity === '0');
       assert.match(page.url(), /[?&]state=fresh/);
       assert.match(stubs.itemQueries.at(-1)!, /state=fresh/);
       assert.deepEqual(unexpected(opened), []);
@@ -262,7 +266,7 @@ describe('实体页筛选浮层', () => {
       }));
       assert.deepEqual(photos, { pressed: 'true', states: true, tags: 0, combo: true, sorts: 0, batch: 1 });
       assertCovers(await glideOver(page, '[data-view-glide="round"]', '[data-media-view="photos"]'), '照片键');
-      assert.equal(await page.locator('[data-view-glide=""]').evaluate((node) => (node as HTMLElement).hidden), true,
+      assert.equal(await page.locator('[data-entity-filter-glass] > [data-view-glide=""]').evaluate((node) => (node as HTMLElement).hidden), true,
         '观看状态收起了，那块玻璃还亮着');
       await segment(page, '图片布局', 'fixed').click();
       await page.waitForFunction(() => document.querySelector('[data-local-wall]')?.getAttribute('data-layout') === 'fixed');
@@ -338,7 +342,7 @@ describe('实体页筛选浮层', () => {
       await page.waitForFunction(() => document.querySelector('[data-entity-scroll]')!.scrollLeft > 0);
       const keyAfter = await page.locator('[data-media-view="videos"]').boundingBox();
       assert.equal(keyAfter?.x, keyBefore?.x, '视图键跟着横滚走了');
-      await page.waitForFunction(() => (document.querySelector('[data-view-glide=""]') as HTMLElement).hidden,
+      await page.waitForFunction(() => (document.querySelector('[data-entity-filter-glass] > [data-view-glide=""]') as HTMLElement).hidden,
         undefined, { timeout: 5_000 });
       const glass = '[data-entity-filter-glass]';
       /* 方向判据按「上一个 y」算：壳在 scroll 事件里排一帧 rAF 才读 scrollY，两次滚动落进同一帧

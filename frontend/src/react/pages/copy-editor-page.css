@@ -15,9 +15,9 @@ body.peach-react {
   --board-body: 400 14px/20px var(--font-sans);
   --board-body-medium: 500 14px/20px var(--font-sans);
 }
-body.peach-react [data-copy-bar] {
+:is(body.peach-react, [data-copy-editor].peach-react) [data-copy-bar] {
   border: 1px solid var(--color-border-button-default);
   background: var(--color-background-secondary-default);
-  box-shadow: var(--elevation-card);
+  box-shadow: var(--elevation-card, var(--elevation-dropdown));
 }
 body.peach-react:has([data-copy-bar]) { padding-bottom: 108px; }

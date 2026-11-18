@@ -14,6 +14,8 @@
 import { memo, useCallback, useEffect, useRef, useState, type ComponentPropsWithoutRef, type MouseEvent } from 'react';
 import { esc, fmtDur, icon, entityPath } from '@peach/legacy/core';
 import { tagLabel } from '@peach/legacy/tags';
+import { CardDate, CardTags, WhoLabel } from '../components/card-meta';
+import { RecommendationReason } from '../components/recommendation-reason';
 
 import { suppressShiftTextSelection } from '../components/row-click';
 import { MIX_FLIP_FACES, useStackFlip } from '../components/use-stack-flip';
@@ -25,6 +27,7 @@ import {
   followBadges, followCompactWhen, followIdentity, followMediaIssue, followTitle, followTitleMarks, followWhen,
   learnFollowDims, sourceMark,
 } from './follow-marks';
+import { t } from '../../i18n';
 
 /** 时长只在是真时长时写：来源没给、给了 0 或给了一个明显是占位的数，都不出这一格。 */
 const realDuration = (value: unknown) => Number(value) > 0;
@@ -56,6 +59,8 @@ export interface FollowCardProps {
   actions: Pick<FollowFeedActions, 'openDetail' | 'openAuthor' | 'canFlip'> & Partial<Pick<FollowFeedActions, 'toggleSelection'>>;
   onStatus?(id: number, to: string): void;
   onSave?(id: number): void;
+  /** 接着看那一排的推荐理由（`variant="next"`）：顶替标签行，和作品详情的接着看同一个写法。 */
+  reason?: { reasons: readonly string[]; tags: readonly string[] };
 }
 
 /** 卡面没有画面时的那一格：来源的站标居中，和本来就没给缩略图的卡同一个样子。 */
@@ -160,7 +165,7 @@ function FollowCardView(props: FollowCardProps) {
       data-selected={selected ? '' : undefined} onClick={click} onMouseDown={suppressShiftTextSelection}
       onMouseEnter={flip.onPointerEnter} onMouseLeave={flip.onPointerLeave}>
       <div data-follow-visual="" data-mix-stack={stack.isMix ? '' : undefined}>
-        <button type="button" data-follow-open="" aria-label={`打开 ${title} 详情`} />
+        <button type="button" data-follow-open="" aria-label={t('follow:followCard.openDetails', { title })} />
         <div data-media-pic="">
           {thumbUrl
             ? <Thumb key={thumbUrl} src={thumbUrl} fallback={imageFallback} width={sized?.width} height={sized?.height}
@@ -177,7 +182,7 @@ function FollowCardView(props: FollowCardProps) {
           ) : null}
           <div data-follow-sources="">
             <span data-media-badge="" title={item.provider_label || item.provider}
-              aria-label={`来源：${item.provider_label || item.provider}`}
+              aria-label={t('follow:followFeed.sourceLabel', { source: item.provider_label || item.provider })}
               dangerouslySetInnerHTML={{ __html: sourceMark(item.provider, item.provider_label) }} />
             {badges ? <span data-follow-badges="" dangerouslySetInnerHTML={{ __html: badges }} /> : null}
           </div>
@@ -195,23 +200,23 @@ function FollowCardView(props: FollowCardProps) {
               </button>
             ) : null}
             {props.variant !== 'next' ? <div data-follow-actions="">
-              <button type="button" data-follow-save={item.id} title={saved ? '已保存' : '保存到数据库'}
-                aria-label={saved ? '已保存' : '保存到数据库'} disabled={saved}
+              <button type="button" data-follow-save={item.id} title={saved ? t('follow:shared.saved') : t('follow:followDetail.saveToDatabase')}
+                aria-label={saved ? t('follow:shared.saved') : t('follow:followDetail.saveToDatabase')} disabled={saved}
                 aria-busy={busy === 'save' || undefined} aria-disabled={busy === 'save' || undefined}
                 onClick={(event) => act(event, () => props.onSave?.(item.id))}
                 dangerouslySetInnerHTML={{ __html: icon(saved ? 'check' : 'bookmark-plus') }} />
-              <button type="button" data-follow-status={item.id} data-to="seen" title="标记已看" aria-label="标记已看"
+              <button type="button" data-follow-status={item.id} data-to="seen" title={t('follow:followDetail.markSeen')} aria-label={t('follow:followDetail.markSeen')}
                 disabled={item.status === 'seen'} aria-busy={busy === 'seen' || undefined}
                 aria-disabled={busy === 'seen' || undefined}
                 onClick={(event) => act(event, () => props.onStatus?.(item.id, 'seen'))}
                 dangerouslySetInnerHTML={{ __html: icon('eye') }} />
-              <button type="button" data-follow-status={item.id} data-to="ignored" title="忽略" aria-label="忽略"
+              <button type="button" data-follow-status={item.id} data-to="ignored" title={t('follow:shared.ignore')} aria-label={t('follow:shared.ignore')}
                 disabled={item.status === 'ignored'} aria-busy={busy === 'ignored' || undefined}
                 aria-disabled={busy === 'ignored' || undefined}
                 onClick={(event) => act(event, () => props.onStatus?.(item.id, 'ignored'))}
                 dangerouslySetInnerHTML={{ __html: icon('eye-off') }} />
               {item.status === 'seen' || item.status === 'ignored' ? (
-                <button type="button" data-follow-status={item.id} data-to="new" title="恢复未看" aria-label="恢复未看"
+                <button type="button" data-follow-status={item.id} data-to="new" title={t('follow:followDetail.markUnseen')} aria-label={t('follow:followDetail.markUnseen')}
                   aria-busy={busy === 'new' || undefined} aria-disabled={busy === 'new' || undefined}
                   onClick={(event) => act(event, () => props.onStatus?.(item.id, 'new'))}
                   dangerouslySetInnerHTML={{ __html: icon('rotate-ccw') }} />
@@ -223,30 +228,30 @@ function FollowCardView(props: FollowCardProps) {
       <div data-media-meta="">
         {identity.entityName ? (
           <FollowAuthorLink name={identity.entityName} actions={actions} data-media-avatar="" data-follow-avatar=""
-            aria-label={`查看 ${identity.author} 的作者页`} dangerouslySetInnerHTML={{ __html: identity.avatar }} />
-        ) : <span data-media-avatar="" data-follow-avatar="" title="创作者头像"
+            aria-label={t('follow:followFeed.viewCreatorPage', { name: identity.author })} dangerouslySetInnerHTML={{ __html: identity.avatar }} />
+        ) : <span data-media-avatar="" data-follow-avatar="" title={t('follow:followCard.creatorAvatar')}
           dangerouslySetInnerHTML={{ __html: identity.avatar }} />}
         <div data-media-text="">
           <button type="button" data-media-title=""
             dangerouslySetInnerHTML={{ __html: followTitleMarks(group, item) + esc(title) }} />
-          <div data-follow-byline="">
+          {/* 署名、日期与标签行用作品卡的同一份零件（`../components/card-meta.tsx`）；名字外面是作者页链接，
+              标签只读（卡上不筛选），另外记下来源类型。 */}
+          <div data-media-byline="" data-follow-byline="">
             {identity.entityName ? (
-              <FollowAuthorLink name={identity.entityName} actions={actions} data-follow-author="" title={identity.author}>
-                {identity.author}
+              <FollowAuthorLink name={identity.entityName} actions={actions} data-media-who="" data-follow-author="" title={identity.author}>
+                <WhoLabel name={identity.author} />
               </FollowAuthorLink>
-            ) : <span data-follow-author="" title={identity.author}>{identity.author}</span>}
-            <time dateTime={item.published_at || ''} title={followWhen(item)}>{followCompactWhen(item)}</time>
-            {identity.credited ? <span data-follow-credit="" title={`署名含 ${identity.credited}`}>{`署名含 ${identity.credited}`}</span> : null}
-          </div>
-          {issue ? <span data-follow-issue="">{issue}</span> : null}
-        </div>
-        <div data-media-tags="" data-follow-labels="">
-          {tags.map((tag) => (
-            <span key={tag} data-media-tag="" data-tag-cat={`r34-${item.tag_types?.[tag] || 'unknown'}`}
-              data-follow-tag={tag}>
-              {tagLabel(tag)}
+            ) : <span data-media-who="" data-follow-author="" title={identity.author}><WhoLabel name={identity.author} /></span>}
+            <span data-media-facts="">
+              <CardDate value={item.published_at || ''} label={followCompactWhen(item)} title={followWhen(item)} />
             </span>
-          ))}
+            {identity.credited ? <span data-follow-credit="" title={t('follow:followCard.credited', { names: identity.credited })}>{t('follow:followCard.credited', { names: identity.credited })}</span> : null}
+          </div>
+          {props.variant === 'next'
+            ? props.reason ? <RecommendationReason reasons={props.reason.reasons} tags={props.reason.tags.map(tag => tagLabel(tag))} /> : null
+            : <CardTags data-follow-labels="" tags={tags} label={tagLabel} readOnly
+              attrs={(tag) => ({ 'data-tag-cat': `r34-${item.tag_types?.[tag] || 'unknown'}`, 'data-follow-tag': tag })} />}
+          {issue ? <span data-follow-issue="">{issue}</span> : null}
         </div>
       </div>
       <span data-follow-state="" aria-live="polite">{failure}</span>

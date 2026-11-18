@@ -9,10 +9,14 @@
 import type { QueryKey } from '@tanstack/react-query';
 import { esc, foldName } from '@peach/legacy/core';
 import { mixLabel, type FaceRef } from '@peach/card-art';
+import type { AfterPlayback } from '@peach/appearance';
 
 import { apiGet } from '../../api';
 import type { MediaCardActions, MediaCardHelpers, MediaCardLayout, MediaItem } from '../catalog-grid/types';
 import { queryClient } from '../query';
+import type { PendingWorkItem } from '../components/pending-work';
+import { t } from '../../i18n';
+import { codedText, partsLabel, type TextPart } from '../../core/server-text';
 
 /* ── 接口形状（`src/peach/web_catalog.py` 的 `q_item`） ── */
 
@@ -28,6 +32,8 @@ export interface DetailEntityRef extends FaceRef {
   logo_version?: string;
   /** 厂牌是某家片商旗下的 label 时（ADR-0049），从近到远的上级片商链。 */
   makers?: DetailEntityRef[];
+  /** 用户在编辑资料里新建的档案（ADR-0165），名字旁带一枚小标记。 */
+  user_created?: boolean;
 }
 
 /** 卡片条目里声明过的那些字段。`MediaItem` 带着 `[field: string]: unknown`，直接 `Omit` 会把
@@ -38,12 +44,16 @@ type CardFields = { [K in keyof MediaItem as string extends K ? never : K]: Medi
 export interface DetailItem extends Omit<CardFields, 'tags'> {
   [field: string]: unknown;
   error?: string;
+  /** 刚入库还在补资料：扫描与采集或云下载后处理还没走完。 */
+  pending_work?: PendingWorkItem[];
   title?: string;
   width?: number | null;
   height?: number | null;
   release_date?: string | null;
   region?: string | null;
   region_label?: string | null;
+  /** 产地显示名的 code（`server:labels.regions.<分区码>`）。 */
+  region_label_code?: string | null;
   region_settled?: boolean;
   rating?: number | null;
   liked?: boolean | number;
@@ -55,13 +65,23 @@ export interface DetailItem extends Omit<CardFields, 'tags'> {
   studio_logo_version?: string;
   poster_box?: { x0: number; y0: number; x1: number; y1: number; px: number[] } | null;
   part_label?: string;
+  part_label_code?: string;
+  part_label_params?: Record<string, unknown>;
   tags?: DetailTag[];
   entity_refs?: Partial<Record<'performer' | 'studio' | 'creator' | 'series', DetailEntityRef[]>>;
   sample_images?: { n: number }[];
+  /** 现在这张封面是编辑资料里换上的（ADR-0165）。 */
+  cover_user?: boolean;
 }
 
-/** 队列里的一条：卡片那一份，外加版次与卷标。 */
-export interface QueueItem extends MediaItem { edition_label?: string; part_label?: string; version_id?: number }
+/** 卷标：数字、字母卷标原样给；FC2 的本篇与特典是服务端按 zh-CN 写好的原文，旁边带 code 与参数。 */
+export interface PartLabelFields { part_label?: string; part_label_code?: string; part_label_params?: Record<string, unknown> }
+
+/** 队列里的一条：卡片那一份，外加版次与卷标。版本名 `edition_label` 是 zh-CN 原文，`edition_label_parts`
+ *  按段给当前语言拼，`edition` 是版次 id。 */
+export interface QueueItem extends MediaItem, PartLabelFields {
+  edition_label?: string; edition_label_parts?: TextPart[]; edition?: string; version_id?: number;
+}
 
 export type QueueKind = 'mix' | 'parts' | 'editions' | 'playlist';
 
@@ -98,7 +118,6 @@ export const ITEM_URL = (id: number) => `/api/item?id=${id}`;
 export const RELATED_URL = (id: number, limit: number) => `/api/related?id=${id}&limit=${limit}`;
 export const PLAYLIST_URL = '/api/playlist';
 export const FEEDBACK_URL = '/api/feedback';
-export const ITEM_TAG_URL = '/api/item-tag';
 export const WATCH_LATER_URL = '/api/watch-later';
 export const QUALITY_GOAL_URL = '/api/quality-goal';
 export const PREFERENCE_URL = '/api/preference';
@@ -131,9 +150,9 @@ export async function fetchQueue(ref: QueueRef, helpers: Pick<ItemDetailHelpers,
     return playlistQueue(playlist);
   }
   const group = await apiGet<GroupPayload>(`/api/${ref.kind}?id=${ref.seedId}`, signal);
-  if (group.error || !group.items?.length) throw new Error(group.error || '这一组已不存在');
+  if (group.error || !group.items?.length) throw new Error(group.error || t('catalog:detailQueue.groupGone'));
   return {
-    kind: ref.kind, seedId: ref.seedId!, title: `${ref.kind === 'parts' ? '分卷' : '版本'} · ${group.title || ''}`,
+    kind: ref.kind, seedId: ref.seedId!, title: `${ref.kind === 'parts' ? t('catalog:detailQueue.parts') : t('catalog:detailQueue.editions')} · ${group.title || ''}`,
     items: group.items,
     versionCount: ref.kind === 'editions' ? group.count : undefined,
   };
@@ -163,8 +182,9 @@ export function chooseItem(queue: DetailQueue, requested: number | null): number
  *  卷号在深链进来和点开队列另一条时都不出现。 */
 export function withPartLabel(item: DetailItem, queue: DetailQueue | null): DetailItem {
   if (queue?.kind !== 'parts' && queue?.kind !== 'editions') return item;
-  const part_label = queue.items.find((part) => part.id === item.id)?.part_label || '';
-  return item.part_label === part_label ? item : { ...item, part_label };
+  const part = queue.items.find((row) => row.id === item.id);
+  const fields = { part_label: part?.part_label || '', part_label_code: part?.part_label_code, part_label_params: part?.part_label_params };
+  return item.part_label === fields.part_label && item.part_label_code === fields.part_label_code ? item : { ...item, ...fields };
 }
 
 /** 播完一卷只接同一版本的下一卷；选另一个版本由用户发起。 */
@@ -175,6 +195,23 @@ export function nextPart(queue: DetailQueue | null, id: number): QueueItem | nul
   const next = queue.items[index + 1];
   if (!current?.part_label || !next?.part_label) return null;
   return queue.kind === 'parts' || (current.version_id != null && current.version_id === next.version_id) ? next : null;
+}
+
+/** 一条播完之后接哪一条，按「播完之后」那一项。分卷不看这一项，总是接同一版本的下一卷；
+ *  播放列表与 Mix 队列按顺序、列表循环或随机接，已消失的条目跳过。返回当前这一条表示从头再播一遍，
+ *  null 表示停下。单片循环由播放器自己循环，到不了这里。 */
+export function queueNext(queue: DetailQueue | null, id: number, mode: AfterPlayback,
+  random: () => number = Math.random): QueueItem | null {
+  const part = nextPart(queue, id);
+  if (part) return part;
+  if (!queue || (queue.kind !== 'playlist' && queue.kind !== 'mix') || mode === 'stop' || mode === 'repeat-one') return null;
+  const items = queue.items.filter((item) => !isVanished(item));
+  if (mode === 'shuffle') {
+    const others = items.filter((item) => item.id !== id);
+    return others.length ? others[Math.floor(random() * others.length)]! : null;
+  }
+  const next = items[items.findIndex((item) => item.id === id) + 1];
+  return next ?? (mode === 'repeat-all' ? items[0] ?? null : null);
 }
 
 /** 首屏：先定队列（这一下要不要重取由壳说），再定停在哪一条，最后取那一条。要转走的几种情形
@@ -383,12 +420,6 @@ export function detailTags(item: DetailItem, helpers: Pick<ItemDetailHelpers, 't
   return [...byDisplay.values()].slice(0, 40);
 }
 
-export const hasTag = (item: DetailItem, tag: string) => (item.tags || []).some((own) => foldName(own.k) === foldName(tag));
-export const withoutTag = (item: DetailItem, tag: string): DetailItem =>
-  ({ ...item, tags: (item.tags || []).filter((own) => foldName(own.k) !== foldName(tag)) });
-export const withTag = (item: DetailItem, tag: DetailTag): DetailItem =>
-  (hasTag(item, tag.k) ? item : { ...item, tags: [...(item.tags || []), tag] });
-
 const RECENT_TAGS = 'peach.recentTags';
 export function recentTags(): string[] {
   try {
@@ -423,28 +454,31 @@ export function pickerSections(query: string, candidates: readonly TagCount[], r
 
 /* ── 队列 ── */
 
-/** 版次徽章的配色跟卡片标题上的那套走。多一个 `有码`：卡片上正片不加角标是对的（没角标就是
- *  正片），但队列里两条并排时「什么都不写」等于让人自己猜哪条是哪条。 */
-export const EDITION_TONE: Record<string, string> = { 中字: 'subtitle', 无码: 'uncensored', 无码破解: 'cracked', 有码: 'censored' };
+/** 版本名按当前语言拼：版次随语言，规格是文件名里的原样。 */
+export const editionLabel = (row: QueueItem) => (row.edition_label ? partsLabel(row.edition_label_parts, row.edition_label) : '');
 
-const QUEUE_LABEL: Record<QueueKind, string> = { mix: 'Mix', parts: '分卷', editions: '版本', playlist: '播放列表' };
+const QUEUE_LABEL: Record<QueueKind, string> = { mix: 'Mix', parts: t('catalog:detailQueue.parts'), editions: t('catalog:detailQueue.editions'), playlist: t('catalog:detailQueue.playlist') };
 
 /** 队列头那两行：类别与摘要。版次队列的标题是「版本 · 番号」，而番号就印在正上方的详情标题里，
  *  标题栏又已经写着「版本」——三处说同一件事，这里只留数量。别的队列标题带真信息（播放列表名、
  *  Mix 种子），不能一起砍。 */
 export function queueCopy(queue: DetailQueue): { title: string; summary: string } {
-  const count = (queue.kind === 'editions' ? queue.versionCount ?? queue.items.length : queue.items.length).toLocaleString();
-  const countLabel = queue.kind === 'parts' ? `${count} 卷` : queue.kind === 'editions' ? `${count} 个版本` : `${count} 个视频`;
+  const count = queue.kind === 'editions' ? queue.versionCount ?? queue.items.length : queue.items.length;
+  const countLabel = queue.kind === 'parts' ? t('catalog:detailQueue.partCount', { count }) : queue.kind === 'editions' ? t('catalog:detailQueue.editionCount', { count }) : t('catalog:countLabel.videos', { count });
   return { title: QUEUE_LABEL[queue.kind], summary: queue.kind === 'editions' ? countLabel : `${queue.title} · ${countLabel}` };
 }
 
 /** 同一部片的几卷共用文件名，标题、女优、厂牌逐字相同：详情标题不写卷号的话，在队列里换一卷，
  *  右侧整栏看上去纹丝不动。卷号说的是「第几份文件」而不是版次，用中性灰。数字卷写「第 2 卷」，
  *  字母卷照番号分卷后缀的写法大写成「A 卷」。 */
-export const partLabel = (label = '') => /^\d+$/.test(label) ? `第 ${label} 卷`
-  : /^[a-h]$/i.test(label) ? `${label.toUpperCase()} 卷` : label;
+export function partLabel(row: PartLabelFields): string {
+  const label = row.part_label || '';
+  if (row.part_label_code) return codedText(row, 'part_label');
+  return /^\d+$/.test(label) ? t('catalog:detailQueue.partNumber', { part: label })
+    : /^[a-h]$/i.test(label) ? t('catalog:detailQueue.partLetter', { part: label.toUpperCase() }) : label;
+}
 export const partLabelHtml = (item: DetailItem, queue: DetailQueue | null) =>
-  ((queue?.kind === 'parts' || queue?.kind === 'editions') && item.part_label ? `<small class="javedition partlabel">${esc(partLabel(item.part_label))}</small>` : '');
+  ((queue?.kind === 'parts' || queue?.kind === 'editions') && item.part_label ? `<small class="javedition partlabel">${esc(partLabel(item))}</small>` : '');
 
 /** 拖动之后的新顺序：`from` 挪到 `target` 的前面或后面。 */
 export function movedOrder(ids: readonly number[], from: number, target: number, after: boolean): number[] {
@@ -482,8 +516,8 @@ export function realWatched(item: DetailItem): number | null {
 
 /** 反馈键的回执。 */
 export function feedbackReceipt(kind: string, result: { feedback?: string | null; disposal?: string | null }): string {
-  if (kind === 'dislike') return result.feedback === 'dislike' ? '已标记不合口味' : '已取消不合口味';
-  if (kind === 'seen') return result.feedback === 'seen' ? '已标记看过' : '已取消看过';
-  if (kind === 'dispose') return result.disposal === 'trash' ? '已移入回收站' : '已移出回收站';
-  return '已记录一次高潮';
+  if (kind === 'dislike') return result.feedback === 'dislike' ? t('catalog:detailFeedback.disliked') : t('catalog:detailFeedback.dislikeRemoved');
+  if (kind === 'seen') return result.feedback === 'seen' ? t('catalog:detailFeedback.seenMarked') : t('catalog:detailFeedback.seenRemoved');
+  if (kind === 'dispose') return result.disposal === 'trash' ? t('catalog:detailFeedback.movedToTrash') : t('catalog:detailFeedback.restoredFromTrash');
+  return t('catalog:detailFeedback.orgasmRecorded');
 }

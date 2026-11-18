@@ -116,8 +116,8 @@ describe('打开', () => {
 
     await act(async () => {
       const opened = openPhotoLightbox(0, WALL);
-      expect(link().getAttribute('href')).toBe('/vendor/swiper/14.3.0/swiper-bundle.min.css');
-      expect(script().getAttribute('src')).toBe('/vendor/swiper/14.3.0/swiper-bundle.min.js');
+      expect(link().getAttribute('href')).toBe('/vendor/swiper/14.4.0/swiper-bundle.min.css');
+      expect(script().getAttribute('src')).toBe('/vendor/swiper/14.4.0/swiper-bundle.min.js');
       (window as { Swiper?: unknown }).Swiper = FakeSwiper;
       script().onload!(new Event('load'));
       await Promise.resolve();
@@ -340,7 +340,7 @@ describe('信息面板', () => {
     expect(q(panel, '[data-photo-detail-meta]').textContent).toBe('本地 · 2\u00a0MB');
     const reveal = q<HTMLButtonElement>(panel, '[data-photo-reveal]');
     expect(reveal.hidden).toBe(false);
-    expect(reveal.textContent).toBe('在资源管理器中显示');
+    expect(reveal.textContent).toBe('查看文件位置');
     await click(reveal);
     expect(revealSource).toHaveBeenCalledWith(100);
     expect(document.body.innerHTML).not.toContain('secret');
@@ -359,7 +359,7 @@ describe('信息面板', () => {
     await act(async () => release('源文件不在这台机器上'));
     await settle();
     expect(reveal.hasAttribute('aria-busy')).toBe(false);
-    expect(reveal.textContent).toBe('在资源管理器中显示');
+    expect(reveal.textContent).toBe('查看文件位置');
     const status = q(box, '[data-photo-status]');
     expect(status.getAttribute('aria-live')).toBe('polite');
     expect(status.textContent).toBe('源文件不在这台机器上');

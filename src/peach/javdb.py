@@ -24,6 +24,7 @@ import html as html_lib
 import re
 
 from .social_links import name_key
+from .source_page_words import JAVDB_COUNT, JAVDB_LOGIN, JAVDB_RECORD_KIND, JAVDB_UNCENSORED
 
 BASE = "https://javdb.com/"
 SEARCH = BASE + "search?f=actor&q={}"
@@ -44,15 +45,15 @@ INFO = re.compile(r'class="info">([^<]*)<')
 NAME = re.compile(r'class="actor-section-name">([^<]*)<')
 META = re.compile(r'class="section-meta">([^<]*)<')
 #: 「323 部影片」也在 `section-meta` 里，它不是名字。
-COUNT = re.compile(r"^\d+\s*部影片$")
+COUNT = re.compile(JAVDB_COUNT)
 #: 一部分资料页要登录才给，回的是登入页而不是 401/403。同一位女优在站上常有两条
 #: 记录（有碼那条公开、無碼那条要登录），搜索结果把两条都给出来，所以这不是抓失败。
-LOGIN = re.compile(r"<title>\s*登入\s*\|")
+LOGIN = re.compile(JAVDB_LOGIN)
 ACTOR_ID = re.compile(r'href="/actors/([A-Za-z0-9]+)/collect"')
 
 #: 同一位女优的无码那条记录，现名后面挂着 `(無碼)`。它是记录类型不是名字的一部分，
 #: 留着会让 `木下ひまり(無碼)` 与 `木下ひまり` 变成两个人。
-RECORD_KIND = re.compile(r"[(（](?:無碼|无码|有碼|有码|流出|破解|中文字幕)[)）]\s*$")
+RECORD_KIND = re.compile(JAVDB_RECORD_KIND)
 
 _TAG = re.compile(r"<[^>]+>")
 
@@ -113,8 +114,8 @@ def search_hits(html: str, wanted: set[str], key=name_key) -> list[str]:
     对得上的全都返回，不只取第一个。同一个名字在站上真有两位时，两页都进判定——
     取第一个是默默替用户挑了一位。
 
-    `key` 可以换成更宽的归一（比如先折叠繁简与日本字形）。默认不折叠：折叠要
-    opencc，那是可选依赖，不能让这一层跟着必装。
+    默认的 `name_key` 已经折掉日本字形（`有岡` 与 `有冈`）；繁简转换要 opencc，那是可选
+    依赖，需要时由调用方换成更宽的 `key`。
     """
     out = []
     for path, title in BOX.findall(html):
@@ -145,3 +146,29 @@ def one_person(cards: list[dict]) -> bool:
     """
     kinds = [card["record"] for card in cards]
     return bool(kinds) and len(kinds) == len(set(kinds))
+
+
+#: 無碼那条卡片上的标记。繁体界面写 `無碼`，简体界面写 `无码`。
+UNCENSORED = JAVDB_UNCENSORED
+
+
+def card_uncensored(card: dict) -> bool | None:
+    """这张卡是不是無碼那条记录。有碼那条不带标记；认不出的标记是 None，不猜。"""
+    record = str(card.get("record") or "")
+    if not record:
+        return False
+    return True if record in UNCENSORED else None
+
+
+def card_records(pages) -> dict[str, bool]:
+    """几张搜索页上的演员卡 → {站内 id: 是不是無碼那条}。
+
+    同一个 id 在不同页上标得不一样，或者标记认不出，就不收：记录类型是用来分辨同站两枚
+    入口的，标错了会把她真正的那页藏掉。
+    """
+    seen: dict[str, set] = {}
+    for html in pages:
+        for card in search_cards(html):
+            seen.setdefault(card["id"], set()).add(card_uncensored(card))
+    return {actor: kinds.pop() for actor, kinds in seen.items()
+            if len(kinds) == 1 and None not in kinds}

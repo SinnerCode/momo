@@ -34,7 +34,8 @@ AVBase、JavBus 与 JavDB，封面先求两个图源比对一致；JavDB 只作�
 为省流量，先用 Range 只取前 64 KiB 量尺寸，只有胜出的那张才整张下载。
 
 存原图不裁：4:3 与 16:9 两种版式在界面上靠 `object-fit` / `object-position` 取景，
-切版式零成本也不重新下载。官方那张独立正封 `ps.jpg` 只有 147x200，比裁出来的还小。
+切版式零成本也不重新下载。同目录的竖版图 `ps.jpg` 只在装封面时另取（`dmm_portrait`），用来判定
+横图是不是封套；老片的只有 147x200，2020 年后的高清横图配 1000～2184 高的竖版图。
 """
 from __future__ import annotations
 
@@ -57,13 +58,18 @@ from peach.scripting import USER_AGENT, open_readonly
 from peach.config import COVER_DIR, DATABASE_PATH, GENERATED_DIR, SOURCES_DIR
 from peach.http import HttpRequest, HttpTransport, HttpxTransport
 from peach.scripting import HostLimiter
-from peach.scraping_access import SOURCES, SourcePaused, SourceTransport, source_for
+from peach.scraping_access import SOURCES, SourceBudgetExhausted, SourcePaused, SourceTransport, source_for
+from peach import interface_text
+from peach.metadata import RelayableError, relay_args, relayed
 from peach.config import SECRETS_DIR
 from peach.jobs import DiskGuard, JobPolicyError
 from peach.task_runs import TaskRunHandle, cli_run, inert_handle
+from peach.user_messages import UserFacingError, failure_fields, nested_message
 from peach.platform import system_volume
+from peach.catalog_vocabulary import FETCH_FOUND, FETCH_MISSED, fetch_result
 from peach.catalog_rules import (
     code_letter_stem,
+    code_serial,
     is_amateur_code,
     is_jav_code,
     is_korean_mib_code,
@@ -95,13 +101,27 @@ SMALL_MIN_WIDTH = 240
 #: DMM 缺图时 302 到「NOW PRINTING」占位图（590×800），尺寸像一张正常封面。
 PLACEHOLDER = re.compile(r"now_?printing", re.I)
 #: 官方候选一张都量不出可用尺寸时的两种说法，下标是「有没有量到过偏小的图」。
-NO_USABLE_OFFICIAL = ("官方封面地址都没有取到图片", "官方封面只有缩略图或占位图")
-#: 占位图是来源自己说「没有图」：DMM 下架的作品两个版本都只剩这一张。
-PLACEHOLDER_REASON = "来源给的是「准备中」占位图"
+NO_USABLE_OFFICIAL_CODES = ("errors.javCoverFetch.officialNoImage", "errors.javCoverFetch.officialTooSmall")
+#: 占位图是来源自己说「没有图」：DMM 发售前还没出图、下架的作品两个版本都只剩这一张。
+PLACEHOLDER_CODE = "errors.javCoverFetch.placeholder"
 #: 官方候选里取到的只有占位图、没有偏小的真图时的说法。
-OFFICIAL_PLACEHOLDER_ONLY = "官方封面地址只回「准备中」占位图，作品多半已从官方下架"
+OFFICIAL_PLACEHOLDER_ONLY_CODE = "errors.javCoverFetch.officialPlaceholderOnly"
 #: 韩国 MIB 的编号不在 JAV 目录站上，封面来源一律不问；记进日志算确认落空，不重探。
-MIB_NOT_JAV = "韩国 MIB 不适用 JAV 封面来源"
+MIB_NOT_JAV_CODE = "errors.javCoverFetch.mibNotJav"
+NO_CANDIDATES_CODE = "errors.javCoverFetch.noCandidates"
+
+
+def _zh(code: str) -> str:
+    return interface_text.text(f"server:{code}")
+
+
+#: 上面几句的 zh-CN 原文：取图日志的 `note`、取图记录的 `reason` 存的是它，读旧记录时按它认。
+NO_USABLE_OFFICIAL = tuple(_zh(code) for code in NO_USABLE_OFFICIAL_CODES)
+PLACEHOLDER_REASON = _zh(PLACEHOLDER_CODE)
+OFFICIAL_PLACEHOLDER_ONLY = _zh(OFFICIAL_PLACEHOLDER_ONLY_CODE)
+MIB_NOT_JAV = _zh(MIB_NOT_JAV_CODE)
+#: 批量封面日志 `result` 列的取值（ADR-0162 的英文 id）。读回时先经 `fetch_result` 归一，旧日志里的中文值也认。
+FOUND, MISSED = FETCH_FOUND, FETCH_MISSED
 #: 量尺寸只需要 JPEG 头部，别把整张 1 MB 的图拉下来。
 PROBE_BYTES = 64 * 1024
 # 瞬时 TLS EOF / 连接重置不能落成“官方没有封面”。按项目外网退避规则重试，
@@ -162,8 +182,8 @@ class MetadataEvidence:
     sources: frozenset[str] = frozenset()
 
 
-class Unavailable(RuntimeError):
-    pass
+class Unavailable(RelayableError, RuntimeError):
+    """这一次没取到：给人看的那句是 code 与参数，状态说明（`HTTP 503`）经 `relayed` 转述。"""
 
 
 class NotFound(Unavailable):
@@ -174,12 +194,13 @@ class NotFound(Unavailable):
     """
 
 
-class DeadlineExceeded(RuntimeError):
+class DeadlineExceeded(RelayableError, RuntimeError):
     """动作预算已用尽：调用方记录当前项目后继续下一项。"""
 
 
-#: 候选一张都没连上时的说法。
-HOSTS_UNREACHABLE = "官方图片主机都连不上"
+#: 候选一张都没连上时的说法；`HOSTS_UNREACHABLE` 是它的 zh-CN 原文。
+HOSTS_UNREACHABLE_CODE = "errors.javCoverFetch.hostsUnreachable"
+HOSTS_UNREACHABLE = _zh(HOSTS_UNREACHABLE_CODE)
 
 
 class CoverConnectError(Unavailable):
@@ -211,6 +232,11 @@ class HostLimitedTransport:
     def __call__(self, request: HttpRequest, timeout: float, limit: int):
         self.limiter.wait(request.url)
         return self.inner(request, timeout, limit)
+
+    def exhausted(self) -> str:
+        """里层传输的本趟预算到顶时那一句说明；里层不设预算的返回空串。"""
+        check = getattr(self.inner, "exhausted", None)
+        return check() if check else ""
 
     def renew(self) -> None:
         if hasattr(self.inner, "renew"):
@@ -257,7 +283,7 @@ def _sleep_within(delay: float, deadline: float | None) -> None:
     """限速等待也服从截止时间，不让睡眠越过预算。"""
     remaining = _remaining(deadline)
     if remaining is not None and delay >= remaining:
-        raise DeadlineExceeded("动作预算已用尽")
+        raise DeadlineExceeded("errors.javCoverFetch.deadline")
     time.sleep(delay)
 
 
@@ -294,7 +320,7 @@ def _fetch(transport: HttpTransport, url: str, *, referer: str,
     for attempt in range(len(NETWORK_RETRY_DELAYS) + 1):
         remaining = _remaining(deadline)
         if remaining is not None and remaining <= 0:
-            raise DeadlineExceeded("动作预算已用尽")
+            raise DeadlineExceeded("errors.javCoverFetch.deadline")
         try:
             response = transport(request, request_timeout(url, remaining), limit)
             break
@@ -304,24 +330,24 @@ def _fetch(transport: HttpTransport, url: str, *, referer: str,
             _sleep_within(NETWORK_RETRY_DELAYS[attempt], deadline)
     final_url = getattr(response, "url", "")
     if isinstance(final_url, str) and PLACEHOLDER.search(final_url):
-        raise NotFound(PLACEHOLDER_REASON)
+        raise NotFound(PLACEHOLDER_CODE)
     if response.status == 404:
-        raise NotFound("HTTP 404")
+        raise NotFound(*relayed("HTTP 404"))
     if response.status not in (200, 206):
-        raise Unavailable(f"HTTP {response.status}")
+        raise Unavailable(*relayed(f"HTTP {response.status}"))
     return response.body
 
 
 def _probe_failure(error: Exception) -> str:
     """量尺寸失败记进诊断的哪一格：占位图单列，它是来源自己说没有图。"""
-    return "placeholder" if isinstance(error, NotFound) and str(error) == PLACEHOLDER_REASON else "probe_failed"
+    return "placeholder" if isinstance(error, NotFound) and error.code == PLACEHOLDER_CODE else "probe_failed"
 
 
 def _no_usable_official(diagnostics: dict) -> str:
-    """官方候选一张都量不出可用尺寸时的原因。"""
+    """官方候选一张都量不出可用尺寸时的原因（code）。"""
     if diagnostics.get("placeholder") and not diagnostics.get("too_small"):
-        return OFFICIAL_PLACEHOLDER_ONLY
-    return NO_USABLE_OFFICIAL[bool(diagnostics.get("too_small"))]
+        return OFFICIAL_PLACEHOLDER_ONLY_CODE
+    return NO_USABLE_OFFICIAL_CODES[bool(diagnostics.get("too_small"))]
 
 
 def code_variants(code: str) -> list[str]:
@@ -379,7 +405,7 @@ def fc2_cover_candidates(path: Path | None) -> dict[str, Candidate]:
     for row in read_rows(path):
         url = re.sub(r"(/w)\d+(/)", r"\g<1>1200\2", str(row.get("cover_url") or ""), count=1)
         code = normalise_code_key(str(row.get("code") or ""))
-        if (row.get("result") == "取得" and not row.get("is_collection")
+        if (fetch_result(row.get("result")) == FOUND and not row.get("is_collection")
                 and code.startswith("FC2-PPV-") and IMAGE_URL.fullmatch(url)):
             found[code] = Candidate(urlparse(url).netloc.lower(), url, "https://fc2cmadb.com/")
     return found
@@ -433,6 +459,45 @@ def official_image_candidates(url: str) -> list[Candidate]:
     return []
 
 
+#: DVD 封套的面积按这个倍数参与择优：统一用封套，只有封套面积不到配信图一半（边长不到约七成，
+#: 明显更糊）才用配信图。START-435 封套 2184×1466、配信图 2184×1542，用封套；STARS-776 的封套
+#: 只有 800×535，面积约 13%，照旧用配信图。
+PACKAGE_PREFERENCE = 2.0
+
+_DMM_PORTRAIT = re.compile(r"pl\.jpg$", re.I)
+#: 竖版图只取这么大：高清那张 1536×2184 约 1 MB。
+PORTRAIT_LIMIT = 8 * 1024 * 1024
+
+
+def dmm_portrait_url(url: str) -> str:
+    """DMM 横版大图 `…pl.jpg` 同目录的竖版图 `…ps.jpg`；不是 DMM 横图地址是空串。
+
+    FANZA 页面上的正封就是这张。老片只有 147×200，2020 年后的高清横图配 1000～2184 高的竖版图。
+    """
+    clean = (url or "").split("?", 1)[0].strip()
+    host = urlparse(clean).netloc.lower()
+    if not (host.endswith("dmm.co.jp") or host.endswith("dmm.com")) or not _DMM_PORTRAIT.search(clean):
+        return ""
+    return _DMM_PORTRAIT.sub("ps.jpg", clean)
+
+
+def dmm_portrait(transport: HttpTransport, url: str, *, deadline: float | None = None) -> bytes | None:
+    """取 DMM 横图配套的竖版图；不是 DMM 横图、来源说没有或网络失败都是 None。
+
+    它只用来判定版式（`cover_artwork.install_cover`），取不到时照原有判据取景，不让装封面失败。
+    """
+    portrait = dmm_portrait_url(url)
+    return official_image(transport, portrait, deadline=deadline) if portrait else None
+
+
+def official_image(transport: HttpTransport, url: str, *, deadline: float | None = None) -> bytes | None:
+    """取一张可有可无的官方图（竖版图、补换的封套）；来源说没有、预算用完或网络失败都是 None。"""
+    try:
+        return _fetch(transport, url, referer=_referer_for(url), limit=16 * 1024 * 1024, deadline=deadline)
+    except (Unavailable, DeadlineExceeded, SourcePaused, SourceBudgetExhausted, httpx.TransportError):
+        return None
+
+
 #: 库外卡片经 `/cover-image` 取图时放行的主机后缀，与 `official_image_candidates` 认的两家一致；
 #: 代理跟重定向的每一跳也按它核对。
 COVER_PROXY_HOSTS = ("dmm.co.jp", "dmm.com", "mgstage.com")
@@ -448,13 +513,37 @@ def proxyable_cover_url(url: str) -> bool:
             and bool(official_image_candidates(clean)))
 
 
+def package_cid(content_id: str) -> str:
+    """配信版内容编号对应的 DVD 版编号：数字段去掉补位的零，至少留三位。`1start00435` → `1start435`。"""
+    shape = re.match(r"^(.*?[a-z])0*(\d{3,})$", (content_id or "").strip().lower())
+    return shape.group(1) + shape.group(2) if shape else ""
+
+
+def is_package_image(url: str) -> bool:
+    """DMM 的 DVD 版封套（`mono/movie`）：实体封套，正封在右侧。"""
+    return "/mono/movie/" in urlparse(url or "").path.lower()
+
+
+def is_streaming_image(url: str) -> bool:
+    """DMM 的配信版横图（`digital/video`）：多数与封套同图，SOD 系是另画的宣传图。"""
+    return "/digital/video/" in urlparse(url or "").path.lower()
+
+
 def content_id_images(content_id: str) -> list[Candidate]:
+    """内容编号推出的官方候选：配信版两条 CDN 路径，加 DVD 版封套。
+
+    SOD 系（START、STARS 等）的配信版横图是另画的双栏宣传图，人物在左、剧照拼贴在右，
+    DVD 版才是标准封套；择优统一偏向封套，只有封套明显更糊才用配信图（`PACKAGE_PREFERENCE`）。
+    """
     candidates: list[Candidate] = []
     for cid in cid_variants(content_id):
         candidates.extend([
             candidate_for(AWS_MODERN.format(kind="digital/video", cid=cid)),
             candidate_for(AWS_LEGACY_DIGITAL.format(cid=cid)),
         ])
+    package = package_cid(content_id)
+    if package:
+        candidates.append(candidate_for(AWS_MODERN.format(kind="mono/movie", cid=package)))
     return _unique_candidates(candidates)
 
 
@@ -502,7 +591,7 @@ def logged_success_evidence(
     """复用历史精确 URL 与已量尺寸；DUGA 等无需重复探同一张图。"""
     for row in reversed(rows):
         if (normalise_code_key(str(row.get("code") or "")) == code
-                and row.get("result") == "取得"
+                and fetch_result(row.get("result")) == FOUND
                 and isinstance(row.get("url"), str)
                 and IMAGE_URL.fullmatch(str(row["url"]))):
             try:
@@ -566,9 +655,11 @@ def is_cross_product_cover(code: str, url: str) -> bool:
     if stem not in cid:
         return True
     # 字母段对上还不够：`YUJ-101` 取回的是 `yuj00011`，`CHU-201` 是 `chu00021`，
-    # `435MFC-135` 是 `h_1711mfcc00027`。数字段按整数比，补零和厂牌前缀都不影响。
-    wanted, got = _CODE_NUMBER.search(code or ""), _CID_NUMBER.search(cid)
-    return bool(wanted and got) and int(wanted.group(1)) != int(got.group(1))
+    # `435MFC-135` 是 `h_1711mfcc00027`。数字段按 `code_serial` 比，补零和厂牌前缀都不影响；
+    # 只有 `SHORT_SERIAL_PREFIXES` 的短号例外：DMM 的 `mcdv00024` 是有码 `MCDV-024`，不是无码 `MCDV-24`。
+    # 序号从字母段之后取：`T28-612` 的 cid 是 `55t2800612`，整串末尾的数字会把厂牌段的 `28` 带进来。
+    wanted, got = _CODE_NUMBER.search(code or ""), _CID_NUMBER.search(cid[cid.index(stem) + len(stem):])
+    return bool(wanted and got) and code_serial(stem, wanted.group(1)) != code_serial(stem, got.group(1))
 
 
 def _is_prestige(evidence: MetadataEvidence) -> bool:
@@ -634,7 +725,7 @@ def dmm_evidence(transport: HttpTransport, code: str, *, deadline=None) -> Metad
     except SourceFailure as error:
         if error.kind == 'not_found':
             return MetadataEvidence()
-        raise Unavailable('DMM：' + str(error)) from error
+        raise Unavailable('errors.javCoverFetch.dmmFailed', {'error': nested_message(error)}) from error
     found = [candidate for url in payload.get('cover_urls') or () for candidate in dmm_cdn_images(url)]
     found += content_id_images(str(payload.get('content_id') or ''))
     makers = frozenset(str(payload.get(field) or '').strip().casefold() for field in ('maker', 'label'))
@@ -725,11 +816,26 @@ def prestige_images(transport: HttpTransport, code: str, *,
     return []
 
 
+def _source_query(query, *, empty, record):
+    """单个来源冷却只记为未作答；本趟预算耗尽继续交给任务停止。"""
+    try:
+        return query()
+    except SourceBudgetExhausted:
+        raise
+    except SourcePaused:
+        record('source_unanswered')
+        record('paused')
+        return empty()
+
+
 def prestige_group_images(transport: HttpTransport, code: str, *,
-                          deadline: float | None = None) -> list[Candidate]:
+                          deadline: float | None = None, record=lambda key: None) -> list[Candidate]:
     """汇总 Prestige 与 MGS 的官方候选，尺寸由统一探测比较。"""
-    official = prestige_images(transport, code, deadline=deadline)
-    return _unique_candidates(official + mgstage_images(transport, code, deadline=deadline))
+    official = _source_query(lambda: prestige_images(transport, code, deadline=deadline),
+                              empty=list, record=record)
+    mgs = _source_query(lambda: mgstage_images(transport, code, deadline=deadline),
+                         empty=list, record=record)
+    return _unique_candidates(official + mgs)
 
 
 def probe_size(transport: HttpTransport, candidate: Candidate, *,
@@ -776,29 +882,41 @@ def _site_candidates(transport: HttpTransport, code: str, evidence: MetadataEvid
     prestige = _is_prestige(evidence) or 'prestige' in maker_sites(code)
     amateur = is_amateur_code(code) or 'mgstage' in evidence.sources
     if prestige:
-        candidates += prestige_group_images(transport, code, deadline=deadline)
+        candidates += prestige_group_images(transport, code, deadline=deadline, record=record)
     elif amateur:
-        candidates += mgstage_images(transport, code, deadline=deadline)
+        candidates += _source_query(lambda: mgstage_images(transport, code, deadline=deadline),
+                                     empty=list, record=record)
     if candidates or ((prestige or amateur) and evidence.candidates):
         return candidates
     if ('dmm' not in evidence.sources
             and not prestige and not amateur and not is_uncensored_code(code)):
         try:
-            live_evidence = dmm_evidence(transport, code, deadline=deadline)
+            live_evidence = _source_query(lambda: dmm_evidence(transport, code, deadline=deadline),
+                                           empty=MetadataEvidence, record=record)
             candidates += list(live_evidence.candidates)
-        except (Unavailable, SourcePaused, httpx.TransportError):
+        except (Unavailable, httpx.TransportError):
             record('source_unanswered')
     # 有成功快照时不重复打 r18；失败快照不算证据，仍允许联网刷新。
     if ('r18dev' not in evidence.sources and not live_evidence.candidates
             and not ('dmm' in evidence.sources and evidence.candidates)):
-        live_evidence = r18_evidence(transport, code, deadline=deadline, record=record)
+        live_evidence = _source_query(
+            lambda: r18_evidence(transport, code, deadline=deadline, record=record),
+            empty=MetadataEvidence, record=record)
         candidates += list(live_evidence.candidates)
         _sleep_within(delay, deadline)
     # 目录新识别出 Prestige 时补问集团自营渠道。
     if not prestige and _is_prestige(live_evidence):
-        candidates += prestige_group_images(transport, code, deadline=deadline)
+        candidates += prestige_group_images(transport, code, deadline=deadline, record=record)
         _sleep_within(delay, deadline)
     return candidates
+
+
+def _unanswered_error(diagnostics: dict, *said) -> Exception:
+    """没问成的那一趟交什么：没答复的全是冷却挡下的就交 `SourcePaused`，否则按 `said`（code 与参数）交 `Unavailable`。"""
+    unanswered = sum(diagnostics.get(key, 0) for key in ('source_unanswered', 'unanswered', 'download_failed'))
+    if unanswered and diagnostics.get('paused', 0) == unanswered:
+        return SourcePaused('errors.javCoverFetch.coolingDown')
+    return Unavailable(*said)
 
 
 def best_cover(transport: HttpTransport, code: str, delay: float, *,
@@ -822,7 +940,7 @@ def best_cover(transport: HttpTransport, code: str, delay: float, *,
     # `HA-101`、`MY-102` 取回的都是那部日本片的封套，番号核验拦不住，因为番号本来
     # 就一样。所以不是「找不到」，是根本不该去找。
     if is_korean_mib_code(code):
-        raise Unavailable(MIB_NOT_JAV)
+        raise Unavailable(MIB_NOT_JAV_CODE)
     # 来源一律记主机名。缓存、构造路径和官方页常指向同一个主机，记成多个名字
     # 会让覆盖率统计凭空多出「渠道」。
     evidence = _joined_evidence(known, cached_metadata(metadata_root, code))
@@ -836,7 +954,7 @@ def best_cover(transport: HttpTransport, code: str, delay: float, *,
     def source_transport(request, timeout, limit):
         try:
             response = transport(request, timeout, limit)
-        except (httpx.TransportError, SourcePaused):
+        except httpx.TransportError:
             record('source_unanswered')
             raise
         if response.status not in (200, 206, 404):
@@ -851,22 +969,24 @@ def best_cover(transport: HttpTransport, code: str, delay: float, *,
                                             deadline=deadline, record=record)])
     if not asked:
         if diagnostics.get('source_unanswered'):
-            raise Unavailable('官方目录查询未完成，尚未取得封面候选')
-        raise NotFound("所有渠道都没有候选")
+            raise _unanswered_error(diagnostics, 'errors.javCoverFetch.catalogUnfinished')
+        raise NotFound(NO_CANDIDATES_CODE)
     measured = _measure(transport, asked, record, minimum_width=minimum_width,
                         delay=delay, deadline=deadline)
     if not measured:
         # 每张候选都回过话（404、太小、占位图、解不开）就是来源的确定答复，下次再问还是这几张：
         # 交 `NotFound`，采集任务记下一周不问。有一张断在连接、5xx 或拒绝访问上才可能是这趟没问成。
-        kind = Unavailable if diagnostics.get("unanswered") or diagnostics.get('source_unanswered') else NotFound
-        raise kind(_no_usable_official(diagnostics))
+        if diagnostics.get("unanswered") or diagnostics.get('source_unanswered'):
+            raise _unanswered_error(diagnostics, _no_usable_official(diagnostics))
+        raise NotFound(_no_usable_official(diagnostics))
     try:
         return _download_best(transport, measured, record, minimum_width=minimum_width,
                               minimum_quality=minimum_quality, minimum_pixels=minimum_pixels,
                               deadline=deadline)
-    except NotFound as error:
-        if diagnostics.get('source_unanswered') or diagnostics.get('unanswered'):
-            raise Unavailable(str(error)) from error
+    except Unavailable as error:
+        if (diagnostics.get('source_unanswered') or diagnostics.get('unanswered')
+                or diagnostics.get('paused')):
+            raise _unanswered_error(diagnostics, *relay_args(error)) from error
         raise
 
 
@@ -884,6 +1004,13 @@ def _measure(transport: HttpTransport, candidates, record, *, minimum_width: int
         for candidate in candidates:
             try:
                 width, height = probe_size(transport, candidate, deadline=deadline)
+            except (SourceBudgetExhausted, InterruptedError):
+                raise
+            except SourcePaused:
+                record('paused')
+                record('unanswered')
+                answered += 1
+                continue
             except httpx.TransportError as error:
                 record(_probe_failure(error))
                 record("unanswered")
@@ -908,10 +1035,10 @@ def _measure(transport: HttpTransport, candidates, record, *, minimum_width: int
                 record("too_small")
     except DeadlineExceeded:
         if unreachable and not answered:
-            raise CoverConnectError(HOSTS_UNREACHABLE) from None
+            raise CoverConnectError(HOSTS_UNREACHABLE_CODE) from None
         raise
     if unreachable and not answered:
-        raise CoverConnectError(HOSTS_UNREACHABLE)
+        raise CoverConnectError(HOSTS_UNREACHABLE_CODE)
     return measured
 
 
@@ -925,11 +1052,25 @@ def _download_best(transport: HttpTransport, measured, record, *, minimum_width:
     动图时算没有，而不是没下载成——再问一遍还是这几张。
     """
     animated = 0
+    packaged = any(is_package_image(item[1].url) for item in measured)
+
+    def preferred_pixels(item) -> float:
+        # 同一部有 DVD 封套时，DMM 配信图降权：它可能是另画的宣传图（SOD 双栏），封套才有标准正封。
+        # 只压配信图，不改封套与其他来源（DUGA、MGS）之间按面积的比较。
+        return item[0] / PACKAGE_PREFERENCE if packaged and is_streaming_image(item[1].url) else item[0]
+
     for _pixels, winner, size in sorted(
-            measured, key=lambda item: (candidate_quality(item[1]) > 0, item[0], candidate_quality(item[1])), reverse=True):
+            measured, key=lambda item: (candidate_quality(item[1]) > 0, preferred_pixels(item),
+                                        candidate_quality(item[1])), reverse=True):
         try:
             data = _fetch(transport, winner.url, referer=winner.referer,
                           limit=16 * 1024 * 1024, deadline=deadline)
+        except SourceBudgetExhausted:
+            raise
+        except SourcePaused:
+            record('paused')
+            record('download_failed')
+            continue
         except (Unavailable, httpx.TransportError):
             record("download_failed")
             continue
@@ -954,8 +1095,8 @@ def _download_best(transport: HttpTransport, measured, record, *, minimum_width:
             continue
         return winner, actual_size, data
     if animated == len(measured):
-        raise NotFound("官方候选都是动图")
-    raise Unavailable("可用候选完整下载都失败")
+        raise NotFound("errors.javCoverFetch.allAnimated")
+    raise Unavailable("errors.javCoverFetch.downloadsFailed")
 
 
 FIELDS = ("code", "result", "source", "width", "height", "kb", "url", "note", "outcome", "catalog_rules")
@@ -985,7 +1126,7 @@ def settled_misses(log: Path) -> set[str]:
                 and str(row.get('catalog_rules')) == str(upgrade_rules.OFFICIAL_COVER_CATALOG_MISSES))
 
     return {str(row.get("code") or "").strip() for row in rows
-            if row.get("result") == "未取得"
+            if fetch_result(row.get("result")) == MISSED
             and confirmed(row)
             and not TRANSIENT.search(str(row.get("note") or ""))
             and str(row.get("code") or "").strip()}
@@ -1010,7 +1151,7 @@ def restore_logged_successes(transport: HttpTransport, log: Path, root: Path,
     # 恢复不做发现请求，所以它比抓取更容易把历史错图原样搬回本地：跨片封套与 MIB
     # 在这里也要挡掉，否则删掉错图重跑恢复只会把同一张再下一次。
     successes = [row for row in logged_rows(log)
-                 if row.get("result") == "取得" and row.get("code") and row.get("url")
+                 if fetch_result(row.get("result")) == FOUND and row.get("code") and row.get("url")
                  and not is_cross_product_cover(str(row["code"]), str(row["url"]))
                  and not is_korean_mib_code(str(row["code"]))]
     for index, row in enumerate(successes, 1):
@@ -1030,16 +1171,17 @@ def restore_logged_successes(transport: HttpTransport, log: Path, root: Path,
                 image.verify()
             expected = (int(row["width"]), int(row["height"]))
             if size != expected or size[0] < MIN_WIDTH:
-                raise Unavailable(f"尺寸变化：日志 {expected[0]}x{expected[1]}，当前 {size[0]}x{size[1]}")
+                raise Unavailable("errors.javCoverFetch.sizeChanged", {"expectedWidth": expected[0], "expectedHeight": expected[1],
+                                                                     "width": size[0], "height": size[1]})
             temporary.write_bytes(data)
             temporary.replace(target)
             restored += 1
-            print(f"[{index}/{len(successes)}] 恢复 {code}  {size[0]}x{size[1]}", flush=True)
+            print(f"[{index}/{len(successes)}] restored {code}  {size[0]}x{size[1]}", flush=True)
         # 与完整抓取同一条长跑边界：单张网络异常降级成失败记录，不能让余下恢复归零；
         # KeyboardInterrupt 等 BaseException 仍会正常中断。
         except Exception as exc:
             failed.append({"code": code, "error": f"{type(exc).__name__}: {exc}"[:120]})
-            print(f"[{index}/{len(successes)}] 未恢复 {code}：{type(exc).__name__} {exc}",
+            print(f"[{index}/{len(successes)}] not restored {code}: {type(exc).__name__} {exc}",
                   flush=True)
         finally:
             temporary.unlink(missing_ok=True)
@@ -1132,46 +1274,46 @@ def audit_state(database: Path, root: Path, log: Path) -> dict[str, object]:
         "missing": len(codes - set(dimensions)),
         "invalid": invalid,
         "width_buckets": widths,
-        "log_successes": sum(row.get("result") == "取得" for row in rows),
-        "log_misses": sum(row.get("result") == "未取得" for row in rows),
+        "log_successes": sum(fetch_result(row.get("result")) == FOUND for row in rows),
+        "log_misses": sum(fetch_result(row.get("result")) == MISSED for row in rows),
         "settled_misses": len(settled_misses(log)),
     }
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="按番号抓最高清的官方封套")
+    parser = argparse.ArgumentParser(description="Fetch the highest-resolution official cover for each code")
     parser.add_argument("--db", type=Path, default=DATABASE_PATH)
     parser.add_argument("--out", type=Path, default=COVER_DIR)
     parser.add_argument("--log", type=Path,
                         default=GENERATED_DIR / "cover-fetch-log.csv")
     parser.add_argument(
         "--metadata-root", type=Path, default=DEFAULT_METADATA_ROOT,
-        help="Javinizer-Go 原始快照目录；先离线复用成功证据，再补联网来源",
+        help="Javinizer-Go raw snapshot directory; reuse its evidence offline before asking online sources",
     )
     parser.add_argument("--fc2-metadata-log", type=Path, default=DEFAULT_FC2_METADATA_LOG,
-                        help="fc2cmadb 文章封面证据，只对 --fc2-only 生效")
+                        help="fc2cmadb article cover evidence; only used with --fc2-only")
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--code", help="只处理一个已归一化番号，用于定点重试")
+    parser.add_argument("--code", help="only process one normalized code, for a targeted retry")
     parser.add_argument("--delay", type=float, default=1.5)
     parser.add_argument("--min-free", type=float, default=40.0,
-                        help="系统盘最低可用 GiB；运行中每隔一段时间复查")
+                        help="minimum free GiB on the system volume; rechecked periodically while running")
     parser.add_argument("--disk-check-secs", type=float, default=20.0)
     parser.add_argument("--location",
-                        help="只抓指定来源的番号封套，例如 pikpak；封套仍按番号共享")
+                        help="only fetch covers for codes in this storage, e.g. pikpak; covers are still shared by code")
     parser.add_argument("--retry-misses", action="store_true",
-                        help="连上轮确认没有封套的番号也重探一遍")
+                        help="also retry codes the last run confirmed have no cover")
     parser.add_argument("--restore-successes", action="store_true",
-                        help="只按成功日志中的原 URL 恢复缺失封套，不重新探测来源")
+                        help="only restore missing covers from the URLs in the success log, without probing sources")
     parser.add_argument("--upgrade-existing", action="store_true",
-                        help="重探已有封套；只有候选像素更多时才原子替换")
+                        help="re-probe existing covers; replace atomically only when the candidate has more pixels")
     parser.add_argument("--upgrade-max-width", type=int, default=0,
-                        help="升级模式只重探不超过此宽度的已有封套；0 表示全部")
+                        help="in upgrade mode, only re-probe covers no wider than this; 0 means all")
     parser.add_argument("--all-codes", action="store_true",
-                        help="连 FC2/日期番号一起试；默认只跑片商与素人形态")
+                        help="also try FC2 and date-style codes; by default only studio and amateur codes")
     parser.add_argument("--fc2-only", action="store_true",
-                        help="只用 fc2cmadb 已存证据抓 FC2 官方 CDN 封面")
+                        help="only fetch FC2 official CDN covers from saved fc2cmadb evidence")
     parser.add_argument("--audit", action="store_true",
-                        help="只读输出封面数量、缺失、损坏和尺寸分布，不联网不写文件")
+                        help="read-only report of cover counts, gaps, damage and size distribution; no network, no writes")
     return parser
 
 
@@ -1201,10 +1343,15 @@ def _replace_log_row(rows: list[dict], code: str, replacement: dict) -> None:
 
 def failure_log_row(code: str, error: Exception) -> dict:
     """批量封面的未取得记录，区分确定无图与本次未作答。"""
-    return {"code": code, "result": "未取得", "source": "", "width": "", "height": "",
+    return {"code": code, "result": MISSED, "source": "", "width": "", "height": "",
             "kb": "", "url": "", "note": f"{type(error).__name__}: {error}"[:80],
             "outcome": 'not_found' if isinstance(error, NotFound) else 'unavailable',
             "catalog_rules": upgrade_rules.OFFICIAL_COVER_CATALOG_MISSES}
+
+
+def _stop_fields(stopped: BaseException) -> dict:
+    """停下的原因写进任务行：带 code 的连同 code 与参数，别的照旧只写原文。"""
+    return failure_fields(stopped) if isinstance(stopped, UserFacingError) else {"error": str(stopped)}
 
 
 def run(args: argparse.Namespace, handle: TaskRunHandle | None = None) -> int:
@@ -1215,19 +1362,19 @@ def run(args: argparse.Namespace, handle: TaskRunHandle | None = None) -> int:
                          ensure_ascii=False, indent=2))
         return 0
     if args.upgrade_max_width < 0:
-        print("[stop] --upgrade-max-width 不能小于 0")
+        print("[stop] --upgrade-max-width must not be negative")
         return 2
     if args.upgrade_max_width and not args.upgrade_existing:
-        print("[stop] --upgrade-max-width 只能与 --upgrade-existing 一起使用")
+        print("[stop] --upgrade-max-width only works with --upgrade-existing")
         return 2
     if args.upgrade_existing and args.retry_misses:
-        print("[stop] --upgrade-existing 与 --retry-misses 不能同时使用")
+        print("[stop] --upgrade-existing and --retry-misses cannot be combined")
         return 2
     if args.restore_successes and args.upgrade_existing:
-        print("[stop] --restore-successes 与 --upgrade-existing 不能同时使用")
+        print("[stop] --restore-successes and --upgrade-existing cannot be combined")
         return 2
     if args.fc2_only and args.all_codes:
-        print("[stop] --fc2-only 与 --all-codes 不能同时使用")
+        print("[stop] --fc2-only and --all-codes cannot be combined")
         return 2
     args.out.mkdir(parents=True, exist_ok=True)
     guard = DiskGuard(system_volume(), args.min_free, args.disk_check_secs)
@@ -1236,7 +1383,7 @@ def run(args: argparse.Namespace, handle: TaskRunHandle | None = None) -> int:
     except JobPolicyError as exc:
         print(f"[stop] {exc}")
         return exc.exit_code
-    print(f"系统盘可用 {free_gb:.1f} GiB，运行期阈值 {args.min_free:.1f} GiB")
+    print(f"system volume free {free_gb:.1f} GiB, running threshold {args.min_free:.1f} GiB")
     if args.restore_successes:
         transport = HttpxTransport()
         try:
@@ -1248,8 +1395,8 @@ def run(args: argparse.Namespace, handle: TaskRunHandle | None = None) -> int:
             return exc.exit_code
         finally:
             transport.close()
-        print(f"成功日志 {result['logged']}，恢复 {result['restored']}，"
-              f"已存在 {result['skipped']}，失败 {len(result['failed'])} → {args.out}")
+        print(f"logged {result['logged']}, restored {result['restored']}, "
+              f"already present {result['skipped']}, failed {len(result['failed'])} -> {args.out}")
         return 2 if result["failed"] else 0
 
     todo = pending(
@@ -1268,12 +1415,12 @@ def run(args: argparse.Namespace, handle: TaskRunHandle | None = None) -> int:
         todo = todo[:args.limit]
     selected = set(todo)
     if args.upgrade_existing:
-        width_note = (f"，当前宽度不超过 {args.upgrade_max_width}"
+        width_note = (f", current width at most {args.upgrade_max_width}"
                       if args.upgrade_max_width else "")
-        print(f"待重探已有封套 {len(todo)} 个{width_note}；只在像素更多时替换")
+        print(f"{len(todo)} existing covers to re-probe{width_note}; replaced only when the candidate has more pixels")
     else:
-        print(f"待抓番号 {len(todo)} 个（本机已有的跳过，"
-              f"上轮确认没有的跳过 {len(skipped)} 个，--retry-misses 可重试）")
+        print(f"{len(todo)} codes to fetch (covers already on this device skipped, "
+              f"{len(skipped)} confirmed misses skipped; --retry-misses retries them)")
 
     transport = HostLimitedTransport(SourceTransport(SECRETS_DIR), args.delay)
     # 日志是整份重写：这轮只跑 pikpak 或只跑 --limit 时，未选中的旧记录也必须保留；
@@ -1330,18 +1477,18 @@ def run(args: argparse.Namespace, handle: TaskRunHandle | None = None) -> int:
                 transport = _renew_transport_after_error(transport, exc)
                 stats["miss"] += 1
                 if args.upgrade_existing:
-                    print(f"[{index}/{len(todo)}] 保留 {code}：重探失败 "
+                    print(f"[{index}/{len(todo)}] kept {code}: re-probe failed "
                           f"{type(exc).__name__} {exc}", flush=True)
                 else:
                     rows.append(failure_log_row(code, exc))
-                    print(f"[{index}/{len(todo)}] 未取得 {code}："
+                    print(f"[{index}/{len(todo)}] not found {code}: "
                           f"{type(exc).__name__} {exc}", flush=True)
             else:
                 if args.upgrade_existing and not candidate_improves(
                         winner, width * height,
                         baseline_quality, current_size[0] * current_size[1]):
                     stats["kept"] += 1
-                    print(f"[{index}/{len(todo)}] 保留 {code}  "
+                    print(f"[{index}/{len(todo)}] kept {code}  "
                           f"{current_size[0]}x{current_size[1]} >= {width}x{height}",
                           flush=True)
                 else:
@@ -1352,14 +1499,14 @@ def run(args: argparse.Namespace, handle: TaskRunHandle | None = None) -> int:
                     finally:
                         temporary.unlink(missing_ok=True)
                     stats["ok"] += 1
-                    row = {"code": code, "result": "取得", "source": winner.source,
+                    row = {"code": code, "result": FOUND, "source": winner.source,
                            "width": width, "height": height, "kb": len(data) // 1024,
                            "url": winner.url, "note": ""}
                     if args.upgrade_existing:
                         _replace_log_row(rows, code, row)
                     else:
                         rows.append(row)
-                    verb = "升级" if args.upgrade_existing else "取得"
+                    verb = "upgraded" if args.upgrade_existing else "fetched"
                     print(f"[{index}/{len(todo)}] {verb} {code}  {width}x{height} "
                           f"{len(data)//1024} KB  <- {winner.source}", flush=True)
             # 落空的行也要落盘。这句只放在取得分支里的话，连续落空时 CSV 整段不动；
@@ -1371,16 +1518,16 @@ def run(args: argparse.Namespace, handle: TaskRunHandle | None = None) -> int:
         _write_log(args.log, rows)
 
     if args.upgrade_existing:
-        print(f"\n升级 {stats['ok']}，保留 {stats['kept']}，"
-              f"重探失败但保留原图 {stats['miss']} → {args.out}")
+        print(f"\nupgraded {stats['ok']}, kept {stats['kept']}, "
+              f"re-probe failed but original kept {stats['miss']} -> {args.out}")
     else:
-        print(f"\n取得 {stats['ok']}，未取得 {stats['miss']} → {args.out}")
-    print(f"逐条记录 → {args.log}")
+        print(f"\nfetched {stats['ok']}, not found {stats['miss']} -> {args.out}")
+    print(f"per-code log -> {args.log}")
     summary = dict(stats, planned=len(todo))
     if stopped is not None:
         # 磁盘闸门把这一趟拦下来了：活儿没干完，但也不是故障。活动页上要看得出
         # 是「被叫停」而不是「跑完了」，否则下次没人知道还有剩下的番号没抓。
-        handle.finish("cancelled", summary=summary, error=str(stopped))
+        handle.finish("cancelled", summary=summary, **_stop_fields(stopped))
         return stopped.exit_code
     handle.finish("succeeded", summary=summary)
     return 0
@@ -1389,12 +1536,12 @@ def run(args: argparse.Namespace, handle: TaskRunHandle | None = None) -> int:
 def main(argv: list[str] | None = None) -> int:
     """入口只负责把这一趟登记进任务中心，正文在 `run` 里。"""
     args = build_parser().parse_args(argv)
-    with cli_run("jav-covers", args.db, label="封面批量抓取") as handle:
+    with cli_run("jav-covers", args.db) as handle:
         code = run(args, handle)
         if code:
             # 参数自检这类提前收工走不到 `run` 结尾的结算，在这里补上。
             handle.finish("cancelled", summary={"exit_code": code},
-                          error=f"提前收工，退出码 {code}")
+                          **failure_fields(UserFacingError("errors.javCoverFetch.stoppedEarly", {"exitCode": code})))
         return code
 
 

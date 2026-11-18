@@ -34,13 +34,20 @@ class CaptureFrameTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 1, stderr=b'unsupported hardware decoder')
                 Image.new('RGB', (480, 270)).save(command[-1], format='JPEG')
                 return subprocess.CompletedProcess(command, 0, stderr=b'')
-            detail = {}
-            with patch('peach.hardware_transcode.frame_decode_options', return_value=('-hwaccel', 'videotoolbox')), \
-                    patch.object(frame_capture.subprocess, 'run', side_effect=run):
-                self.assertTrue(frame_capture.capture_with_retry('ffmpeg', 'sample.mp4', 1, destination, diagnostics=detail))
-            self.assertEqual(len(calls), 2)
-            self.assertNotIn('-hwaccel', calls[1])
-            self.assertEqual([attempt['hardware_decode'] for attempt in detail['attempts']], [True, False])
+            for options in (None, ('-hwaccel', 'videotoolbox'), ()):
+                calls.clear()
+                detail = {}
+                with self.subTest(decode_options=options), \
+                        patch('peach.hardware_transcode.frame_decode_options', return_value=('-hwaccel', 'videotoolbox')) as probe, \
+                        patch.object(frame_capture.subprocess, 'run', side_effect=run):
+                    self.assertTrue(frame_capture.capture_with_retry(
+                        'ffmpeg', 'sample.mp4', 1, destination, diagnostics=detail, decode_options=options))
+                expected = [False] if options == () else [True, False]
+                self.assertEqual(len(calls), len(expected))
+                self.assertNotIn('-hwaccel', calls[-1])
+                self.assertEqual([attempt['hardware_decode'] for attempt in detail['attempts']], expected)
+                if options is not None:
+                    probe.assert_not_called()
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="frame-capture-")).resolve()
@@ -65,7 +72,6 @@ class CaptureFrameTests(unittest.TestCase):
         self.assertTrue(ok)
         command = self.commands[0]
         self.assertLess(command.index("-ss"), command.index("-i"))
-        self.assertIn("scale=320:-1", command)
         self.assertNotIn("bt709", command)
 
     def test_a_frame_too_small_to_be_a_picture_does_not_count_as_taken(self):
@@ -154,7 +160,7 @@ class CaptureFrameTests(unittest.TestCase):
             (b"", 1),
         ):
             self.commands = []
-            with self._run(produce=False, stderr=stderr):
+            with self._run(produce=False, stderr=stderr), patch('peach.error_reporting.subprocess_failure'):
                 ok = frame_capture.capture_with_retry("ffmpeg", "movie.mp4", 1.0,
                                                       self.root / "retry.jpg")
             self.assertFalse(ok)
@@ -186,13 +192,41 @@ class TileFramesTests(unittest.TestCase):
 
     def test_a_tile_that_did_not_land_is_not_reported_as_made(self):
         with patch.object(frame_capture.subprocess, "run",
-                          lambda command, **_kwargs: _Completed()):
+                          lambda command, **_kwargs: _Completed()), \
+                patch('peach.error_reporting.subprocess_failure') as report:
             made = frame_capture.tile_frames("ffmpeg", str(self.root / "s%03d.jpg"), 3, 3,
                                              self.root / "out" / "000.jpg")
         self.assertFalse(made)
+        self.assertEqual(report.call_args.kwargs['reason'], 'tile_unavailable')
 
 
 class FFmpegCaptureIntegrationTests(unittest.TestCase):
+    def test_anamorphic_video_probe_frames_and_grid_use_display_geometry(self):
+        from peach import media_probe
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            resolver = FFmpegResolver(root)
+            ffmpeg, ffprobe = resolver.ffmpeg(), resolver.ffprobe()
+            if ffmpeg is None or ffprobe is None:
+                missing_prerequisite('非方形像素回归需要 FFmpeg 与 ffprobe')
+            source = root / 'anamorphic.mp4'
+            subprocess.run([str(ffmpeg.path), '-y', '-v', 'error', '-f', 'lavfi', '-i',
+                'color=c=green:s=720x1280:r=5:d=1', '-vf', 'setsar=256/81:max=1000',
+                '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(source)],
+                capture_output=True, check=True, timeout=20)
+            measured = media_probe.measure(str(ffprobe.path), 1, str(source))
+            self.assertEqual(measured[1:3], (2276, 1280))
+            self.assertEqual(measured[7:9], ('landscape', '2K'))
+            for index in range(9):
+                self.assertTrue(frame_capture.capture_with_retry(str(ffmpeg.path), str(source), .1,
+                    root / f's{index:02d}.jpg', width=480, decode_options=()))
+            with Image.open(root / 's00.jpg') as frame:
+                self.assertEqual(frame.size, (480, 270))
+            target = root / 'grid.jpg'
+            self.assertTrue(frame_capture.tile_frames(str(ffmpeg.path), str(root / 's%02d.jpg'), 3, 3, target))
+            with Image.open(target) as grid:
+                self.assertEqual(grid.size, (1440, 810))
+
     def test_av1_software_decode_uses_the_desktop_release_gate(self):
         from scripts.smoke_desktop import assert_av1_decoder
         with tempfile.TemporaryDirectory() as temporary:
