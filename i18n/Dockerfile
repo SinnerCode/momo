@@ -16,6 +16,7 @@ RUN python -I i18n/py.py apply . i18n/en.json
 FROM node:24-trixie-slim@sha256:54f84b4cf8432b21aaffd5d3ce8d41e12cea0d10d33c09d2f3c9879d49d6b446 AS web
 WORKDIR /w
 COPY frontend/package.json frontend/package-lock.json ./frontend/
+COPY frontend/vendor ./frontend/vendor
 RUN cd frontend && npm ci --no-audit --no-fund --ignore-scripts
 COPY frontend ./frontend
 COPY web ./web
